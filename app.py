@@ -10,10 +10,10 @@ TOKEN = os.environ["TOKEN"]
 
 # Render Environment → 아래 네 키에 각 Chat ID 입력
 CHAT_IDS = {
-    "scalping":   os.environ["-4870905408"],
-    "daytrade":   os.environ["-4820497789"],
-    "swing":      os.environ["-4912298868"],
-    "longterm":   os.environ["-1002529014389"],
+    "scalping":   os.environ["SCALP_CHAT_ID"],
+    "daytrade":   os.environ["DAYTRADE_CHAT_ID"],
+    "swing":      os.environ["SWING_CHAT_ID"],
+    "longterm":   os.environ["LONG_CHAT_ID"],
 }
 
 @app.route("/", methods=["POST"])
