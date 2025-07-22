@@ -1,25 +1,23 @@
+# app.py
 from flask import Flask, request
 import os, json, requests
 
 app = Flask(__name__)
 
-# Render → Environment 에 설정한 값
 TOKEN = os.environ["TOKEN"]
 CHAT_IDS = {
-    "scalping":  os.environ["SCALP_CHAT_ID"],
-    "daytrade":  os.environ["DAYTRADE_CHAT_ID"],
-    "swing":     os.environ["SWING_CHAT_ID"],
-    "longterm":  os.environ["LONG_CHAT_ID"],
+    "scalping": os.environ["SCALP_CHAT_ID"],
+    "daytrade": os.environ["DAYTRADE_CHAT_ID"],
+    "swing":    os.environ["SWING_CHAT_ID"],
+    "longterm": os.environ["LONG_CHAT_ID"],
 }
 
 @app.route("/alert", methods=["POST"])
 def webhook():
-    # 1) raw payload 로깅
     raw = request.get_data(as_text=True)
     app.logger.info(f"⏳ RAW PAYLOAD: {raw}")
 
-    # 2) JSON 파싱
-    data = json.loads(raw)
+    data    = json.loads(raw)
     strat   = data.get("type")
     message = data.get("message")
 
@@ -27,7 +25,6 @@ def webhook():
     if not chat_id:
         return "Unknown strategy", 400
 
-    # 3) Telegram 전송
     res = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         json={"chat_id": chat_id, "text": message}
