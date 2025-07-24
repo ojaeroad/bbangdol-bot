@@ -1,4 +1,4 @@
-# 250724 master 전략 ver1
+# 250724 master 전략 ver 1
 from flask import Flask, request
 import os, json, requests, traceback
 
