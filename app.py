@@ -1,10 +1,9 @@
- # app.py
+# 250724 master 전략 ver1
 from flask import Flask, request
-import os, json, requests
+import os, json, requests, traceback
 
 app = Flask(__name__)
-
-TOKEN = os.environ["TOKEN"]
+TOKEN    = os.environ["TOKEN"]
 CHAT_IDS = {
     "scalping": os.environ["SCALP_CHAT_ID"],
     "daytrade": os.environ["DAYTRADE_CHAT_ID"],
@@ -15,22 +14,23 @@ CHAT_IDS = {
 @app.route("/alert", methods=["POST"])
 def webhook():
     raw = request.get_data(as_text=True)
-    app.logger.info(f"⏳ RAW PAYLOAD: {raw}")
-
-    data    = json.loads(raw)
-    strat   = data.get("type")
-    message = data.get("message")
-
+    app.logger.info(f"RAW: {raw}")
+    try:
+        data = json.loads(raw)
+    except:
+        return "Bad JSON", 400
+    strat = data.get("type"); msg = data.get("message")
     chat_id = CHAT_IDS.get(strat)
-    if not chat_id:
-        return "Unknown strategy", 400
-
-    res = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": chat_id, "text": message}
-    )
-    app.logger.info(f"Telegram API response: {res.status_code} {res.text}")
+    if not chat_id: return "Unknown strat", 400
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+        )
+    except:
+        app.logger.error(traceback.format_exc())
+        return "Error", 500
     return "OK", 200
 
-if __name__ == "__main__":
+if __name__=="__main__":
     app.run(port=10000)
