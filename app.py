@@ -1,44 +1,18 @@
-# 250724 master 전략 ver1
 from flask import Flask, request
-import os, json, requests, traceback
+import requests
 
 app = Flask(__name__)
-TOKEN    = os.environ["TOKEN"]
-CHAT_IDS = {
-    "scalping": os.environ["SCALP_CHAT_ID"],
-    "daytrade": os.environ["DAYTRADE_CHAT_ID"],
-    "swing":    os.environ["SWING_CHAT_ID"],
-    "longterm": os.environ["LONG_CHAT_ID"],
-}
 
-@app.route("/alert", methods=["POST"])
+# 여기에 본인의 텔레그램 봇 토큰과 Chat ID를 입력하세요
+TOKEN   = "YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+
+@app.route("/", methods=["POST"])
 def webhook():
-    raw = request.get_data(as_text=True)
-    app.logger.info(f"[ALERT RECEIVED] raw payload repr: {raw!r}")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        app.logger.error(f"JSON parse error: {e}")
-        return "Bad JSON", 400
-
-    strat = data.get("type")
-    msg   = data.get("message")
-    chat_id = CHAT_IDS.get(strat)
-    if not chat_id:
-        return "Unknown strat", 400
-
-    try:
-        res = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
-        )
-        if res.status_code != 200:
-            app.logger.error(f"Telegram API error: {res.status_code} {res.text}")
-    except Exception:
-        app.logger.error(traceback.format_exc())
-        return "Error", 500
-
-    return "OK", 200
-
-if __name__ == "__main__":
-    app.run(port=10000)
+    # TradingView에서 보낸 메시지를 그대로 Telegram으로 포워딩
+    msg = request.get_data(as_text=True)
+    requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": msg}
+    )
+    return "OK"
