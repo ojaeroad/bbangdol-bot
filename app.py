@@ -1,55 +1,46 @@
-# 🔧 작성일시: 2025-07-26 08:25 (KST)
-# ✅ 변경사항: UTF-8 한글 포함 JSON 수동 디코딩 처리
-
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import requests
 import json
 
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = '7845798196:AAG5NVZQRjNZw0HTFyb3bqXIsvigMFRTpBU'
+TOKEN = '7845798196:AAG5NVZQRjNZw0HTFyb3bqXIsvigMFRTpBU'
 
-CHAT_IDS = {
-    "scalp": "-4870905408",
-    "scalp_up": "-4872204876",
-    "daytrade": "-4820497789",
-    "swing": "-4912298868",
-    "longterm": "-1002529014389"
-}
-
-def send_telegram_message(chat_id, message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
+def send_message(chat_id, text):
+    url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'HTML'
     }
-    return requests.post(url, json=data)
+    response = requests.post(url, json=payload)
+    return response
 
-@app.route("/alert", methods=["POST"])
+@app.route('/alert', methods=['POST'])
 def alert():
     try:
-        # ✅ 1. 원시 바이트 수신 후 UTF-8로 디코딩
-        raw_data = request.get_data()
-        decoded = raw_data.decode('utf-8')
-        print("📥 Decoded Payload:", decoded)
+        data = json.loads(request.data.decode('utf-8'))
+        message = data.get('message', '')
+        strategy = data.get('type', '')
 
-        # ✅ 2. JSON 파싱
-        data = json.loads(decoded)
+        # ✅ 전략별 Chat ID 분기 (사용자 정의 이름 적용)
+        if strategy == 'scalp':
+            chat_id = '-4870905408'
+        elif strategy == 'scalp_up':
+            chat_id = '-4872204876'
+        elif strategy == 'short':
+            chat_id = '-4820497789'
+        elif strategy == 'swing':
+            chat_id = '-4912298868'
+        elif strategy == 'long':
+            chat_id = '-1002529014389'
+        else:
+            return 'Invalid strategy type', 400
 
-        message = data.get("message", "[⚠️] No message received")
-        strategy = data.get("type", "daytrade")
-        chat_id = CHAT_IDS.get(strategy)
-
-        if not chat_id:
-            return jsonify({"error": f"Unknown strategy: {strategy}"}), 400
-
-        res = send_telegram_message(chat_id, message)
-        return jsonify({"status": res.status_code}), 200
-
+        res = send_message(chat_id, message)
+        return f'Sent with status code: {res.status_code}', 200
     except Exception as e:
-        print("❌ Exception:", str(e))
-        return jsonify({"error": str(e)}), 500
+        return f'Error: {str(e)}', 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
