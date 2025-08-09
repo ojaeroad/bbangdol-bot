@@ -7,11 +7,11 @@ app = Flask(__name__)
 
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")          # 필수
 CHATMAP = {
-    "scalp":     os.getenv("CHAT_ID_SCALP", ""),
+    "scalp":     os.getenv("-4870905408", ""),
     "scalp_up":  os.getenv("CHAT_ID_SCALP_UP", ""),
-    "short":     os.getenv("CHAT_ID_SHORT", ""),
-    "swing":     os.getenv("CHAT_ID_SWING", ""),
-    "long":      os.getenv("CHAT_ID_LONG", ""),
+    "short":     os.getenv("-4820497789", ""),
+    "swing":     os.getenv("-4912298868", ""),
+    "long":      os.getenv("-1002529014389", ""),
 }
 CHAT_DEFAULT = os.getenv("CHAT_ID_DEFAULT", "")
 
