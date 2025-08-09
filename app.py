@@ -5,7 +5,7 @@ import requests
 
 app = Flask(__name__)
 
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")          # 필수
+TOKEN   = os.getenv("7845798196:AAG5NVZQRjNZw0HTFyb3bqXIsvigMFRTpBU", "")          # 필수
 CHATMAP = {
     "scalp":     os.getenv("-4870905408", ""),
     "scalp_up":  os.getenv("CHAT_ID_SCALP_UP", ""),
