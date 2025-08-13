@@ -10,23 +10,30 @@ import requests
 # -------------------------------
 # Telegram Bot 설정
 # -------------------------------
-BOT_TOKEN = "7845798196:AAG5NVZQRjNZw0HTFyb3bqXIsvigMFRTpBU"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env is missing")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-# Chat ID 매핑 (Pine route → Telegram Chat ID)
+# Chat ID 매핑 (Pine의 route -> Telegram Chat ID)
+# 기존 OS/OB 라우팅은 그대로 유지 + 주요지표(AUX_4INDEX) 하드코딩 추가
 ROUTE_TO_CHAT: Dict[str, int] = {
-    # OS routes
+    # ===== OS (과매도) =====
     "OS_SCALP": -4870905408,
     "OS_SHORT": -4820497789,
     "OS_SWING": -4912298868,
-    "OS_LONG":  -1002529014389,  # long 값은 지수표기 아닌 정수 그대로
+    "OS_LONG":  -1002529014389,
 
-    # OB routes
+    # ===== OB (과매수) =====
     "OB_SWING": -4825365651,
     "OB_LONG":  -4906640026,
+
+    # ===== 주요지표 전용 (하드코딩) =====
+    "AUX_4INDEX": -4872204876,
 }
 
-MAX_LEN = 3900  # 텔레그램 메시지 길이 안전 마진
+MAX_LEN = 3900
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
@@ -42,16 +49,13 @@ def safe_text(s: str) -> str:
         return s[:MAX_LEN - 20] + "\n...[truncated]"
     return s
 
-def post_telegram(chat_id: int, text: str, parse_mode: str = None) -> Dict[str, Any]:
-    payload = {
-        "chat_id": chat_id,
-        "text": safe_text(text),
-    }
+def post_telegram(chat_id: int, text: str, parse_mode: str | None = None) -> Dict[str, Any]:
+    payload = {"chat_id": chat_id, "text": safe_text(text)}
     if parse_mode:
         payload["parse_mode"] = parse_mode
 
     last_err = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
             r = requests.post(TELEGRAM_API, json=payload, timeout=10)
             if r.status_code == 200:
@@ -64,13 +68,12 @@ def post_telegram(chat_id: int, text: str, parse_mode: str = None) -> Dict[str, 
     raise RuntimeError(f"sendMessage failed: {last_err}")
 
 def route_to_chat_id(route: str) -> int:
-    rid = ROUTE_TO_CHAT.get(route)
-    if rid is None:
-        raise KeyError(f"Unknown route: {route}")
-    return rid
+    if route not in ROUTE_TO_CHAT:
+        raise KeyError(f"Unknown or unmapped route: {route}")
+    return ROUTE_TO_CHAT[route]
 
 # -------------------------------
-# 헬스체크
+# 헬스체크 & 라우트 확인
 # -------------------------------
 @app.get("/health")
 def health():
@@ -78,12 +81,13 @@ def health():
 
 @app.get("/routes")
 def routes_dump():
-    return jsonify({"routes": list(ROUTE_TO_CHAT.keys())})
+    # 디버깅용: 현재 라우트 -> chat id 매핑 확인
+    return jsonify({"routes": ROUTE_TO_CHAT})
 
 # -------------------------------
-# TradingView Webhook 엔드포인트
+# TradingView Webhook
 # -------------------------------
-@app.post("/tv")
+@app.post("/bot")
 def tv_webhook():
     try:
         data = request.get_json(silent=True, force=True) or {}
@@ -96,7 +100,7 @@ def tv_webhook():
             return jsonify({"ok": False, "error": "invalid_json"}), 400
 
     route = str(data.get("route", "")).strip()
-    msg    = str(data.get("msg", "")).strip()
+    msg   = str(data.get("msg", "")).strip()
 
     if not route or not msg:
         return jsonify({"ok": False, "error": "missing route or msg"}), 400
@@ -105,12 +109,12 @@ def tv_webhook():
         chat_id = route_to_chat_id(route)
     except KeyError as e:
         log.error(f"[DROP] {e}. payload={data}")
+        # 200으로 응답해 TV 재시도 폭주 방지
         return jsonify({"ok": False, "error": "unknown_route"}), 200
 
     try:
         res = post_telegram(chat_id, msg)
-        ok = bool(res.get("ok"))
-        if not ok:
+        if not bool(res.get("ok")):
             log.error(f"TG send failed: {res}")
             return jsonify({"ok": False, "error": "telegram_failed", "detail": res}), 500
         return jsonify({"ok": True})
@@ -118,8 +122,6 @@ def tv_webhook():
         log.exception("Telegram send exception")
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
 
-# -------------------------------
-# 로컬 실행
-# -------------------------------
 if __name__ == "__main__":
+    # Render는 PORT 환경변수 제공. 로컬에선 5000 기본.
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
