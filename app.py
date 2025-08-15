@@ -1,136 +1,96 @@
-# app.py
-import os
-import json
-import logging
-import time
-from typing import Dict, Any
+# app.py  — unified webhook (old routes kept + new accumulation routes)
+import os, json, logging, time
+from typing import Dict, Any, Optional
 from flask import Flask, request, jsonify
 import requests
-
-# -------------------------------
-# Telegram Bot 설정 (환경변수)
-# -------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is missing")
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-# 환경변수에서 정수형 Chat ID를 안전하게 읽는 함수
-def read_chat_id(env_name: str) -> int:
-    raw = os.getenv(env_name)
-    if raw is None or raw.strip() == "":
-        raise RuntimeError(f"Missing env: {env_name}")
-    s = raw.strip()
-    # 스프레드시트 복사 시 발생하는 지수표기 형태 방지
-    if "e" in s.lower():
-        raise RuntimeError(f"Invalid chat id in {env_name}: exponential form detected ({s})")
-    try:
-        return int(s)
-    except ValueError:
-        raise RuntimeError(f"Invalid chat id in {env_name}: {s}")
-
-# -------------------------------
-# Pine route → Telegram Chat ID 매핑
-# (Render Environment 탭의 KEY 이름과 정확히 일치)
-# -------------------------------
-ROUTE_TO_CHAT: Dict[str, int] = {
-    # 과매도
-    "OS_SCALP": read_chat_id("OS_SCALP_CHAT_ID"),
-    "OS_SHORT": read_chat_id("OS_SHORT_CHAT_ID"),
-    "OS_SWING": read_chat_id("OS_SWING_CHAT_ID"),
-    "OS_LONG":  read_chat_id("OS_LONG_CHAT_ID"),
-
-    # 과매수
-    "OB_SWING": read_chat_id("OB_SWING_CHAT_ID"),
-    "OB_LONG":  read_chat_id("OB_LONG_CHAT_ID"),
-
-    # 주요지표 전용 (1시간 주기 보조지표용)
-    "AUX_4INDEX": read_chat_id("MAIN_INDICATOR_CHAT_ID"),
-}
-
-MAX_LEN = 3900
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
 
-# -------------------------------
-# 유틸
-# -------------------------------
+# --- Telegram ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env is missing")
+TG_SEND = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+MAX_LEN = 3900
+
 def safe_text(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
-    if len(s) > MAX_LEN:
-        return s[:MAX_LEN - 20] + "\n...[truncated]"
-    return s
+    return s if len(s) <= MAX_LEN else s[:MAX_LEN - 20] + "\n...[truncated]"
 
-def post_telegram(chat_id: int, text: str, parse_mode: str | None = None) -> Dict[str, Any]:
+def post_telegram(chat_id: int | str, text: str, parse_mode: Optional[str] = None) -> Dict[str, Any]:
     payload = {"chat_id": chat_id, "text": safe_text(text)}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-
     last_err = None
     for _ in range(3):
         try:
-            r = requests.post(TELEGRAM_API, json=payload, timeout=10)
+            r = requests.post(TG_SEND, json=payload, timeout=10)
             if r.status_code == 200:
                 return r.json()
             last_err = f"HTTP {r.status_code} {r.text}"
-            time.sleep(0.6)
         except Exception as e:
             last_err = str(e)
-            time.sleep(0.6)
+        time.sleep(0.5)
     raise RuntimeError(f"sendMessage failed: {last_err}")
 
-def route_to_chat_id(route: str) -> int:
-    if route not in ROUTE_TO_CHAT:
-        raise KeyError(f"Unknown or unmapped route: {route}")
-    return ROUTE_TO_CHAT[route]
+# --- env helpers ---
+def _read_optional(env_name: str) -> Optional[str]:
+    v = os.getenv(env_name)
+    return v.strip() if v and v.strip() != "" else None
 
-# -------------------------------
-# 헬스체크 & 매핑 확인
-# -------------------------------
+def build_route_map() -> Dict[str, str]:
+    """환경변수에 있는 것만 매핑하여 KeyError 방지"""
+    m: Dict[str, str] = {}
+
+    # 기존 라우팅 (과매수/과매도/지표)  — 원본 유지
+    # OS_*, OB_*, MAIN_INDICATOR_CHAT_ID
+    def add_if(k: str, envk: str):
+        val = _read_optional(envk)
+        if val is not None:
+            m[k] = val
+
+    add_if("OS_SCALP", "OS_SCALP_CHAT_ID")
+    add_if("OS_SHORT", "OS_SHORT_CHAT_ID")
+    add_if("OS_SWING", "OS_SWING_CHAT_ID")
+    add_if("OS_LONG",  "OS_LONG_CHAT_ID")
+    add_if("OB_SWING", "OB_SWING_CHAT_ID")
+    add_if("OB_LONG",  "OB_LONG_CHAT_ID")
+    add_if("AUX_4INDEX", "MAIN_INDICATOR_CHAT_ID")
+
+    # 신규: 매집 전략 4종 (네가 지정한 키 이름)
+    add_if("SCALP", "influ_scalp")
+    add_if("SHORT", "influ_short")
+    add_if("SWING", "influ_swing")
+    add_if("LONG",  "influ_long")
+
+    return m
+
+ROUTE_TO_CHAT: Dict[str, str] = build_route_map()
+
+def route_to_chat_id(route: str) -> Optional[str]:
+    return ROUTE_TO_CHAT.get(route)
+
+# --- health & routes ---
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "status": "healthy"})
+    return jsonify({"ok": True, "status": "healthy", "routes": list(ROUTE_TO_CHAT.keys())})
 
 @app.get("/routes")
 def routes_dump():
-    # 디버깅용: 현재 라우트 → chat id 매핑 노출(값만 표시)
     return jsonify({"routes": ROUTE_TO_CHAT})
 
-# -------------------------------
-# TradingView Webhook 엔드포인트
-# -------------------------------
-@app.post("/bot")
-def tv_webhook():
-    # JSON 파싱
-    try:
-        data = request.get_json(silent=True, force=True) or {}
-    except Exception:
-        raw = request.data.decode("utf-8", errors="ignore")
-        try:
-            data = json.loads(raw)
-        except Exception:
-            log.error("Invalid payload (not JSON)")
-            return jsonify({"ok": False, "error": "invalid_json"}), 400
-
-    route = str(data.get("route", "")).strip()
-    msg   = str(data.get("msg", "")).strip()
-    # symbol은 로깅/확인용 (필수 아님)
-    symbol = str(data.get("symbol", "")).strip()
-
+# --- core handler ---
+def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
         return jsonify({"ok": False, "error": "missing route or msg"}), 400
-
-    try:
-        chat_id = route_to_chat_id(route)
-    except KeyError as e:
-        log.error(f"[DROP] {e}. payload={data}")
-        # TradingView 재시도 폭주 방지를 위해 200 반환
+    chat_id = route_to_chat_id(route)
+    if not chat_id:
+        log.error(f"[DROP] Unknown route={route} (symbol={symbol})")
         return jsonify({"ok": False, "error": "unknown_route"}), 200
-
     try:
         res = post_telegram(chat_id, msg)
         if not bool(res.get("ok")):
@@ -141,7 +101,25 @@ def tv_webhook():
         log.exception("Telegram send exception")
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
 
-# -------------------------------
+# --- old endpoint (kept for backward compatibility) ---
+@app.post("/bot")
+def tv_webhook_legacy():
+    # expects: {"route": "...", "msg": "...", "symbol": "..."}
+    data = request.get_json(silent=True, force=True) or {}
+    route  = str(data.get("route", "")).strip()
+    msg    = str(data.get("msg", "")).strip()
+    symbol = str(data.get("symbol", "")).strip()
+    return _handle_payload(route, msg, symbol)
+
+# --- new endpoint for the accumulation script ---
+@app.post("/webhook")
+def tv_webhook_new():
+    # supports both: {"type":"SCALP","message":"..."}  and  {"route":"SCALP","msg":"..."}
+    data = request.get_json(silent=True, force=True) or {}
+    route  = str(data.get("type", data.get("route", ""))).strip()
+    msg    = str(data.get("message", data.get("msg", ""))).strip()
+    symbol = str(data.get("symbol", "")).strip()
+    return _handle_payload(route, msg, symbol)
+
 if __name__ == "__main__":
-    # Render는 PORT 환경변수를 줌. 로컬은 5000 기본.
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
