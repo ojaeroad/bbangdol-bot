@@ -61,6 +61,12 @@ def build_route_map() -> Dict[str, str]:
     add_if("OB_LONG",  "OB_LONG_CHAT_ID")
     add_if("AUX_4INDEX", "MAIN_INDICATOR_CHAT_ID")
 
+    # --- KRW 전용 라우팅: Pine에서 보내는 *_KRW 라우트를 새 env로 매핑 ---
+    add_if("OS_SCALP_KRW", "KRW_SCALP")
+    add_if("OS_SHORT_KRW", "KRW_SHORT")
+    add_if("OS_SWING_KRW", "KRW_SWING")
+    add_if("OS_LONG_KRW",  "KRW_LONG")
+
     # 신규: 매집 전략 4종 (네가 지정한 키 이름)
     add_if("SCALP", "influ_scalp")
     add_if("SHORT", "influ_short")
