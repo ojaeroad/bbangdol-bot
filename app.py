@@ -53,13 +53,22 @@ def build_route_map() -> Dict[str, str]:
         if val is not None:
             m[k] = val
 
-    add_if("OS_SCALP", "OS_SCALP_CHAT_ID")
-    add_if("OS_SHORT", "OS_SHORT_CHAT_ID")
-    add_if("OS_SWING", "OS_SWING_CHAT_ID")
-    add_if("OS_LONG",  "OS_LONG_CHAT_ID")
-    add_if("OB_SWING", "OB_SWING_CHAT_ID")
-    add_if("OB_LONG",  "OB_LONG_CHAT_ID")
-    add_if("AUX_4INDEX", "MAIN_INDICATOR_CHAT_ID")
+# 기존 유지
+add_if("OS_SCALP", "OS_SCALP_CHAT_ID")
+add_if("OS_SHORT", "OS_SHORT_CHAT_ID")
+add_if("OS_LONG",  "OS_LONG_CHAT_ID")
+add_if("OB_LONG",  "OB_LONG_CHAT_ID")
+add_if("AUX_4INDEX", "MAIN_INDICATOR_CHAT_ID")
+
+# ▼ 여기 추가
+    add_if("OB_SHORT", "OB_SHORT_CHAT_ID")
+
+# ▼ 새로 추가 (스윙 분리)
+    add_if("OS_SWINGA", "OS_SWINGA_CHAT_ID")
+    add_if("OB_SWINGA", "OB_SWINGA_CHAT_ID")
+    add_if("OS_SWINGB", "OS_SWINGB_CHAT_ID")
+    add_if("OB_SWINGB", "OB_SWINGB_CHAT_ID")
+
 
     # --- KRW 전용 라우팅: Pine에서 보내는 *_KRW 라우트를 새 env로 매핑 ---
     add_if("OS_SCALP_KRW", "KRW_SCALP")
