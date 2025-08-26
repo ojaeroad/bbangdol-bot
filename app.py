@@ -54,6 +54,7 @@ def build_route_map() -> Dict[str, str]:
     add_if("OS_SHORT", "OS_SHORT_CHAT_ID")
     add_if("OS_LONG",  "OS_LONG_CHAT_ID")
     add_if("OB_LONG",  "OB_LONG_CHAT_ID")
+    add_if("OB_SHORT",  "OB_LONG_CHAT_ID")
     add_if("AUX_4INDEX", "MAIN_INDICATOR_CHAT_ID")
 
     # 스윙 분리
