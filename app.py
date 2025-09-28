@@ -69,11 +69,11 @@ def build_route_map() -> Dict[str, str]:
     add_if("OS_SWING_KRW", "KRW_SWING")
     add_if("OS_LONG_KRW",  "KRW_LONG")
 
-    # 매집 전략
-    add_if("SCALP", "influ_scalp")
-    add_if("SHORT", "influ_short")
-    add_if("SWING", "influ_swing")
-    add_if("LONG",  "influ_long")
+# 매집 전략 -> 신규 키로 변경
+add_if("SHORT",    "child_short")
+add_if("SWINGA",   "child_swinga")
+add_if("SWINGB",   "child_swingb")
+add_if("LONG",     "child_long")
 
     return m
 
