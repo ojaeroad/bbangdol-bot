@@ -1,7 +1,8 @@
 # app.py — unified webhook (old routes kept + new accumulation routes)
-import os, json, logging, time, re
+import os, json, logging, time, re, hmac, hashlib
 from time import time as now
 from typing import Dict, Any, Optional, Tuple
+from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 import requests
 
@@ -48,9 +49,9 @@ def _is_duplicate(bucket: str, msg_norm: str) -> bool:
     return False
 
 # --- Telegram base (기존 트뷰용) ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is missing")
+    raise RuntimeError("BOT_TOKEN/TELEGRAM_BOT_TOKEN env is missing")
 TG_SEND = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 MAX_LEN = 3900
 
@@ -216,6 +217,115 @@ def bnc_send():
         return jsonify({"ok": bool(res.get("ok")), "detail": res})
     except Exception as e:
         log.exception("BNC Telegram send exception")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# =========================================================
+# === 신규: Binance USDⓈ-M Futures order endpoint (/bnc/trade) ===
+# =========================================================
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _sign(query: str, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _binance_base() -> str:
+    # 우선순위: BINANCE_FUTURES_BASE > BINANCE_IS_TESTNET 플래그
+    base = _read_optional("BINANCE_FUTURES_BASE")
+    if base:
+        return base
+    return "https://testnet.binancefuture.com" if os.getenv("BINANCE_IS_TESTNET", "1") == "1" else "https://fapi.binance.com"
+
+def _binance_post(path: str, params: dict) -> dict:
+    base = _binance_base()
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_SECRET_KEY")
+    if not api_key or not api_secret:
+        raise RuntimeError("BINANCE_API_KEY/SECRET_KEY missing")
+
+    params["timestamp"] = _now_ms()
+    params["recvWindow"] = 5000
+    q = urlencode(params, doseq=True, safe=":/")
+    sig = _sign(q, api_secret)
+    url = f"{base}{path}?{q}&signature={sig}"
+    headers = {"X-MBX-APIKEY": api_key}
+    r = requests.post(url, headers=headers, timeout=10)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    if r.status_code != 200:
+        raise RuntimeError(f"Binance HTTP {r.status_code} {data}")
+    return data
+
+def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False, position_side: Optional[str] = None, client_id: Optional[str] = None) -> dict:
+    params = {
+        "symbol": symbol,
+        "side": side,                 # BUY / SELL
+        "type": "MARKET",
+        "quantity": qty,              # 코인 수량
+        "reduceOnly": "true" if reduce_only else "false",
+    }
+    if position_side:
+        params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
+    if client_id:
+        params["newClientOrderId"] = client_id[:36]
+    return _binance_post("/fapi/v1/order", params)
+
+SYM_WHITELIST = set((_read_optional("BNC_SYMBOLS") or "BTCUSDT,ETHUSDT,SOLUSDT").split(","))
+
+@app.post("/bnc/trade")
+def bnc_trade():
+    """
+    Body:
+    {
+      "secret": "<BNC_SECRET>",
+      "symbol": "BTCUSDT",
+      "action": "OPEN_LONG" | "CLOSE_LONG" | "OPEN_SHORT" | "CLOSE_SHORT",
+      "qty": 0.001,
+      "note": "optional"
+    }
+    """
+    data = request.get_json(silent=True, force=True) or {}
+    secret = os.getenv("BNC_SECRET")
+    if secret and data.get("secret") != secret:
+        return jsonify({"ok": False, "error": "bad secret"}), 401
+
+    symbol = str(data.get("symbol", "")).upper()
+    action = str(data.get("action", "")).upper()
+    qty    = float(data.get("qty", 0) or 0)
+    note   = str(data.get("note", ""))
+
+    if symbol not in SYM_WHITELIST:
+        return jsonify({"ok": False, "error": f"symbol not allowed: {symbol}"}), 400
+    if qty <= 0:
+        return jsonify({"ok": False, "error": "qty must be > 0"}), 400
+    if action not in {"OPEN_LONG","CLOSE_LONG","OPEN_SHORT","CLOSE_SHORT"}:
+        return jsonify({"ok": False, "error": "invalid action"}), 400
+
+    try:
+        cid = f"bnc_{symbol}_{action}_{int(qty*1e8)}_{int(now())}"
+        if action == "OPEN_LONG":
+            res = place_market_order(symbol, "BUY", qty, reduce_only=False, position_side="LONG", client_id=cid)
+        elif action == "CLOSE_LONG":
+            res = place_market_order(symbol, "SELL", qty, reduce_only=True, position_side="LONG", client_id=cid)
+        elif action == "OPEN_SHORT":
+            res = place_market_order(symbol, "SELL", qty, reduce_only=False, position_side="SHORT", client_id=cid)
+        else:  # CLOSE_SHORT
+            res = place_market_order(symbol, "BUY", qty, reduce_only=True, position_side="SHORT", client_id=cid)
+
+        # 텔레그램 확인 메시지(신규 방)
+        try:
+            bnc_token = os.getenv("BNC_BOT_TOKEN")
+            bnc_chat  = os.getenv("BNC_CHAT_ID")
+            confirm   = f"[TRADE] {symbol} {action} qty={qty}\norderId={res.get('orderId')}  status={res.get('status')}\n{note}"
+            if bnc_token and bnc_chat:
+                post_telegram_with_token(bnc_token, bnc_chat, confirm)
+        except Exception:
+            pass
+
+        return jsonify({"ok": True, "result": res})
+    except Exception as e:
+        log.exception("bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
 # =========================================================
 
