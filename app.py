@@ -654,11 +654,9 @@ def tg_webhook():
 # =========================================================
 # === /bnc/trade : 수량 자동계산 + SL/트레일링 세팅
 # =========================================================
-# BNC_SYMBOLS 환경변수가 비어 있으면 -> 모든 심볼 허용
-_raw = _read_optional("BNC_SYMBOLS") or ""
-# BNC_SYMBOLS 환경변수가 비면 → 모든 심볼 허용
-SYM_WHITELIST = set((_read_optional("BNC_SYMBOLS") or "").split(",")) or None
-
+# BNC_SYMBOLS이 비어있으면 -> 모든 심볼 허용, 채워두면 -> 해당 심볼만 허용
+_raw = _read_optional("BNC_SYMBOLS")
+SYM_WHITELIST = set(s.strip().upper() for s in _raw.split(",") if s.strip()) if _raw else None
 
 @app.post("/bnc/trade")
 def bnc_trade():
