@@ -760,34 +760,6 @@ def bnc_trade():
         log.exception("bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
-# --- Telegram webhook (minimal) ---
-@app.post("/tg")
-def tg_webhook():
-    """Telegram webhook endpoint: POST only."""
-    try:
-        upd = request.get_json(silent=True, force=True) or {}
-        msg = upd.get("message") or upd.get("edited_message")
-        if not msg:
-            return jsonify({"ok": True})
-
-        chat_id = msg.get("chat", {}).get("id")
-        text = str(msg.get("text") or "").strip()
-        if not chat_id:
-            return jsonify({"ok": True})
-
-        if text.lower().startswith("/start"):
-            post_telegram(chat_id, "안녕하세요! 봇이 준비되었습니다.\n예) trade ETHUSDT")
-        elif text.lower().startswith("/status"):
-            post_telegram(chat_id, "STATUS: running")
-        elif text.lower().startswith("trade "):
-            sym = text.split(None, 1)[1].upper().replace(" ", "")
-            post_telegram(chat_id, f"TRADE 요청 수신: {sym}\n(트리거/옵션은 트뷰 웹훅에서 처리)")
-        return jsonify({"ok": True})
-    except Exception:
-        log.exception("/tg handler error")
-        return jsonify({"ok": True})
-
 # =========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
