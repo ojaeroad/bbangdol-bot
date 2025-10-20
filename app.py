@@ -656,7 +656,8 @@ def tg_webhook():
 # =========================================================
 # BNC_SYMBOLS 환경변수가 비어 있으면 -> 모든 심볼 허용
 _raw = _read_optional("BNC_SYMBOLS") or ""
-SYM_WHITELIST = {s.strip().upper() for s in _raw.split(",") if s.strip()} or None
+# BNC_SYMBOLS 환경변수가 비면 → 모든 심볼 허용
+SYM_WHITELIST = set((_read_optional("BNC_SYMBOLS") or "").split(",")) or None
 
 
 @app.post("/bnc/trade")
