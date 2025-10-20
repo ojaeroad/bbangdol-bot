@@ -674,8 +674,9 @@ def bnc_trade():
     action = str(data.get("action", "")).upper()
     note   = str(data.get("note", ""))
 
-    if symbol not in SYM_WHITELIST:
-        return jsonify({"ok": False, "error": f"symbol not allowed: {symbol}"}), 400
+# 화이트리스트가 있을 때만 검사 (없으면 모든 심볼 허용)
+if SYM_WHITELIST and symbol not in SYM_WHITELIST:
+    return jsonify({"ok": False, "error": f"symbol not allowed: {symbol}"}), 400
     if action not in {"OPEN_LONG","CLOSE_LONG","OPEN_SHORT","CLOSE_SHORT"}:
         return jsonify({"ok": False, "error": "invalid action"}), 400
 
