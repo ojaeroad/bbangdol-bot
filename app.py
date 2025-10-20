@@ -654,7 +654,8 @@ def tg_webhook():
 # =========================================================
 # === /bnc/trade : 수량 자동계산 + SL/트레일링 세팅
 # =========================================================
-SYM_WHITELIST = set((_read_optional("BNC_SYMBOLS") or "BTCUSDT,ETHUSDT,SOLUSDT").split(","))
+# BNC_SYMBOLS 환경변수가 비어 있으면 -> 모든 심볼 허용
+SYM_WHITELIST = set((_read_optional("BNC_SYMBOLS") or "").split(",")) or None
 
 
 @app.post("/bnc/trade")
