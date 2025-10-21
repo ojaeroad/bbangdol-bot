@@ -364,21 +364,22 @@ def place_market_order(symbol: str, side: str, qty: float,
 
 
 
-def place_stop_market(symbol: str, side: str, qty: float, stop_price: float, position_side: Optional[str] = None) -> dict:
-    # STOP-MARKET (reduceOnly)
+def place_stop_market(symbol: str, side: str, qty: float, stop_price: float,
+                      position_side: Optional[str] = None) -> dict:
     params = {
         "symbol": symbol,
         "side": side,
         "type": "STOP_MARKET",
         "stopPrice": f"{stop_price:.8f}",
-        "closePosition": "false",
         "reduceOnly": "true",
-        "quantity": qty,
-        "timeInForce": "GTC"
+        "quantity": qty
+        # ❌ timeInForce 제거
+        # ❌ closePosition="false"도 굳이 보낼 필요 없음 (기본 false)
     }
     if position_side:
         params["positionSide"] = position_side
     return _binance_post("/fapi/v1/order", params)
+
 
 
 def place_trailing(symbol: str, side: str, qty: float, activation_price: float, callback_rate: float, position_side: Optional[str] = None) -> dict:
