@@ -772,6 +772,37 @@ def bnc_trade():
         log.exception("bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# === TradingView → Private /bnc/trade 프록시 (Pine alert() JSON 호환) ===
+@app.post("/tv")
+def tv_proxy():
+    data = request.get_json(silent=True, force=True) or {}
+    # Pine 포맷: {"secret":"...","tag":"BNC_POSITION","symbol":"BTCUSDT","tf":"5","p":"...","sig":"LONG_5m"}
+    symbol = str(data.get("symbol","")).upper()
+    sig    = str(data.get("sig","")).upper()
+
+    if not symbol or not sig:
+        return jsonify({"ok": False, "error": "missing symbol/sig"}), 400
+
+    if   sig.startswith("LONG"):  action = "OPEN_LONG"
+    elif sig.startswith("SHORT"): action = "OPEN_SHORT"
+    else:                         return jsonify({"ok": True, "skipped": "unknown-sig"})
+
+    note = f"tf={data.get('tf','')}, price={data.get('p','')}, sig={sig}"
+
+    private_base = os.getenv("PRIVATE_BASE", "http://bbangdol-bnc-bot-private:10000")
+    payload = {
+        "secret": os.getenv("BNC_SECRET", ""),  # 프라이빗 /bnc/trade에서 검증
+        "symbol": symbol,
+        "action": action,
+        "note":   note
+    }
+    try:
+        r = requests.post(f"{private_base}/bnc/trade", json=payload, timeout=10)
+        return (r.text, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # =========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
