@@ -342,19 +342,26 @@ def _binance_post(path: str, params: dict) -> dict:
     return data
 
 
-def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False, position_side: Optional[str] = None, client_id: Optional[str] = None) -> dict:
+def place_market_order(symbol: str, side: str, qty: float,
+                       reduce_only: bool = False,
+                       position_side: Optional[str] = None,
+                       client_id: Optional[str] = None) -> dict:
     params = {
         "symbol": symbol,
-        "side": side,                 # BUY / SELL
+        "side": side,               # BUY / SELL
         "type": "MARKET",
-        "quantity": qty,              # 코인 수량
-        "reduceOnly": "true" if reduce_only else "false",
+        "quantity": qty,            # 코인 수량
     }
+    # ✅ 진입 주문에는 reduceOnly를 보내지 말고, 청산일 때만 붙인다
+    if reduce_only:
+        params["reduceOnly"] = "true"
+
     if position_side:
         params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
     if client_id:
         params["newClientOrderId"] = client_id[:36]
     return _binance_post("/fapi/v1/order", params)
+
 
 
 def place_stop_market(symbol: str, side: str, qty: float, stop_price: float, position_side: Optional[str] = None) -> dict:
