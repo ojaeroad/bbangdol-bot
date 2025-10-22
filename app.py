@@ -218,6 +218,12 @@ def tv_webhook_new():
     symbol = str(data.get("symbol", "")).strip()
     return _handle_payload(route, msg, symbol)
 
+
+def _is_oneway() -> bool:
+    # 기본 HEDGE. 환경변수로 ONEWAY 라고 넣으면 원웨이 처리
+    return (os.getenv("BINANCE_POSITION_MODE", "HEDGE").upper() != "HEDGE")
+
+
 # =========================================================
 # === BNC_POSITION 전용 (bbangdol_bnc_bot)
 # =========================================================
@@ -729,45 +735,64 @@ def bnc_trade():
         cid = f"bnc_{symbol}_{action}_{int(now())}"
 
         # === 실행 ===
+        # 모드에 따라 positionSide 세팅 (ONEWAY면 None → 파라미터 자체를 안 보냄)
+        ps_long  = None if _is_oneway() else "LONG"
+        ps_short = None if _is_oneway() else "SHORT"
+
         if action == "OPEN_LONG":
-            res_open = place_market_order(symbol, "BUY", qty, reduce_only=False, position_side="LONG", client_id=cid)
-            # SL & Trailing
+            res_open = place_market_order(symbol, "BUY", qty, reduce_only=False,
+                                          position_side=ps_long, client_id=cid)
             sl_pct = float(cfg["sl"])
             sl_price = price * (1 - sl_pct/100.0)
-            place_stop_market(symbol, "SELL", qty, stop_price=sl_price, position_side="LONG")
+            place_stop_market(symbol, "SELL", qty, stop_price=sl_price,
+                              position_side=ps_long)
             tr = cfg["trail"]; act = float(tr.get("act", 0.6)); cb=float(tr.get("cb",0.2))
             activation = price * (1 - act/100.0)
-            place_trailing(symbol, "SELL", qty, activation_price=activation, callback_rate=cb, position_side="LONG")
+            place_trailing(symbol, "SELL", qty, activation_price=activation,
+                           callback_rate=cb, position_side=ps_long)
             result = res_open
             save_pair_cfg(symbol, {"legs": min(legs+1, len(PHASES))})
+
         elif action == "OPEN_SHORT":
-            res_open = place_market_order(symbol, "SELL", qty, reduce_only=False, position_side="SHORT", client_id=cid)
+            res_open = place_market_order(symbol, "SELL", qty, reduce_only=False,
+                                          position_side=ps_short, client_id=cid)
             sl_pct = float(cfg["sl"])
             sl_price = price * (1 + sl_pct/100.0)
-            place_stop_market(symbol, "BUY", qty, stop_price=sl_price, position_side="SHORT")
+            place_stop_market(symbol, "BUY", qty, stop_price=sl_price,
+                              position_side=ps_short)
             tr = cfg["trail"]; act = float(tr.get("act", 0.6)); cb=float(tr.get("cb",0.2))
             activation = price * (1 + act/100.0)
-            place_trailing(symbol, "BUY", qty, activation_price=activation, callback_rate=cb, position_side="SHORT")
+            place_trailing(symbol, "BUY", qty, activation_price=activation,
+                           callback_rate=cb, position_side=ps_short)
             result = res_open
             save_pair_cfg(symbol, {"legs": min(legs+1, len(PHASES))})
+
         elif action == "CLOSE_LONG":
-            result = place_market_order(symbol, "SELL", qty, reduce_only=True, position_side="LONG", client_id=cid)
+            result = place_market_order(symbol, "SELL", qty, reduce_only=True,
+                                        position_side=ps_long, client_id=cid)
             save_pair_cfg(symbol, {"legs": 0})
+
         else:  # CLOSE_SHORT
-            result = place_market_order(symbol, "BUY", qty, reduce_only=True, position_side="SHORT", client_id=cid)
+            result = place_market_order(symbol, "BUY", qty, reduce_only=True,
+                                        position_side=ps_short, client_id=cid)
             save_pair_cfg(symbol, {"legs": 0})
 
         # 텔레그램 확인 메시지
         try:
             bnc_token = os.getenv("BNC_BOT_TOKEN")
             bnc_chat  = os.getenv("BNC_CHAT_ID")
-            confirm   = f"[TRADE] {symbol} {action} qty={qty}\norderId={result.get('orderId')}  status={result.get('status')}\n{note}\n🌐 {STATE['global_mode']}  🧩 SPLIT={'ON' if STATE['split_enabled'] else 'OFF'}  legs={get_pair_cfg(symbol)['legs']}"
+            confirm   = (f"[TRADE] {symbol} {action} qty={qty}\n"
+                         f"orderId={result.get('orderId')}  status={result.get('status')}\n"
+                         f"{note}\n🌐 {STATE['global_mode']}  🧩 SPLIT="
+                         f"{'ON' if STATE['split_enabled'] else 'OFF'}  "
+                         f"legs={get_pair_cfg(symbol)['legs']}")
             if bnc_token and bnc_chat:
                 post_telegram_with_token(bnc_token, bnc_chat, confirm)
         except Exception:
             pass
 
         return jsonify({"ok": True, "result": result})
+
     except Exception as e:
         log.exception("bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -801,6 +826,7 @@ def tv_proxy():
         return (r.text, r.status_code, r.headers.items())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 # =========================================================
