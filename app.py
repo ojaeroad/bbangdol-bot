@@ -1,4 +1,4 @@
-# app.py — unified webhook + BNC trade + TG UI (global mode & split-entry)
+# app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
 import os, json, logging, time, re, hmac, hashlib, math
 from time import time as now
 from typing import Dict, Any, Optional, Tuple
@@ -70,8 +70,6 @@ TG_EDIT = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
 TG_ANSW = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
 MAX_LEN = 3900
 
-# 가벼운 리트라이 래퍼
-
 def _post_json(url: str, payload: dict, tries: int = 2, timeout: int = 10):
     last_err = None
     for _ in range(tries):
@@ -82,13 +80,11 @@ def _post_json(url: str, payload: dict, tries: int = 2, timeout: int = 10):
             time.sleep(0.2)
     raise last_err
 
-
 def safe_text(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
     return s if len(s) <= MAX_LEN else s[:MAX_LEN - 20] + "\n...[truncated]"
-
 
 def post_telegram(chat_id: int | str, text: str, parse_mode: Optional[str] = None, reply_markup: Optional[dict] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": safe_text(text)}
@@ -99,23 +95,19 @@ def post_telegram(chat_id: int | str, text: str, parse_mode: Optional[str] = Non
     r = _post_json(TG_SEND, payload)
     return r.json()
 
-
 def edit_message(chat_id: int | str, message_id: int, text: str, reply_markup: Optional[dict] = None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": safe_text(text)}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     _post_json(TG_EDIT, payload)
 
-
 def answer_callback_query(cq_id: str, text: str = ""):
     _post_json(TG_ANSW, {"callback_query_id": cq_id, "text": text, "show_alert": False})
 
 # --- env helpers ---
-
 def _read_optional(env_name: str) -> Optional[str]:
     v = os.getenv(env_name)
     return v.strip() if v and v.strip() != "" else None
-
 
 def build_route_map() -> Dict[str, str]:
     m: Dict[str, str] = {}
@@ -145,7 +137,6 @@ def build_route_map() -> Dict[str, str]:
 
 ROUTE_TO_CHAT: Dict[str, str] = build_route_map()
 
-
 def route_to_chat_id(route: str) -> Optional[str]:
     return ROUTE_TO_CHAT.get(route)
 
@@ -163,13 +154,11 @@ def _require_webhook_secret(d: dict) -> Optional[tuple]:
 def health():
     return jsonify({"ok": True, "status": "healthy", "routes": list(ROUTE_TO_CHAT.keys())})
 
-
 @app.get("/routes")
 def routes_dump():
     return jsonify({"routes": ROUTE_TO_CHAT})
 
-# --- core handler ---
-
+# --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
         return jsonify({"ok": False, "error": "missing route or msg"}), 400
@@ -196,7 +185,7 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
         log.exception("Telegram send exception")
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
 
-# --- old endpoint (legacy) ---
+# --- old endpoint (legacy for 불꽃타점) ---
 @app.post("/bot")
 def tv_webhook_legacy():
     data = request.get_json(silent=True, force=True) or {}
@@ -207,7 +196,7 @@ def tv_webhook_legacy():
     symbol = str(data.get("symbol", "")).strip()
     return _handle_payload(route, msg, symbol)
 
-# --- new accumulation endpoint ---
+# --- new accumulation endpoint (겸용) ---
 @app.post("/webhook")
 def tv_webhook_new():
     data = request.get_json(silent=True, force=True) or {}
@@ -217,7 +206,6 @@ def tv_webhook_new():
     msg    = str(data.get("message", data.get("msg", ""))).strip()
     symbol = str(data.get("symbol", "")).strip()
     return _handle_payload(route, msg, symbol)
-
 
 def _is_oneway() -> bool:
     # 기본 HEDGE. 환경변수로 ONEWAY 라고 넣으면 원웨이 처리
@@ -235,7 +223,6 @@ def post_telegram_with_token(bot_token: str, chat_id: str, text: str, reply_mark
         payload["reply_markup"] = reply_markup
     return _post_json(url, payload).json()
 
-
 @app.post("/bnc/dryrun")
 def bnc_dryrun():
     secret = os.getenv("BNC_SECRET")
@@ -247,7 +234,6 @@ def bnc_dryrun():
         "chat_id": os.getenv("BNC_CHAT_ID"),
         "bot": "bbangdol_bnc_bot"
     })
-
 
 @app.post("/bnc")
 def bnc_send():
@@ -292,17 +278,14 @@ def bnc_send():
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
-
 def _sign(query: str, secret: str) -> str:
     return hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-
 
 def _binance_base() -> str:
     base = _read_optional("BINANCE_FUTURES_BASE")
     if base:
         return base
     return "https://testnet.binancefuture.com" if os.getenv("BINANCE_IS_TESTNET", "1") == "1" else "https://fapi.binance.com"
-
 
 def _binance_get(path: str, params: dict) -> dict:
     base = _binance_base()
@@ -325,7 +308,6 @@ def _binance_get(path: str, params: dict) -> dict:
         raise RuntimeError(f"Binance HTTP {r.status_code} {data}")
     return data
 
-
 def _binance_post(path: str, params: dict) -> dict:
     base = _binance_base()
     api_key = os.getenv("BINANCE_API_KEY")
@@ -347,7 +329,6 @@ def _binance_post(path: str, params: dict) -> dict:
         raise RuntimeError(f"Binance HTTP {r.status_code} {data}")
     return data
 
-
 def place_market_order(symbol: str, side: str, qty: float,
                        reduce_only: bool = False,
                        position_side: Optional[str] = None,
@@ -368,8 +349,6 @@ def place_market_order(symbol: str, side: str, qty: float,
         params["newClientOrderId"] = client_id[:36]
     return _binance_post("/fapi/v1/order", params)
 
-
-
 def place_stop_market(symbol: str, side: str, qty: float, stop_price: float,
                       position_side: Optional[str] = None) -> dict:
     params = {
@@ -379,14 +358,10 @@ def place_stop_market(symbol: str, side: str, qty: float, stop_price: float,
         "stopPrice": f"{stop_price:.8f}",
         "reduceOnly": "true",
         "quantity": qty
-        # ❌ timeInForce 제거
-        # ❌ closePosition="false"도 굳이 보낼 필요 없음 (기본 false)
     }
     if position_side:
         params["positionSide"] = position_side
     return _binance_post("/fapi/v1/order", params)
-
-
 
 def place_trailing(symbol: str, side: str, qty: float, activation_price: float, callback_rate: float, position_side: Optional[str] = None) -> dict:
     params = {
@@ -402,22 +377,18 @@ def place_trailing(symbol: str, side: str, qty: float, activation_price: float, 
         params["positionSide"] = position_side
     return _binance_post("/fapi/v1/order", params)
 
-
 def get_mark_price(symbol: str) -> float:
     base = _binance_base()
     r = requests.get(f"{base}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
     data = r.json()
     return float(data["markPrice"])
 
-
 def get_account_available_usdt() -> float:
     data = _binance_get("/fapi/v2/balance", {})
     for b in data:
         if b.get("asset") == "USDT":
-            # availableBalance: 선물 사용가능 잔고
             return float(b.get("availableBalance", 0))
     return 0.0
-
 
 def get_symbol_filters(symbol: str) -> dict:
     info = _binance_get("/fapi/v1/exchangeInfo", {})
@@ -429,41 +400,50 @@ def get_symbol_filters(symbol: str) -> dict:
             return f
     return {}
 
-
 def round_step(value: float, step: float) -> float:
     if step <= 0: return value
     return math.floor(value / step) * step
 
 # =========================================================
-# === STATE (설정/포지션/분할)
+# === STATE & RISK PRESETS (multi-symbol + risk modes)
 # =========================================================
+
+RISK_PRESETS = {
+    "safe":       {"sl": 1.5, "trail": {"act": 1.5, "cb": 0.4}, "phases": [0.20, 0.25, 0.33, 0.50, 1.00]},
+    "normal":     {"sl": 1.0, "trail": {"act": 1.0, "cb": 0.3}, "phases": [0.25, 0.33, 0.50, 1.00]},
+    "aggressive": {"sl": 0.7, "trail": {"act": 0.6, "cb": 0.2}, "phases": [0.33, 0.50, 1.00]},
+}
+
+def _risk_or_default(name: str) -> str:
+    name = (name or "normal").lower()
+    return name if name in RISK_PRESETS else "normal"
+
 STATE = {
-    "global_mode": "BOTH",     # BOTH | LONG_ONLY | SHORT_ONLY
-    "split_enabled": True,      # 분할 진입 on/off
-    "pairs": {
-        # "BTCUSDT": {"mode":"LONG","lev":10,"sl":1.0,"trail":{"act":0.6,"cb":0.2},"legs":0}
+    "global_mode": "BOTH",    # BOTH | LONG_ONLY | SHORT_ONLY
+    "split_enabled": True,    # 분할 진입 on/off
+    "pairs": {                # 심볼별 저장소
+        # "BTCUSDT": {"dir":"BOTH","lev":10,"sl":1.0,"trail":{"act":0.6,"cb":0.2},"legs":0,"risk":"normal"}
     }
 }
-PHASES = [0.20, 0.25, 0.33, 0.50, 1.00]  # 남은 USDT 대비 분할 비율
-
 
 def get_pair_cfg(sym: str) -> dict:
     d = STATE["pairs"].get(sym, {})
     return {
-        "mode": d.get("mode", "BOTH"),
-        "lev": d.get("lev", 10),
-        "sl": d.get("sl", 1.0),
+        "dir":   d.get("dir", "BOTH"),
+        "lev":   d.get("lev", 10),
+        "sl":    d.get("sl", 1.0),
         "trail": d.get("trail", {"act":0.6,"cb":0.2}),
-        "legs": d.get("legs", 0),
+        "legs":  d.get("legs", 0),
+        "risk":  _risk_or_default(d.get("risk", "normal"))
     }
 
-
 def save_pair_cfg(sym: str, cfg: dict):
-    STATE["pairs"][sym] = {**get_pair_cfg(sym), **cfg}
-
+    base = get_pair_cfg(sym)
+    base.update(cfg)
+    STATE["pairs"][sym] = base
 
 def allowed_by_mode(sym: str, side: str) -> bool:
-    local = get_pair_cfg(sym)["mode"]
+    local = get_pair_cfg(sym)["dir"]
     globalm = STATE["global_mode"]
     eff = local if local in ("LONG","SHORT","BOTH","LONG_ONLY","SHORT_ONLY") else globalm
     eff = {"LONG_ONLY":"LONG","SHORT_ONLY":"SHORT"}.get(eff, eff)
@@ -472,19 +452,34 @@ def allowed_by_mode(sym: str, side: str) -> bool:
     if eff == "SHORT": return side == "SHORT"
     return True
 
+def effective_params(sym: str) -> dict:
+    """종목 설정 + 리스크 프리셋을 합쳐 실제 주문 파라미터 산출."""
+    cfg = get_pair_cfg(sym)
+    rkey = cfg["risk"]
+    rp = RISK_PRESETS[rkey]
+    sl = float(cfg.get("sl") or rp["sl"])
+    trail = cfg.get("trail") or rp["trail"]
+    phases = rp["phases"]
+    return {"sl": sl, "trail": trail, "phases": phases, "lev": cfg["lev"], "dir": cfg["dir"], "risk": rkey, "legs": cfg["legs"]}
+
 # =========================================================
 # === Telegram UI (inline buttons + force reply)
 # =========================================================
 UI: Dict[int, dict] = {}  # chat_id -> state
 
-
 def ui_get(chat_id: int) -> dict:
     return UI.setdefault(chat_id, {"mode":"idle", "cfg":{}})
-
 
 def ui_reset(chat_id: int):
     UI[chat_id] = {"mode":"idle", "cfg":{}}
 
+def kb_risk() -> dict:
+    return {"inline_keyboard":[
+        [{"text":"안전(safe)","callback_data":"RISK:safe"},
+         {"text":"보수(normal)","callback_data":"RISK:normal"},
+         {"text":"공격(aggressive)","callback_data":"RISK:aggressive"}],
+        [{"text":"⏪ 뒤로","callback_data":"RISK:BACK"}]
+    ]}
 
 def kb_main(cfg: dict) -> dict:
     sym = cfg.get("symbol","미설정")
@@ -493,6 +488,7 @@ def kb_main(cfg: dict) -> dict:
     sl  = cfg.get("sl","미설정")
     trail = cfg.get("trail",{})
     trail_txt = f'{trail.get("act","-")}/{trail.get("cb","-")}'
+    risk = cfg.get("risk","normal")
     rows = [
         [{"text": f"① 종목: {sym}", "callback_data": "ADD:SYMBOL"}],
         [{"text": "② 방향 LONG", "callback_data": "ADD:DIR:LONG"},
@@ -501,14 +497,14 @@ def kb_main(cfg: dict) -> dict:
         [{"text": f"③ 레버리지: {lev}", "callback_data": "ADD:LEV"}],
         [{"text": f"④ 손절%: {sl}", "callback_data": "ADD:SL"}],
         [{"text": f"⑤ 트레일링(act/cb): {trail_txt}", "callback_data": "ADD:TRAIL"}],
+        [{"text": f"⑥ 모드(리스크): {risk}", "callback_data": "ADD:RISK"}],
         [{"text": "✅ 저장", "callback_data": "ADD:SAVE"},
          {"text": "↩️ 취소", "callback_data": "ADD:CANCEL"}],
-        # --- 글로벌/분할 토글 ---
         [{"text": f"🌐 GLOBAL: {STATE['global_mode']}", "callback_data":"GLOB:MODE"}],
         [{"text": f"🧩 분할진입: {'ON' if STATE['split_enabled'] else 'OFF'}", "callback_data":"SPLIT:TOGGLE"}],
+        [{"text": "📜 저장된 종목 보기/열기/삭제", "callback_data":"LIST:OPEN"}]
     ]
     return {"inline_keyboard": rows}
-
 
 def kb_lev() -> dict:
     return {"inline_keyboard":[
@@ -516,13 +512,11 @@ def kb_lev() -> dict:
         [{"text":"직접입력","callback_data":"LEV:CUSTOM"},{"text":"⏪ 뒤로","callback_data":"LEV:BACK"}]
     ]}
 
-
 def kb_sl() -> dict:
     return {"inline_keyboard":[
         [{"text":"0.5%","callback_data":"SL:0.5"},{"text":"1%","callback_data":"SL:1"},{"text":"1.5%","callback_data":"SL:1.5"},{"text":"2%","callback_data":"SL:2"}],
         [{"text":"직접입력","callback_data":"SL:CUSTOM"},{"text":"⏪ 뒤로","callback_data":"SL:BACK"}]
     ]}
-
 
 def kb_trail() -> dict:
     return {"inline_keyboard":[
@@ -533,10 +527,8 @@ def kb_trail() -> dict:
          {"text":"⏪ 뒤로","callback_data":"TRAIL:BACK"}]
     ]}
 
-
 def force_reply(ph: str) -> dict:
     return {"force_reply": True, "input_field_placeholder": ph}
-
 
 @app.post("/tg")
 def tg_webhook():
@@ -564,6 +556,14 @@ def tg_webhook():
         elif data == "ADD:TRAIL":
             st["mode"] = "pick_trail"
             post_telegram(chat_id, "트레일링 (activate/callback)", reply_markup=kb_trail())
+        elif data == "ADD:RISK":
+            st["mode"] = "pick_risk"
+            post_telegram(chat_id, "모드를 선택하세요 (안전/보수/공격).", reply_markup=kb_risk())
+        elif data == "RISK:BACK":
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
+        elif data.startswith("RISK:"):
+            st["cfg"]["risk"] = data.split(":")[1]
+            post_telegram(chat_id, f"리스크 모드: {st['cfg']['risk']}", reply_markup=kb_main(st["cfg"]))
         elif data == "ADD:SAVE":
             cfg = st["cfg"]; sym = cfg.get("symbol")
             if not sym:
@@ -571,11 +571,27 @@ def tg_webhook():
                 return jsonify({"ok":True})
             mode = cfg.get("dir","BOTH")
             lev  = int(cfg.get("lev",10))
-            sl   = float(cfg.get("sl",1.0))
-            trail= cfg.get("trail", {"act":0.6,"cb":0.2})
-            save_pair_cfg(sym, {"mode":"LONG" if mode=="LONG" else ("SHORT" if mode=="SHORT" else "BOTH"),
-                                "lev":lev, "sl":sl, "trail":{"act":float(trail["act"]), "cb":float(trail["cb"])}, "legs":0})
-            post_telegram(chat_id, f"✅ 저장 완료\nSYMBOL: {sym}\nDIR: {mode}\nLEV: {lev}x\nSL: {sl}%\nTRAIL: {trail['act']}/{trail['cb']}\n🌐 GLOBAL={STATE['global_mode']}  🧩 SPLIT={'ON' if STATE['split_enabled'] else 'OFF'}", reply_markup=kb_main(st["cfg"]))
+            risk = _risk_or_default(cfg.get("risk","normal"))
+            sl   = float(cfg.get("sl",0) or 0)
+            trail= cfg.get("trail") or {}
+            if not sl:
+                sl = RISK_PRESETS[risk]["sl"]
+            if not trail or "act" not in trail or "cb" not in trail:
+                trail = RISK_PRESETS[risk]["trail"]
+            save_pair_cfg(sym, {
+                "dir":"LONG" if mode=="LONG" else ("SHORT" if mode=="SHORT" else "BOTH"),
+                "lev":lev,
+                "sl":float(sl),
+                "trail":{"act":float(trail["act"]), "cb":float(trail["cb"])},
+                "risk": risk,
+                "legs":0
+            })
+            ep = effective_params(sym)
+            msgtxt = (f"✅ 저장 완료\nSYMBOL: {sym}\nDIR: {mode}\nLEV: {lev}x\n"
+                      f"SL: {ep['sl']}% (risk={risk})\n"
+                      f"TRAIL: {ep['trail']['act']}/{ep['trail']['cb']}\n"
+                      f"🌐 GLOBAL={STATE['global_mode']}  🧩 SPLIT={'ON' if STATE['split_enabled'] else 'OFF'}")
+            post_telegram(chat_id, msgtxt, reply_markup=kb_main(st["cfg"]))
         elif data == "ADD:CANCEL":
             ui_reset(chat_id)
             post_telegram(chat_id, "취소했습니다. /add 로 다시 시작하세요.")
@@ -605,13 +621,40 @@ def tg_webhook():
             st["cfg"]["trail"] = {"act": float(act), "cb": float(cb)}
             post_telegram(chat_id, f"트레일링 {act}/{cb} 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "GLOB:MODE":
-            # 순환: BOTH -> LONG_ONLY -> SHORT_ONLY -> BOTH
             nxt = {"BOTH":"LONG_ONLY", "LONG_ONLY":"SHORT_ONLY", "SHORT_ONLY":"BOTH"}[STATE["global_mode"]]
             STATE["global_mode"] = nxt
             post_telegram(chat_id, f"🌐 GLOBAL 모드: {STATE['global_mode']}", reply_markup=kb_main(st["cfg"]))
         elif data == "SPLIT:TOGGLE":
             STATE["split_enabled"] = not STATE["split_enabled"]
             post_telegram(chat_id, f"🧩 분할진입: {'ON' if STATE['split_enabled'] else 'OFF'}", reply_markup=kb_main(st["cfg"]))
+        elif data == "LIST:OPEN":
+            if not STATE["pairs"]:
+                post_telegram(chat_id, "저장된 종목이 없습니다.", reply_markup=kb_main(st["cfg"]))
+            else:
+                rows = []
+                for s in sorted(STATE["pairs"].keys()):
+                    rows.append([
+                        {"text": f"열기 {s}", "callback_data": f"LIST:OPEN:{s}"},
+                        {"text": "삭제", "callback_data": f"LIST:DEL:{s}"}
+                    ])
+                rows.append([{"text":"⏪ 뒤로","callback_data":"LIST:BACK"}])
+                post_telegram(chat_id, "저장된 종목", reply_markup={"inline_keyboard": rows})
+        elif data.startswith("LIST:OPEN:"):
+            sym = data.split(":")[2]
+            st["cfg"]["symbol"] = sym
+            pc = get_pair_cfg(sym)
+            st["cfg"]["dir"]   = pc["dir"]
+            st["cfg"]["lev"]   = pc["lev"]
+            st["cfg"]["sl"]    = pc["sl"]
+            st["cfg"]["trail"] = pc["trail"]
+            st["cfg"]["risk"]  = pc["risk"]
+            post_telegram(chat_id, f"{sym} 불러옴.", reply_markup=kb_main(st["cfg"]))
+        elif data.startswith("LIST:DEL:"):
+            sym = data.split(":")[2]
+            STATE["pairs"].pop(sym, None)
+            post_telegram(chat_id, f"{sym} 삭제 완료.", reply_markup=kb_main(st["cfg"]))
+        elif data == "LIST:BACK":
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         return jsonify({"ok": True})
 
     if msg:
@@ -652,6 +695,8 @@ def tg_webhook():
             st["mode"] = "idle"
             if "dir" not in st["cfg"]:
                 st["cfg"]["dir"] = "BOTH"
+            if "risk" not in st["cfg"]:
+                st["cfg"]["risk"] = "normal"
             post_telegram(chat_id, "아래 버튼으로 설정하세요.", reply_markup=kb_main(st["cfg"]))
             return jsonify({"ok": True})
 
@@ -666,9 +711,8 @@ def tg_webhook():
     return jsonify({"ok": True})
 
 # =========================================================
-# === /bnc/trade : 수량 자동계산 + SL/트레일링 세팅
+# === /bnc/trade : 수량 자동계산 + SL/트레일링(리스크 프리셋 반영)
 # =========================================================
-# BNC_SYMBOLS이 비어있으면 -> 모든 심볼 허용, 채워두면 -> 해당 심볼만 허용
 _raw = _read_optional("BNC_SYMBOLS")
 SYM_WHITELIST = set(s.strip().upper() for s in _raw.split(",") if s.strip()) if _raw else None
 
@@ -676,7 +720,7 @@ SYM_WHITELIST = set(s.strip().upper() for s in _raw.split(",") if s.strip()) if 
 def bnc_trade():
     """
     Body (Pine Stage2):
-      {"secret":"<BNC_SECRET>", "symbol":"BTCUSDT", "action":"OPEN_LONG|OPEN_SHORT", "note":"tf=..."}
+      {"secret":"<BNC_SECRET>", "symbol":"BTCUSDT", "action":"OPEN_LONG|OPEN_SHORT|CLOSE_LONG|CLOSE_SHORT", "note":"tf=..."}
     qty가 비어있어도 서버가 자동으로 계산.
     """
     data = request.get_json(silent=True, force=True) or {}
@@ -688,45 +732,41 @@ def bnc_trade():
     action = str(data.get("action", "")).upper()
     note   = str(data.get("note", ""))
 
-    # 화이트리스트가 있을 때만 검사 (없으면 모든 심볼 허용)
     if SYM_WHITELIST and symbol not in SYM_WHITELIST:
         return jsonify({"ok": False, "error": f"symbol not allowed: {symbol}"}), 400
-
     if action not in {"OPEN_LONG", "CLOSE_LONG", "OPEN_SHORT", "CLOSE_SHORT"}:
         return jsonify({"ok": False, "error": "invalid action"}), 400
-
 
     side = "LONG" if "LONG" in action else "SHORT"
     if action.startswith("OPEN") and not allowed_by_mode(symbol, side):
         return jsonify({"ok": True, "skipped": "mode"})
 
     try:
-        # --- 현재 설정/상태 로드
-        cfg = get_pair_cfg(symbol)
-        legs = cfg["legs"]
+        # --- 설정/프리셋 결합 파라미터 로드
+        ep   = effective_params(symbol)
+        legs = ep["legs"]
+
         # --- 수량 계산
         price = get_mark_price(symbol)
         avail = get_account_available_usdt()
-        lev   = cfg["lev"]
+        lev   = ep["lev"]
 
-        # 분할 ON이면 PHASES, OFF면 항상 1단계만(=전체)
+        phases = ep["phases"]
         if STATE["split_enabled"]:
-            phase = PHASES[legs] if legs < len(PHASES) else 0.0
+            phase = phases[legs] if legs < len(phases) else 0.0
         else:
-            phase = 1.0  # 필요 시 0.2로 바꿀 수 있음
+            phase = 1.0
 
         if action.startswith("OPEN"):
             alloc_usdt = avail * phase
             if alloc_usdt <= 0:
                 return jsonify({"ok": False, "error": "no available balance"})
             notional = alloc_usdt * lev
-            # 심볼 필터에 맞춰 qty 라운딩
             filters = get_symbol_filters(symbol)
             step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
             min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0.0"))
             qty = max(round_step(notional / price, step), min_qty)
         else:
-            # CLOSE_*: 포지션 조회 없이 최소치로 반대 주문(실전은 포지션 조회 권장)
             filters = get_symbol_filters(symbol)
             step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
             min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0.0"))
@@ -735,37 +775,36 @@ def bnc_trade():
         cid = f"bnc_{symbol}_{action}_{int(now())}"
 
         # === 실행 ===
-        # 모드에 따라 positionSide 세팅 (ONEWAY면 None → 파라미터 자체를 안 보냄)
         ps_long  = None if _is_oneway() else "LONG"
         ps_short = None if _is_oneway() else "SHORT"
 
         if action == "OPEN_LONG":
             res_open = place_market_order(symbol, "BUY", qty, reduce_only=False,
                                           position_side=ps_long, client_id=cid)
-            sl_pct = float(cfg["sl"])
+            sl_pct = float(ep["sl"])
             sl_price = price * (1 - sl_pct/100.0)
             place_stop_market(symbol, "SELL", qty, stop_price=sl_price,
                               position_side=ps_long)
-            tr = cfg["trail"]; act = float(tr.get("act", 0.6)); cb=float(tr.get("cb",0.2))
+            tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
             activation = price * (1 - act/100.0)
             place_trailing(symbol, "SELL", qty, activation_price=activation,
                            callback_rate=cb, position_side=ps_long)
             result = res_open
-            save_pair_cfg(symbol, {"legs": min(legs+1, len(PHASES))})
+            save_pair_cfg(symbol, {"legs": min(legs+1, len(phases))})
 
         elif action == "OPEN_SHORT":
             res_open = place_market_order(symbol, "SELL", qty, reduce_only=False,
                                           position_side=ps_short, client_id=cid)
-            sl_pct = float(cfg["sl"])
+            sl_pct = float(ep["sl"])
             sl_price = price * (1 + sl_pct/100.0)
             place_stop_market(symbol, "BUY", qty, stop_price=sl_price,
                               position_side=ps_short)
-            tr = cfg["trail"]; act = float(tr.get("act", 0.6)); cb=float(tr.get("cb",0.2))
+            tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
             activation = price * (1 + act/100.0)
             place_trailing(symbol, "BUY", qty, activation_price=activation,
                            callback_rate=cb, position_side=ps_short)
             result = res_open
-            save_pair_cfg(symbol, {"legs": min(legs+1, len(PHASES))})
+            save_pair_cfg(symbol, {"legs": min(legs+1, len(phases))})
 
         elif action == "CLOSE_LONG":
             result = place_market_order(symbol, "SELL", qty, reduce_only=True,
@@ -785,7 +824,7 @@ def bnc_trade():
                          f"orderId={result.get('orderId')}  status={result.get('status')}\n"
                          f"{note}\n🌐 {STATE['global_mode']}  🧩 SPLIT="
                          f"{'ON' if STATE['split_enabled'] else 'OFF'}  "
-                         f"legs={get_pair_cfg(symbol)['legs']}")
+                         f"risk={ep['risk']}  legs={get_pair_cfg(symbol)['legs']}")
             if bnc_token and bnc_chat:
                 post_telegram_with_token(bnc_token, bnc_chat, confirm)
         except Exception:
@@ -797,7 +836,7 @@ def bnc_trade():
         log.exception("bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# === TradingView → Private /bnc/trade 프록시 (Pine alert() JSON 호환) ===
+# === TradingView → Private /bnc/trade 프록시 (기존 유지) ===
 @app.post("/tv")
 def tv_proxy():
     data = request.get_json(silent=True, force=True) or {}
@@ -816,7 +855,7 @@ def tv_proxy():
 
     private_base = os.getenv("PRIVATE_BASE", "http://bbangdol-bnc-bot-private:10000")
     payload = {
-        "secret": os.getenv("BNC_SECRET", ""),  # 프라이빗 /bnc/trade에서 검증
+        "secret": os.getenv("BNC_SECRET", ""),
         "symbol": symbol,
         "action": action,
         "note":   note
@@ -826,8 +865,6 @@ def tv_proxy():
         return (r.text, r.status_code, r.headers.items())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
 
 # =========================================================
 if __name__ == "__main__":
