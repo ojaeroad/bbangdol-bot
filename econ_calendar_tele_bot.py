@@ -92,8 +92,11 @@ def fetch_events_24h(now_sg: datetime) -> List[Dict[str, Any]]:
     return fetch_events_range(d1, d2)
 
 def fetch_events_range(d1_sg: datetime, d2_sg: datetime) -> List[Dict[str, Any]]:
-    # TradingEconomics는 Basic Auth 대신 쿼리스트링 c=key:secret 를 요구
-    # 일부 환경에서 params에 넣은 값이 로깅상 보이지 않는 혼동을 막기 위해 URL을 직접 구성
+    """
+    TE가 간혹 범위 밖(과거)의 이벤트를 돌려줄 수 있어
+    로컬에서 한 번 더 'd1_sg <= 날짜 < d2_sg' 필터링을 강제한다.
+    """
+    # 인증과 기본 파라미터 (TE는 Basic Auth가 아닌 c=key:secret 쿼리 파라미터 사용)
     base = f"{TE_BASE}?c={quote_plus(TE_AUTH)}&format=json"
     params = {
         "country": ",".join(COUNTRIES),  # 다중국가: 쉼표 구분
@@ -102,15 +105,41 @@ def fetch_events_range(d1_sg: datetime, d2_sg: datetime) -> List[Dict[str, Any]]
         "importance": ",".join(IMPORTANCE),
     }
     full_url = f"{base}&{urlencode(params)}"
+
     try:
-        log.info("TE GET %s", full_url)  # 최종 요청 URL 확인용
+        log.info("TE GET %s", full_url)
         r = requests.get(full_url, timeout=20)
         r.raise_for_status()
-        data = r.json()
-        # TE 필드 예: { 'Country', 'Category', 'Event', 'Date', 'Actual', 'Previous', 'Forecast' }
-        data = [e for e in data if e.get("Country") in COUNTRIES]
-        data.sort(key=lambda x: x.get("Date", ""))
-        return data
+        raw = r.json()
+
+        # 1) 국가 필터
+        cand = [e for e in raw if e.get("Country") in COUNTRIES]
+
+        # 2) 날짜 필터 (싱가포르 시간 기준 강제)
+        events: List[Dict[str, Any]] = []
+        for e in cand:
+            try:
+                evtdt_sg = _to_sg(e.get("Date"))
+            except Exception:
+                continue
+            if d1_sg <= evtdt_sg < d2_sg:
+                events.append(e)
+
+        # 3) 날짜 정렬
+        events.sort(key=lambda x: x.get("Date", ""))
+
+        # 4) 디버깅 로그
+        if events:
+            log.info("Filtered events: %s ~ %s (SG)",
+                     _to_sg(events[0]["Date"]).strftime("%Y-%m-%d %H:%M"),
+                     _to_sg(events[-1]["Date"]).strftime("%Y-%m-%d %H:%M"))
+        else:
+            log.info("Filtered events: none in range %s ~ %s (SG)",
+                     d1_sg.strftime("%Y-%m-%d %H:%M"),
+                     d2_sg.strftime("%Y-%m-%d %H:%M"))
+
+        return events
+
     except Exception as e:
         log.exception("fetch_events error: %s", e)
         return []
