@@ -1,27 +1,25 @@
 # econ_calendar_tele_bot.py
 # -*- coding: utf-8 -*-
 """
-미국 경제지표를 Trading Economics API(guest:guest)에서 가져와
-- 매일 08:55, 20:55 (Asia/Singapore) 에 '앞으로 24시간 내' 주요 이벤트 미리보기(예상치 포함)
-- 각 이벤트별로 '상회/부합/하회 시' 암호화폐 영향 시나리오(전문가 톤) 동봉
-- 발표 시각 모니터링(매 1분) 후 '실제치가 나온 즉시' 결과 해석 코멘트와 함께 텔레그램으로 전송
-- 주요 연설(파월 등) 시작 시각에 '연설 해석 가이드' 즉시 전송
+미국 경제지표를 Trading Economics API에서 가져와:
+- 매일 08:55, 20:55 (Asia/Singapore) → 앞으로 24h 주요 이벤트 '사전 시나리오' 전송
+- 발표 직후(실제치 업데이트) → 결과 해석 코멘트 전송
+- 주요 연설 시작 시각 → 연설 해석 가이드 전송
 
-Render의 기존 Flask app.py 에서:
+Flask(app.py) 예시:
 from econ_calendar_tele_bot import init_econ_calendar
-...
 app = Flask(__name__)
 init_econ_calendar(app)
 
-환경변수:
-  ECON_TG_TOKEN       : 텔레그램 봇 토큰 (bbangdol_bot 등)
-  ECON_CHAT_ID        : 보낼 채팅방 ID (예: -4904606442)
-  ECON_COUNTRIES      : 기본 'United States' (쉼표구분 다중국가 가능)
-  ECON_IMPORTANCE     : 중요도(예: 3 또는 2,3)
-  ECON_PREVIEW_TIMES  : '08:55,20:55' (Asia/Singapore 기준)
-  TE_AUTH             : TradingEconomics 인증 (기본 guest:guest)
+필요 ENV:
+  ECON_TG_TOKEN | TELEGRAM_BOT_TOKEN   : 텔레그램 봇 토큰
+  ECON_CHAT_ID  | TELEGRAM_CHAT_ID     : 채팅방 ID
+  ECON_COUNTRIES      (기본: United States)
+  ECON_IMPORTANCE     (기본: 3)   # 2,3 가능
+  ECON_PREVIEW_TIMES  (기본: 08:55,20:55)
+  TE_AUTH              (기본: guest:guest)  # TradingEconomics 인증
 
-필요 패키지: requests, pytz, apscheduler
+필요 패키지: requests, apscheduler, pytz
 """
 
 import os
@@ -29,6 +27,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
+from urllib.parse import urlencode, quote_plus
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -41,8 +40,9 @@ ASIA_SG = timezone("Asia/Singapore")
 TE_BASE = "https://api.tradingeconomics.com/calendar"
 TE_AUTH = os.getenv("TE_AUTH", "guest:guest")  # ex) 'guest:guest' 또는 'key:secret'
 
-TG_TOKEN = os.getenv("ECON_TG_TOKEN", "")
-TG_CHAT  = os.getenv("ECON_CHAT_ID", "")
+# token/chat id는 두 이름 중 하나만 있어도 동작 (호환)
+TG_TOKEN = os.getenv("ECON_TG_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT  = os.getenv("ECON_CHAT_ID")  or os.getenv("TELEGRAM_CHAT_ID", "")
 
 COUNTRIES     = [s.strip() for s in os.getenv("ECON_COUNTRIES", "United States").split(",") if s.strip()]
 IMPORTANCE    = [s.strip() for s in os.getenv("ECON_IMPORTANCE", "3").split(",") if s.strip()]
@@ -53,6 +53,7 @@ POLL_SEC = int(os.getenv("ECON_POLL_SEC", "60"))                 # 60초마다
 RELEASE_LOOKAHEAD_MIN = int(os.getenv("ECON_RELEASE_LOOKAHEAD_MIN", "5"))  # 5분 이내 일정 감시
 
 _sent_release_keys: Dict[str, float] = {}  # 중복 방지 (event id + release time)
+
 
 # === 공통 유틸 ===
 
@@ -82,6 +83,7 @@ def tg_send(text: str) -> None:
     except Exception as e:
         log.exception("telegram send failed: %s", e)
 
+
 # === 경제지표 호출 ===
 
 def fetch_events_24h(now_sg: datetime) -> List[Dict[str, Any]]:
@@ -90,17 +92,19 @@ def fetch_events_24h(now_sg: datetime) -> List[Dict[str, Any]]:
     return fetch_events_range(d1, d2)
 
 def fetch_events_range(d1_sg: datetime, d2_sg: datetime) -> List[Dict[str, Any]]:
+    # TradingEconomics는 Basic Auth 대신 쿼리스트링 c=key:secret 를 요구
+    # 일부 환경에서 params에 넣은 값이 로깅상 보이지 않는 혼동을 막기 위해 URL을 직접 구성
+    base = f"{TE_BASE}?c={quote_plus(TE_AUTH)}&format=json"
     params = {
         "country": ",".join(COUNTRIES),  # 다중국가: 쉼표 구분
         "d1": d1_sg.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "d2": d2_sg.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "importance": ",".join(IMPORTANCE),
-        "c": TE_AUTH,            # ✅ TE 인증은 쿼리스트링으로
-        "format": "json"
     }
-    url = TE_BASE
+    full_url = f"{base}&{urlencode(params)}"
     try:
-        r = requests.get(url, params=params, timeout=20)  # ✅ auth 파라미터 제거
+        log.info("TE GET %s", full_url)  # 최종 요청 URL 확인용
+        r = requests.get(full_url, timeout=20)
         r.raise_for_status()
         data = r.json()
         # TE 필드 예: { 'Country', 'Category', 'Event', 'Date', 'Actual', 'Previous', 'Forecast' }
@@ -110,6 +114,7 @@ def fetch_events_range(d1_sg: datetime, d2_sg: datetime) -> List[Dict[str, Any]]
     except Exception as e:
         log.exception("fetch_events error: %s", e)
         return []
+
 
 # === 시나리오 엔진 ===
 
@@ -199,6 +204,7 @@ def _scenario_text(key: str) -> Tuple[str, str, str]:
     )
     return CRYPTO_SCENARIOS.get(key, default)
 
+
 # === 프리뷰(사전) 메시지 ===
 
 def build_speech_preview_lines(e: Dict[str, Any]) -> List[str]:
@@ -246,6 +252,7 @@ def build_preview(events: List[Dict[str, Any]], now_sg: datetime) -> str:
         lines.append("(24시간 내 고중요 이벤트 없음)")
     return "\n".join(lines).strip()
 
+
 # === 결과(실적) 메시지 ===
 
 def build_release_note(e: Dict[str, Any]) -> str:
@@ -255,7 +262,6 @@ def build_release_note(e: Dict[str, Any]) -> str:
     forecast = e.get("Forecast")
     previous = e.get("Previous")
 
-    # 평가
     verdict = "중립"
     detail = "발표 확인"
 
@@ -266,7 +272,6 @@ def build_release_note(e: Dict[str, Any]) -> str:
         try:
             a = float(str(actual).replace('%','').replace(',',''))
             f = float(str(forecast).replace('%','').replace(',',''))
-            # 단순 판정: 0.05~0.1pp 내는 부합 처리
             diff = a - f
             thr = 0.1 if any(k in key for k in ["CPI","PCE"]) else 0.001
             if abs(diff) <= thr:
@@ -299,6 +304,7 @@ def build_release_note(e: Dict[str, Any]) -> str:
     body.append(f"💡 해석: <b>{verdict}</b> — {detail}")
     return "\n".join(body)
 
+
 # ✅ 연설(시작 시각) 메시지
 
 def build_speech_note(e: Dict[str, Any]) -> str:
@@ -318,13 +324,13 @@ def build_speech_note(e: Dict[str, Any]) -> str:
     ]
     return "\n".join(body)
 
+
 # === 스케줄러 ===
 
 def send_preview_job():
     now_sg = _sg_now()
     evts = fetch_events_24h(now_sg)
 
-    # 고중요 키워드 우선 정렬 (+ 연설은 최상위 가중)
     def score(e):
         t = (e.get("Event") or e.get("Category") or "").lower()
         s = 0
