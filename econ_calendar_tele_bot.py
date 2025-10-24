@@ -5,15 +5,21 @@
 - 매일 08:55, 20:55 (Asia/Singapore) 에 '앞으로 24시간 내' 주요 이벤트 미리보기(예상치 포함)
 - 각 이벤트별로 '상회/부합/하회 시' 암호화폐 영향 시나리오(전문가 톤) 동봉
 - 발표 시각 모니터링(매 1분) 후 '실제치가 나온 즉시' 결과 해석 코멘트와 함께 텔레그램으로 전송
-- ✅ 주요 연설(파월 등) 시작 시각에 '연설 해석 가이드' 즉시 전송
+- 주요 연설(파월 등) 시작 시각에 '연설 해석 가이드' 즉시 전송
 
-Render의 기존 Flask app.py 에 import 후, init_econ_calendar(app) 한 줄로 붙여서 사용.
+Render의 기존 Flask app.py 에서:
+from econ_calendar_tele_bot import init_econ_calendar
+...
+app = Flask(__name__)
+init_econ_calendar(app)
+
 환경변수:
-  ECON_TG_TOKEN     : 텔레그램 봇 토큰 (bbangdol_bot 등)
-  ECON_CHAT_ID      : 보낼 채팅방 ID (예: -4904606442)
-  ECON_COUNTRIES    : 기본 'United States' (쉼표구분 다중국가 가능, 옵션)
-  ECON_IMPORTANCE   : 중요도 2,3만 보기 (기본: 3) => '2,3' 형식 가능
-  ECON_PREVIEW_TIMES: '08:55,20:55' (Asia/Singapore 기준)
+  ECON_TG_TOKEN       : 텔레그램 봇 토큰 (bbangdol_bot 등)
+  ECON_CHAT_ID        : 보낼 채팅방 ID (예: -4904606442)
+  ECON_COUNTRIES      : 기본 'United States' (쉼표구분 다중국가 가능)
+  ECON_IMPORTANCE     : 중요도(예: 3 또는 2,3)
+  ECON_PREVIEW_TIMES  : '08:55,20:55' (Asia/Singapore 기준)
+  TE_AUTH             : TradingEconomics 인증 (기본 guest:guest)
 
 필요 패키지: requests, pytz, apscheduler
 """
@@ -33,7 +39,7 @@ log = logging.getLogger("econ-calendar")
 
 ASIA_SG = timezone("Asia/Singapore")
 TE_BASE = "https://api.tradingeconomics.com/calendar"
-TE_AUTH = os.getenv("TE_AUTH", "guest:guest")  # 옵션: 본인 키가 있으면 설정
+TE_AUTH = os.getenv("TE_AUTH", "guest:guest")  # ex) 'guest:guest' 또는 'key:secret'
 
 TG_TOKEN = os.getenv("ECON_TG_TOKEN", "")
 TG_CHAT  = os.getenv("ECON_CHAT_ID", "")
@@ -85,14 +91,16 @@ def fetch_events_24h(now_sg: datetime) -> List[Dict[str, Any]]:
 
 def fetch_events_range(d1_sg: datetime, d2_sg: datetime) -> List[Dict[str, Any]]:
     params = {
-        "country": ";".join(COUNTRIES),
+        "country": ",".join(COUNTRIES),  # 다중국가: 쉼표 구분
         "d1": d1_sg.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "d2": d2_sg.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "importance": ",".join(IMPORTANCE)
+        "importance": ",".join(IMPORTANCE),
+        "c": TE_AUTH,            # ✅ TE 인증은 쿼리스트링으로
+        "format": "json"
     }
     url = TE_BASE
     try:
-        r = requests.get(url, params=params, auth=tuple(TE_AUTH.split(":")), timeout=20)
+        r = requests.get(url, params=params, timeout=20)  # ✅ auth 파라미터 제거
         r.raise_for_status()
         data = r.json()
         # TE 필드 예: { 'Country', 'Category', 'Event', 'Date', 'Actual', 'Previous', 'Forecast' }
@@ -387,7 +395,7 @@ def init_econ_calendar(app=None):
     log.info("econ calendar scheduler started: preview=%s, poll=%ss", PREVIEW_TIMES, POLL_SEC)
     return _scheduler
 
-# ── 예시: 기존 Flask app.py 에서 호출 ──
+# ── 예시: 기존 Flask app.py ──
 # from econ_calendar_tele_bot import init_econ_calendar
 # app = Flask(__name__)
 # init_econ_calendar(app)
