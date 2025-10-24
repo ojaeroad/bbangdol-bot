@@ -6,9 +6,13 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 import requests
 
+from econ_calendar_tele_bot import init_econ_calendar
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
+
+init_econ_calendar(app)
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60
