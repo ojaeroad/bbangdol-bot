@@ -720,6 +720,20 @@ def tg_webhook():
 _raw = _read_optional("BNC_SYMBOLS")
 SYM_WHITELIST = set(s.strip().upper() for s in _raw.split(",") if s.strip()) if _raw else None
 
+# --- 심볼 정규화: BINANCE:BTCUSDT.P, BTCUSDT.P, USDTP 등 -> BTCUSDT ---
+SYM_FIX_RE_SUFFIX = re.compile(r'\.(P|PERP)$', re.IGNORECASE)
+def normalize_symbol(raw: str) -> str:
+    if not raw:
+        return ""
+    s = str(raw).upper().strip()
+    if ":" in s:                       # 'BINANCE:BTCUSDT.P' -> 'BTCUSDT.P'
+        s = s.split(":")[-1]
+    s = SYM_FIX_RE_SUFFIX.sub("", s)   # '.P' or '.PERP' 제거
+    s = s.replace("USDTP", "USDT")     # 'USDTP' -> 'USDT'
+    s = s.replace("USDT.P", "USDT")    # 혹시 남은 변형 정리
+    s = re.sub(r'[^A-Z0-9]', '', s)    # 안전: 특수문자 제거
+    return s
+
 @app.post("/bnc/trade")
 def bnc_trade():
     """
@@ -732,7 +746,7 @@ def bnc_trade():
     if secret and data.get("secret") != secret:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    symbol = str(data.get("symbol", "")).upper()
+    symbol = normalize_symbol(data.get("symbol",""))
     action = str(data.get("action", "")).upper()
     note   = str(data.get("note", ""))
 
@@ -845,7 +859,8 @@ def bnc_trade():
 def tv_proxy():
     data = request.get_json(silent=True, force=True) or {}
     # Pine 포맷: {"secret":"...","tag":"BNC_POSITION","symbol":"BTCUSDT","tf":"5","p":"...","sig":"LONG_5m"}
-    symbol = str(data.get("symbol","")).upper()
+    symbol_raw = data.get("symbol","")
+    symbol = normalize_symbol(symbol_raw)
     sig    = str(data.get("sig","")).upper()
 
     if not symbol or not sig:
