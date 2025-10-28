@@ -333,81 +333,6 @@ def _binance_post(path: str, params: dict) -> dict:
         raise RuntimeError(f"Binance HTTP {r.status_code} {data}")
     return data
 
-def get_symbol_filters(symbol: str) -> dict:
-    info = _binance_get("/fapi/v1/exchangeInfo", {})
-    for s in info.get("symbols", []):
-        if s.get("symbol") == symbol:
-            f = {}
-            for fil in s.get("filters", []):
-                f[fil["filterType"]] = fil
-            return f
-    return {}
-
-def _decimals_from_tick(tick: float) -> int:
-    s = f"{tick:.10f}".rstrip("0").rstrip(".")
-    return len(s.split(".")[1]) if "." in s else 0
-
-def round_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
-
-def fmt_price(symbol: str, price: float) -> str:
-    """PRICE_FILTER.tickSize 정밀도에 맞춰 문자열 포맷."""
-    filters = get_symbol_filters(symbol)
-    tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01"))
-    rounded = round_step(price, tick)
-    dec = _decimals_from_tick(tick)
-    return f"{rounded:.{dec}f}"
-
-def place_market_order(symbol: str, side: str, qty: float,
-                       reduce_only: bool = False,
-                       position_side: Optional[str] = None,
-                       client_id: Optional[str] = None) -> dict:
-    params = {
-        "symbol": symbol,
-        "side": side,               # BUY / SELL
-        "type": "MARKET",
-        "quantity": qty,            # 코인 수량
-    }
-    # ✅ 진입 주문에는 reduceOnly를 보내지 말고, 청산일 때만 붙인다
-    if reduce_only:
-        params["reduceOnly"] = "true"
-
-    if position_side:
-        params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
-    if client_id:
-        params["newClientOrderId"] = client_id[:36]
-    return _binance_post("/fapi/v1/order", params)
-
-def place_stop_market(symbol: str, side: str, qty: float, stop_price: float,
-                      position_side: Optional[str] = None) -> dict:
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "STOP_MARKET",
-        "stopPrice": fmt_price(symbol, stop_price),
-        "reduceOnly": "true",
-        "quantity": qty
-    }
-    if position_side:
-        params["positionSide"] = position_side
-    return _binance_post("/fapi/v1/order", params)
-
-def place_trailing(symbol: str, side: str, qty: float, activation_price: float, callback_rate: float, position_side: Optional[str] = None) -> dict:
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "TRAILING_STOP_MARKET",
-        "activationPrice": fmt_price(symbol, activation_price),
-        "callbackRate": f"{float(callback_rate):.2f}",
-        "reduceOnly": "true",
-        "quantity": qty
-    }
-    if position_side:
-        params["positionSide"] = position_side
-    return _binance_post("/fapi/v1/order", params)
-
 def get_mark_price(symbol: str) -> float:
     base = _binance_base()
     r = requests.get(f"{base}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
@@ -420,6 +345,26 @@ def get_account_available_usdt() -> float:
         if b.get("asset") == "USDT":
             return float(b.get("availableBalance", 0))
     return 0.0
+
+def get_symbol_filters(symbol: str) -> dict:
+    info = _binance_get("/fapi/v1/exchangeInfo", {})
+    for s in info.get("symbols", []):
+        if s.get("symbol") == symbol:
+            f = {}
+            for fil in s.get("filters", []):
+                f[fil["filterType"]] = fil
+            return f
+    return {}
+
+def round_step(value: float, step: float) -> float:
+    if step <= 0: return value
+    return math.floor(value / step) * step
+
+def round_tick(value: float, tick: float) -> float:
+    """PRICE_FILTER.tickSize에 맞춰 가격 정밀도 내림."""
+    if tick <= 0:
+        return value
+    return math.floor(value / tick) * tick
 
 # =========================================================
 # === STATE & RISK PRESETS (multi-symbol + risk modes)
@@ -777,6 +722,7 @@ def bnc_trade():
         filters = get_symbol_filters(symbol)
         step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
         min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0.0"))
+        tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01"))
 
         if action.startswith("OPEN"):
             alloc_usdt = avail * phase
@@ -785,7 +731,7 @@ def bnc_trade():
             notional = alloc_usdt * lev
             qty = max(round_step(notional / price, step), min_qty)
         else:
-            qty = max(min_qty, round_step(min_qty, step))
+            qty = min_qty
 
         cid = f"bnc_{symbol}_{action}_{int(now())}"
 
@@ -797,11 +743,11 @@ def bnc_trade():
             res_open = place_market_order(symbol, "BUY", qty, reduce_only=False,
                                           position_side=ps_long, client_id=cid)
             sl_pct = float(ep["sl"])
-            sl_price = price * (1 - sl_pct/100.0)
+            sl_price = round_tick(price * (1 - sl_pct/100.0), tick)
             place_stop_market(symbol, "SELL", qty, stop_price=sl_price,
                               position_side=ps_long)
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
-            activation = price * (1 - act/100.0)
+            activation = round_tick(price * (1 - act/100.0), tick)
             place_trailing(symbol, "SELL", qty, activation_price=activation,
                            callback_rate=cb, position_side=ps_long)
             result = res_open
@@ -811,11 +757,11 @@ def bnc_trade():
             res_open = place_market_order(symbol, "SELL", qty, reduce_only=False,
                                           position_side=ps_short, client_id=cid)
             sl_pct = float(ep["sl"])
-            sl_price = price * (1 + sl_pct/100.0)
+            sl_price = round_tick(price * (1 + sl_pct/100.0), tick)
             place_stop_market(symbol, "BUY", qty, stop_price=sl_price,
                               position_side=ps_short)
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
-            activation = price * (1 + act/100.0)
+            activation = round_tick(price * (1 + act/100.0), tick)
             place_trailing(symbol, "BUY", qty, activation_price=activation,
                            callback_rate=cb, position_side=ps_short)
             result = res_open
@@ -850,6 +796,63 @@ def bnc_trade():
     except Exception as e:
         log.exception("bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# === 실제 발주 함수들 (정밀도 이슈 없는 MARKET은 그대로) ===
+def place_market_order(symbol: str, side: str, qty: float,
+                       reduce_only: bool = False,
+                       position_side: Optional[str] = None,
+                       client_id: Optional[str] = None) -> dict:
+    params = {
+        "symbol": symbol,
+        "side": side,               # BUY / SELL
+        "type": "MARKET",
+        "quantity": qty,            # 코인 수량
+    }
+    if reduce_only:
+        params["reduceOnly"] = "true"
+    if position_side:
+        params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
+    if client_id:
+        params["newClientOrderId"] = client_id[:36]
+    return _binance_post("/fapi/v1/order", params)
+
+def place_stop_market(symbol: str, side: str, qty: float, stop_price: float,
+                      position_side: Optional[str] = None) -> dict:
+    # ★ tickSize 반영
+    filters = get_symbol_filters(symbol)
+    tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01"))
+    spr = round_tick(float(stop_price), tick)
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "STOP_MARKET",
+        "stopPrice": f"{spr:.8f}",
+        "reduceOnly": "true",
+        "quantity": qty
+    }
+    if position_side:
+        params["positionSide"] = position_side
+    return _binance_post("/fapi/v1/order", params)
+
+def place_trailing(symbol: str, side: str, qty: float, activation_price: float, callback_rate: float, position_side: Optional[str] = None) -> dict:
+    # ★ tickSize 반영
+    filters = get_symbol_filters(symbol)
+    tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01"))
+    actp = round_tick(float(activation_price), tick)
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TRAILING_STOP_MARKET",
+        "activationPrice": f"{actp:.8f}",
+        "callbackRate": f"{callback_rate:.2f}",
+        "reduceOnly": "true",
+        "quantity": qty
+    }
+    if position_side:
+        params["positionSide"] = position_side
+    return _binance_post("/fapi/v1/order", params)
 
 # === TradingView → Private /bnc/trade 프록시 (기존 유지) ===
 @app.post("/tv")
