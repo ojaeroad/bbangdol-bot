@@ -6,12 +6,13 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 import requests
 
-from econ_calendar_tele_bot import init_econ_calendar  # 그대로 유지
+from econ_calendar_tele_bot import init_econ_calendar
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
 
+# ===== Econ calendar (kept) =====
 init_econ_calendar(app)
 
 # === Anti-spam settings (60s fixed) ===
@@ -28,6 +29,7 @@ _opcount = 0
 _TF_RE = re.compile(r'\b(1w|1d|12h|6h|4h|2h|1h|30m|15m|5m|3m)\b', re.IGNORECASE)
 
 def _extract_signature(msg: str) -> str:
+    """타임프레임 + 내용 요약 해시로 시그니처 강화(과차단 방지)."""
     if not msg:
         return "unknown"
     m = _TF_RE.search(msg)
@@ -48,6 +50,7 @@ def _mark_sent(bucket: str):
     _LAST_SENT_AT[bucket] = now()
 
 def _is_duplicate(bucket: str, msg_norm: str) -> bool:
+    """DEDUP_WINDOW_SEC 내 동일 버킷/메시지 반복 차단 + 주기적 청소"""
     global _opcount
     k = (bucket, hash(msg_norm))
     t = _RECENT_MSG_HASH.get(k)
@@ -146,6 +149,7 @@ def route_to_chat_id(route: str) -> Optional[str]:
 WEBHOOK_SECRET = _read_optional("WEBHOOK_SECRET")
 
 def _require_webhook_secret(d: dict) -> Optional[tuple]:
+    """WEBHOOK_SECRET 미설정이면 그대로 통과 → 기존 호환 100%."""
     if WEBHOOK_SECRET and d.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
     return None
@@ -158,24 +162,6 @@ def health():
 @app.get("/routes")
 def routes_dump():
     return jsonify({"routes": ROUTE_TO_CHAT})
-
-# =========================================================
-# === symbol helpers (TV → Binance Futures)
-# =========================================================
-def normalize_symbol(sym: str) -> str:
-    """TradingView 심볼(BINANCE:BTCUSDT.P 등)을 Binance USDⓈ-M 심볼로 정규화."""
-    if not sym:
-        return ""
-    s = sym.strip().upper()
-    if ":" in s:
-        s = s.split(":")[-1]
-    if s.endswith(".P") or s.endswith(".PERP") or s.endswith(".BINANCE"):
-        s = s.split(".")[0]
-    return s
-
-def cfg_key(sym: str) -> str:
-    """STATE 접근용 키(정규화된 심볼)."""
-    return normalize_symbol(sym)
 
 # --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
@@ -204,7 +190,7 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
         log.exception("Telegram send exception")
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
 
-# --- legacy/new endpoints for indicator alerts ---
+# --- old endpoint (legacy for 불꽃타점) ---
 @app.post("/bot")
 def tv_webhook_legacy():
     data = request.get_json(silent=True, force=True) or {}
@@ -215,6 +201,7 @@ def tv_webhook_legacy():
     symbol = str(data.get("symbol", "")).strip()
     return _handle_payload(route, msg, symbol)
 
+# --- new accumulation endpoint (겸용) ---
 @app.post("/webhook")
 def tv_webhook_new():
     data = request.get_json(silent=True, force=True) or {}
@@ -226,11 +213,14 @@ def tv_webhook_new():
     return _handle_payload(route, msg, symbol)
 
 def _is_oneway() -> bool:
+    # 기본 HEDGE. 환경변수로 ONEWAY 라고 넣으면 원웨이 처리
     return (os.getenv("BINANCE_POSITION_MODE", "HEDGE").upper() != "HEDGE")
+
 
 # =========================================================
 # === BNC_POSITION 전용 (bbangdol_bnc_bot)
 # =========================================================
+
 def post_telegram_with_token(bot_token: str, chat_id: str, text: str, reply_markup: Optional[dict] = None) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": safe_text(text)}
@@ -250,45 +240,50 @@ def bnc_dryrun():
         "bot": "bbangdol_bnc_bot"
     })
 
-@app.post("/bnc")
-def bnc_send():
-    data = request.get_json(silent=True, force=True) or {}
-    secret = os.getenv("BNC_SECRET")
-    if secret and data.get("secret") != secret:
-        return jsonify({"ok": False, "error": "bad secret"}), 401
+# ======================= Binance helpers: symbol & precision =======================
 
-    bnc_token = os.getenv("BNC_BOT_TOKEN")
-    bnc_chat  = os.getenv("BNC_CHAT_ID")
-    if not bnc_token or not bnc_chat:
-        return jsonify({"ok": False, "error": "BNC env missing"}), 500
+def normalize_binance_symbol(sym: str) -> str:
+    """
+    TV/내부 저장에는 ETHUSDT.P 같은 것을 쓰더라도,
+    바이낸스 API 호출 시에는 .P 등을 제거한 정규 심볼을 사용한다.
+    """
+    if not sym:
+        return sym
+    s = sym.strip().upper()
+    if s.endswith(".P"):
+        s = s[:-2]  # drop trailing ".P"
+    # 안전하게 기타 특수문자 제거
+    s = re.sub(r'[^A-Z0-9]', '', s)
+    return s
 
-    tag    = str(data.get("tag", "BNC_POSITION")).strip()
-    symbol = str(data.get("symbol", "")).strip()
-    msg    = str(data.get("msg", "")).strip()
-    if not msg:
-        return jsonify({"ok": False, "error": "msg missing"}), 400
+def _decimals_from_step(step: float) -> int:
+    # 0.01000000 -> 2
+    s = f"{step:.16f}".rstrip('0')
+    return len(s.split('.')[-1]) if '.' in s else 0
 
-    header = f"[{tag}] {symbol}" if symbol else f"[{tag}]"
-    text   = f"{header}\n{msg}"
+def round_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor(value / step) * step
 
-    bucket = _bucket_key(bnc_chat, symbol, tag, text)
-    msg_norm = safe_text(text)
-    if not _can_send_now(bucket):
-        return jsonify({"ok": True, "skipped": "cooldown", "bucket": bucket})
-    if _is_duplicate(bucket, msg_norm):
-        return jsonify({"ok": True, "skipped": "dedup", "bucket": bucket})
+def format_price_for_symbol(symbol: str, raw_price: float) -> str:
+    filters = get_symbol_filters(symbol)  # symbol은 정규화된 심볼이어야 함
+    tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01"))
+    adj = round_to_step(raw_price, tick)
+    dec = _decimals_from_step(tick)
+    return f"{adj:.{dec}f}"
 
-    try:
-        res = post_telegram_with_token(bnc_token, bnc_chat, msg_norm)
-        _mark_sent(bucket)
-        return jsonify({"ok": bool(res.get("ok")), "detail": res})
-    except Exception as e:
-        log.exception("BNC Telegram send exception")
-        return jsonify({"ok": False, "error": str(e)}), 500
+def quantize_qty_for_symbol(symbol: str, raw_qty: float) -> float:
+    filters = get_symbol_filters(symbol)
+    step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
+    min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0.0"))
+    qty = round_to_step(raw_qty, step)
+    return max(qty, min_qty)
 
 # =========================================================
-# === Binance USDⓈ-M Futures — helpers
+# === Binance USDⓈ-M Futures — REST
 # =========================================================
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -343,34 +338,61 @@ def _binance_post(path: str, params: dict) -> dict:
         raise RuntimeError(f"Binance HTTP {r.status_code} {data}")
     return data
 
-def _decimals_from_step(step: float) -> int:
-    s = f"{step:.16f}".rstrip("0").rstrip(".")
-    if "." in s:
-        return len(s.split(".")[1])
-    return 0
+def place_market_order(symbol: str, side: str, qty: float,
+                       reduce_only: bool = False,
+                       position_side: Optional[str] = None,
+                       client_id: Optional[str] = None) -> dict:
+    params = {
+        "symbol": symbol,
+        "side": side,               # BUY / SELL
+        "type": "MARKET",
+        "quantity": qty,            # 코인 수량(필터 반영된 값이어야 함)
+    }
+    if reduce_only:
+        params["reduceOnly"] = "true"
+    if position_side:
+        params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
+    if client_id:
+        params["newClientOrderId"] = client_id[:36]
+    return _binance_post("/fapi/v1/order", params)
 
-def round_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
+def place_stop_market(symbol: str, side: str, qty: float, stop_price_raw: float,
+                      position_side: Optional[str] = None) -> dict:
+    stop_price = format_price_for_symbol(symbol, stop_price_raw)
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "STOP_MARKET",
+        "stopPrice": stop_price,
+        "reduceOnly": "true",
+        "quantity": qty
+    }
+    if position_side:
+        params["positionSide"] = position_side
+    return _binance_post("/fapi/v1/order", params)
 
-def round_price_to_tick(value: float, tick: float) -> float:
-    if tick <= 0:
-        return value
-    return round_step(value, tick)
-
-def fmt_price(value: float, tick: float) -> str:
-    dec = _decimals_from_step(tick if tick > 0 else 0.00000001)
-    return f"{value:.{dec}f}"
+def place_trailing(symbol: str, side: str, qty: float, activation_price_raw: float,
+                   callback_rate: float, position_side: Optional[str] = None) -> dict:
+    activation_price = format_price_for_symbol(symbol, activation_price_raw)
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TRAILING_STOP_MARKET",
+        "activationPrice": activation_price,
+        "callbackRate": f"{float(callback_rate):.2f}",
+        "reduceOnly": "true",
+        "quantity": qty
+    }
+    if position_side:
+        params["positionSide"] = position_side
+    return _binance_post("/fapi/v1/order", params)
 
 def get_mark_price(symbol: str) -> float:
     base = _binance_base()
-    sym = normalize_symbol(symbol)
-    r = requests.get(f"{base}/fapi/v1/premiumIndex", params={"symbol": sym}, timeout=10)
+    r = requests.get(f"{base}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
     data = r.json()
-    # 오류 방어 (Invalid symbol 등)
-    if isinstance(data, dict) and "code" in data and data.get("code", 0) != 0:
-        raise RuntimeError(f"premiumIndex error for {sym}: {data}")
+    if "markPrice" not in data:
+        raise RuntimeError(f"premiumIndex error for {symbol}: {data}")
     return float(data["markPrice"])
 
 def get_account_available_usdt() -> float:
@@ -382,70 +404,18 @@ def get_account_available_usdt() -> float:
 
 def get_symbol_filters(symbol: str) -> dict:
     info = _binance_get("/fapi/v1/exchangeInfo", {})
-    sym = normalize_symbol(symbol)
     for s in info.get("symbols", []):
-        if s.get("symbol") == sym:
+        if s.get("symbol") == symbol:
             f = {}
             for fil in s.get("filters", []):
                 f[fil["filterType"]] = fil
             return f
     return {}
 
-def place_market_order(symbol: str, side: str, qty: float,
-                       reduce_only: bool = False,
-                       position_side: Optional[str] = None,
-                       client_id: Optional[str] = None) -> dict:
-    params = {
-        "symbol": normalize_symbol(symbol),
-        "side": side,               # BUY / SELL
-        "type": "MARKET",
-        "quantity": qty,            # 코인 수량
-    }
-    if reduce_only:
-        params["reduceOnly"] = "true"
-    if position_side:
-        params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
-    if client_id:
-        params["newClientOrderId"] = client_id[:36]
-    return _binance_post("/fapi/v1/order", params)
-
-def place_stop_market(symbol: str, side: str, qty: float, stop_price: float,
-                      position_side: Optional[str] = None) -> dict:
-    filters = get_symbol_filters(symbol)
-    tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0"))
-    sp = round_price_to_tick(stop_price, tick)
-    params = {
-        "symbol": normalize_symbol(symbol),
-        "side": side,
-        "type": "STOP_MARKET",
-        "stopPrice": fmt_price(sp, tick),
-        "reduceOnly": "true",
-        "quantity": qty
-    }
-    if position_side:
-        params["positionSide"] = position_side
-    return _binance_post("/fapi/v1/order", params)
-
-def place_trailing(symbol: str, side: str, qty: float, activation_price: float, callback_rate: float, position_side: Optional[str] = None) -> dict:
-    filters = get_symbol_filters(symbol)
-    tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0"))
-    ap = round_price_to_tick(activation_price, tick)
-    params = {
-        "symbol": normalize_symbol(symbol),
-        "side": side,
-        "type": "TRAILING_STOP_MARKET",
-        "activationPrice": fmt_price(ap, tick),
-        "callbackRate": f"{callback_rate:.2f}",
-        "reduceOnly": "true",
-        "quantity": qty
-    }
-    if position_side:
-        params["positionSide"] = position_side
-    return _binance_post("/fapi/v1/order", params)
-
 # =========================================================
 # === STATE & RISK PRESETS (multi-symbol + risk modes)
 # =========================================================
+
 RISK_PRESETS = {
     "safe":       {"sl": 1.5, "trail": {"act": 1.5, "cb": 0.4}, "phases": [0.20, 0.25, 0.33, 0.50, 1.00]},
     "normal":     {"sl": 1.0, "trail": {"act": 1.0, "cb": 0.3}, "phases": [0.25, 0.33, 0.50, 1.00]},
@@ -459,12 +429,13 @@ def _risk_or_default(name: str) -> str:
 STATE = {
     "global_mode": "BOTH",    # BOTH | LONG_ONLY | SHORT_ONLY
     "split_enabled": True,    # 분할 진입 on/off
-    "pairs": { }
+    "pairs": {                # 심볼별 저장소 (사용자 입력 원문 심볼 키로 저장: BTCUSDT.P 등)
+        # "BTCUSDT.P": {"dir":"BOTH","lev":10,"sl":1.0,"trail":{"act":0.6,"cb":0.2},"legs":0,"risk":"normal"}
+    }
 }
 
-def get_pair_cfg(sym: str) -> dict:
-    # 사용자가 ETHUSDT.P 로 저장했어도 정규화 키로 읽어오도록 보강
-    d = STATE["pairs"].get(sym, {}) or STATE["pairs"].get(cfg_key(sym), {})
+def get_pair_cfg(sym_orig: str) -> dict:
+    d = STATE["pairs"].get(sym_orig, {})
     return {
         "dir":   d.get("dir", "BOTH"),
         "lev":   d.get("lev", 10),
@@ -474,15 +445,13 @@ def get_pair_cfg(sym: str) -> dict:
         "risk":  _risk_or_default(d.get("risk", "normal"))
     }
 
-def save_pair_cfg(sym: str, cfg: dict):
-    # 내부 저장은 정규화 키로 통일 (중복 방지)
-    key = cfg_key(sym)
-    base = get_pair_cfg(key)
+def save_pair_cfg(sym_orig: str, cfg: dict):
+    base = get_pair_cfg(sym_orig)
     base.update(cfg)
-    STATE["pairs"][key] = base
+    STATE["pairs"][sym_orig] = base
 
-def allowed_by_mode(sym: str, side: str) -> bool:
-    local = get_pair_cfg(sym)["dir"]
+def allowed_by_mode(sym_orig: str, side: str) -> bool:
+    local = get_pair_cfg(sym_orig)["dir"]
     globalm = STATE["global_mode"]
     eff = local if local in ("LONG","SHORT","BOTH","LONG_ONLY","SHORT_ONLY") else globalm
     eff = {"LONG_ONLY":"LONG","SHORT_ONLY":"SHORT"}.get(eff, eff)
@@ -491,8 +460,9 @@ def allowed_by_mode(sym: str, side: str) -> bool:
     if eff == "SHORT": return side == "SHORT"
     return True
 
-def effective_params(sym: str) -> dict:
-    cfg = get_pair_cfg(sym)
+def effective_params(sym_orig: str) -> dict:
+    """종목 설정 + 리스크 프리셋을 합쳐 실제 주문 파라미터 산출."""
+    cfg = get_pair_cfg(sym_orig)
     rkey = cfg["risk"]
     rp = RISK_PRESETS[rkey]
     sl = float(cfg.get("sl") or rp["sl"])
@@ -581,7 +551,7 @@ def tg_webhook():
         answer_callback_query(cq["id"], "")
         if data == "ADD:SYMBOL":
             st["mode"] = "ask_symbol"
-            post_telegram(chat_id, "종목 코드를 입력하세요 (예: BTCUSDT 또는 BTCUSDT.P)", reply_markup=force_reply("BTCUSDT.P"))
+            post_telegram(chat_id, "종목 코드를 입력하세요 (예: BTCUSDT.P 또는 BTCUSDT)", reply_markup=force_reply("BTCUSDT.P"))
         elif data.startswith("ADD:DIR:"):
             st["cfg"]["dir"] = data.split(":")[2]
             post_telegram(chat_id, "방향이 설정되었습니다.", reply_markup=kb_main(st["cfg"]))
@@ -603,11 +573,9 @@ def tg_webhook():
             st["cfg"]["risk"] = data.split(":")[1]
             post_telegram(chat_id, f"리스크 모드: {st['cfg']['risk']}", reply_markup=kb_main(st["cfg"]))
         elif data == "ADD:SAVE":
-            cfg = st["cfg"]; sym_in = cfg.get("symbol")
-            if not sym_in:
-                post_telegram(chat_id, "먼저 종목을 입력하세요.", reply_markup=kb_main(st["cfg"]))
-                return jsonify({"ok":True})
-            sym_key = cfg_key(sym_in)
+            cfg = st["cfg"]; sym = cfg.get("symbol")
+            if not sym:
+                post_telegram(chat_id, "먼저 종목을 입력하세요.", reply_markup=kb_main(st["cfg"])); return jsonify({"ok":True})
             mode = cfg.get("dir","BOTH")
             lev  = int(cfg.get("lev",10))
             risk = _risk_or_default(cfg.get("risk","normal"))
@@ -617,7 +585,7 @@ def tg_webhook():
                 sl = RISK_PRESETS[risk]["sl"]
             if not trail or "act" not in trail or "cb" not in trail:
                 trail = RISK_PRESETS[risk]["trail"]
-            save_pair_cfg(sym_key, {
+            save_pair_cfg(sym, {
                 "dir":"LONG" if mode=="LONG" else ("SHORT" if mode=="SHORT" else "BOTH"),
                 "lev":lev,
                 "sl":float(sl),
@@ -625,12 +593,12 @@ def tg_webhook():
                 "risk": risk,
                 "legs":0
             })
-            ep = effective_params(sym_key)
-            msgtxt = (f"✅ 저장 완료\nSYMBOL: {sym_in} ➔ {sym_key}\nDIR: {mode}\nLEV: {lev}x\n"
+            ep = effective_params(sym)
+            msgtxt = (f"✅ 저장 완료\nSYMBOL: {sym}\nDIR: {mode}\nLEV: {lev}x\n"
                       f"SL: {ep['sl']}% (risk={risk})\n"
                       f"TRAIL: {ep['trail']['act']}/{ep['trail']['cb']}\n"
                       f"🌐 GLOBAL={STATE['global_mode']}  🧩 SPLIT={'ON' if STATE['split_enabled'] else 'OFF'}")
-            post_telegram(chat_id, msgtxt, reply_markup=kb_main({"symbol":sym_in, **st["cfg"]}))
+            post_telegram(chat_id, msgtxt, reply_markup=kb_main(st["cfg"]))
         elif data == "ADD:CANCEL":
             ui_reset(chat_id)
             post_telegram(chat_id, "취소했습니다. /add 로 다시 시작하세요.")
@@ -703,11 +671,11 @@ def tg_webhook():
         if msg.get("reply_to_message") and st["mode"].startswith("ask_"):
             try:
                 if st["mode"] == "ask_symbol":
-                    sym_in = text.upper().replace(" ","")
-                    key = cfg_key(sym_in)
-                    assert key.endswith("USDT") and len(key) >= 6
-                    st["cfg"]["symbol"] = sym_in  # 표시용은 입력 그대로
-                    post_telegram(chat_id, f"종목 설정: {sym_in} ➔ 내부: {key}", reply_markup=kb_main(st["cfg"]))
+                    sym = text.upper().replace(" ","")
+                    # 저장은 원문 그대로 (BTCUSDT 또는 BTCUSDT.P)
+                    assert sym.endswith("USDT") or sym.endswith("USDT.P")
+                    st["cfg"]["symbol"] = sym
+                    post_telegram(chat_id, f"종목 설정: {sym}", reply_markup=kb_main(st["cfg"]))
                 elif st["mode"] == "ask_lev":
                     lev = int(float(text)); assert 1 <= lev <= 125
                     st["cfg"]["lev"] = lev
@@ -751,44 +719,82 @@ def tg_webhook():
     return jsonify({"ok": True})
 
 # =========================================================
-# === /bnc/trade : 수량 자동계산 + SL/트레일링(리스크 프리셋 반영)
+# === /bnc/trade : 수량 자동계산 + SL/트레일링(리스크 프리셋 반영) + 심볼정규화
 # =========================================================
 _raw = _read_optional("BNC_SYMBOLS")
 SYM_WHITELIST = set(s.strip().upper() for s in _raw.split(",") if s.strip()) if _raw else None
+
+@app.post("/bnc")
+def bnc_send():
+    data = request.get_json(silent=True, force=True) or {}
+    secret = os.getenv("BNC_SECRET")
+    if secret and data.get("secret") != secret:
+        return jsonify({"ok": False, "error": "bad secret"}), 401
+
+    bnc_token = os.getenv("BNC_BOT_TOKEN")
+    bnc_chat  = os.getenv("BNC_CHAT_ID")
+    if not bnc_token or not bnc_chat:
+        return jsonify({"ok": False, "error": "BNC env missing"}), 500
+
+    tag    = str(data.get("tag", "BNC_POSITION")).strip()
+    symbol_orig = str(data.get("symbol", "")).strip()
+    msg    = str(data.get("msg", "")).strip()
+    if not msg:
+        return jsonify({"ok": False, "error": "msg missing"}), 400
+
+    header = f"[{tag}] {symbol_orig}" if symbol_orig else f"[{tag}]"
+    text   = f"{header}\n{msg}"
+
+    bucket = _bucket_key(bnc_chat, symbol_orig, tag, text)
+    msg_norm = safe_text(text)
+    if not _can_send_now(bucket):
+        return jsonify({"ok": True, "skipped": "cooldown", "bucket": bucket})
+    if _is_duplicate(bucket, msg_norm):
+        return jsonify({"ok": True, "skipped": "dedup", "bucket": bucket})
+
+    try:
+        res = post_telegram_with_token(bnc_token, bnc_chat, msg_norm)
+        _mark_sent(bucket)
+        return jsonify({"ok": bool(res.get("ok")), "detail": res})
+    except Exception as e:
+        log.exception("BNC Telegram send exception")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/bnc/trade")
 def bnc_trade():
     """
     Body (Pine Stage2):
       {"secret":"<BNC_SECRET>", "symbol":"BTCUSDT.P", "action":"OPEN_LONG|OPEN_SHORT|CLOSE_LONG|CLOSE_SHORT", "note":"tf=..."}
-    qty가 비어있어도 서버가 자동으로 계산.
+    qty는 비워도 서버가 자동 계산.
     """
     data = request.get_json(silent=True, force=True) or {}
     secret = os.getenv("BNC_SECRET")
     if secret and data.get("secret") != secret:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    symbol_in = str(data.get("symbol", "")).upper()
-    base_sym  = normalize_symbol(symbol_in)
-    action    = str(data.get("action", "")).upper()
-    note      = str(data.get("note", ""))
+    symbol_orig = str(data.get("symbol", "")).upper()
+    base_sym    = normalize_binance_symbol(symbol_orig)
+    action = str(data.get("action", "")).upper()
+    note   = str(data.get("note", ""))
 
-    if SYM_WHITELIST and base_sym not in SYM_WHITELIST and symbol_in not in SYM_WHITELIST:
-        return jsonify({"ok": False, "error": f"symbol not allowed: {symbol_in}"}), 400
+    if SYM_WHITELIST:
+        # 화이트리스트 비교 시도: 원문/정규화 둘 다 허용
+        if (symbol_orig not in SYM_WHITELIST) and (base_sym not in SYM_WHITELIST):
+            return jsonify({"ok": False, "error": f"symbol not allowed: {symbol_orig}"}), 400
     if action not in {"OPEN_LONG", "CLOSE_LONG", "OPEN_SHORT", "CLOSE_SHORT"}:
         return jsonify({"ok": False, "error": "invalid action"}), 400
 
     side = "LONG" if "LONG" in action else "SHORT"
-    if action.startswith("OPEN") and not allowed_by_mode(base_sym, side):
+    if action.startswith("OPEN") and not allowed_by_mode(symbol_orig, side):
         return jsonify({"ok": True, "skipped": "mode"})
 
     try:
-        # --- 설정/프리셋 결합 파라미터 로드
-        ep   = effective_params(base_sym)
+        # --- 설정/프리셋 결합 파라미터 로드 (원문 키 기준)
+        ep   = effective_params(symbol_orig)
         legs = ep["legs"]
 
         # --- 수량 계산
-        price = get_mark_price(base_sym)
+        price = get_mark_price(base_sym)  # <<<< 정규화 심볼
         avail = get_account_available_usdt()
         lev   = ep["lev"]
 
@@ -800,16 +806,17 @@ def bnc_trade():
 
         filters = get_symbol_filters(base_sym)
         step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
-        min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0.0"))
 
         if action.startswith("OPEN"):
             alloc_usdt = avail * phase
             if alloc_usdt <= 0:
                 return jsonify({"ok": False, "error": "no available balance"})
             notional = alloc_usdt * lev
-            qty = max(round_step(notional / price, step), min_qty)
+            raw_qty = notional / price
+            qty = quantize_qty_for_symbol(base_sym, raw_qty)
         else:
-            qty = min_qty  # 안전 최소치로 청산(부분 포지션도 reduceOnly로 처리)
+            # 최소 수량으로 청산(모든 포지션을 정확히 닫으려면 별도 포지션 조회가 필요하나, 여기선 안전 최소치)
+            qty = quantize_qty_for_symbol(base_sym, 0.0 + step)
 
         cid = f"bnc_{base_sym}_{action}_{int(now())}"
 
@@ -822,48 +829,48 @@ def bnc_trade():
                                           position_side=ps_long, client_id=cid)
             sl_pct = float(ep["sl"])
             sl_price = price * (1 - sl_pct/100.0)
-            place_stop_market(base_sym, "SELL", qty, stop_price=sl_price,
+            place_stop_market(base_sym, "SELL", qty, stop_price_raw=sl_price,
                               position_side=ps_long)
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
             activation = price * (1 - act/100.0)
-            place_trailing(base_sym, "SELL", qty, activation_price=activation,
+            place_trailing(base_sym, "SELL", qty, activation_price_raw=activation,
                            callback_rate=cb, position_side=ps_long)
             result = res_open
-            save_pair_cfg(base_sym, {"legs": min(legs+1, len(phases))})
+            save_pair_cfg(symbol_orig, {"legs": min(legs+1, len(phases))})
 
         elif action == "OPEN_SHORT":
             res_open = place_market_order(base_sym, "SELL", qty, reduce_only=False,
                                           position_side=ps_short, client_id=cid)
             sl_pct = float(ep["sl"])
             sl_price = price * (1 + sl_pct/100.0)
-            place_stop_market(base_sym, "BUY", qty, stop_price=sl_price,
+            place_stop_market(base_sym, "BUY", qty, stop_price_raw=sl_price,
                               position_side=ps_short)
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
             activation = price * (1 + act/100.0)
-            place_trailing(base_sym, "BUY", qty, activation_price=activation,
+            place_trailing(base_sym, "BUY", qty, activation_price_raw=activation,
                            callback_rate=cb, position_side=ps_short)
             result = res_open
-            save_pair_cfg(base_sym, {"legs": min(legs+1, len(phases))})
+            save_pair_cfg(symbol_orig, {"legs": min(legs+1, len(phases))})
 
         elif action == "CLOSE_LONG":
             result = place_market_order(base_sym, "SELL", qty, reduce_only=True,
                                         position_side=ps_long, client_id=cid)
-            save_pair_cfg(base_sym, {"legs": 0})
+            save_pair_cfg(symbol_orig, {"legs": 0})
 
         else:  # CLOSE_SHORT
             result = place_market_order(base_sym, "BUY", qty, reduce_only=True,
                                         position_side=ps_short, client_id=cid)
-            save_pair_cfg(base_sym, {"legs": 0})
+            save_pair_cfg(symbol_orig, {"legs": 0})
 
         # 텔레그램 확인 메시지
         try:
             bnc_token = os.getenv("BNC_BOT_TOKEN")
             bnc_chat  = os.getenv("BNC_CHAT_ID")
-            confirm   = (f"[TRADE] {symbol_in} ({base_sym}) {action} qty={qty}\n"
+            confirm   = (f"[TRADE] {symbol_orig}({base_sym}) {action} qty={qty}\n"
                          f"orderId={result.get('orderId')}  status={result.get('status')}\n"
                          f"{note}\n🌐 {STATE['global_mode']}  🧩 SPLIT="
                          f"{'ON' if STATE['split_enabled'] else 'OFF'}  "
-                         f"risk={ep['risk']}  legs={get_pair_cfg(base_sym)['legs']}")
+                         f"risk={ep['risk']}  legs={get_pair_cfg(symbol_orig)['legs']}")
             if bnc_token and bnc_chat:
                 post_telegram_with_token(bnc_token, bnc_chat, confirm)
         except Exception:
@@ -872,18 +879,18 @@ def bnc_trade():
         return jsonify({"ok": True, "result": result})
 
     except Exception as e:
-        log.exception("bnc_trade error")
+        log.exception("bbangdol-bot.bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# === TradingView → Private /bnc/trade 프록시 (기존 유지) ===
+# === TradingView → Private /bnc/trade 프록시 (기존 유지, 심볼 정규화만 추가 설명성 포함) ===
 @app.post("/tv")
 def tv_proxy():
     data = request.get_json(silent=True, force=True) or {}
     # Pine 포맷: {"secret":"...","tag":"BNC_POSITION","symbol":"BTCUSDT.P","tf":"5","p":"...","sig":"LONG_5m"}
-    symbol = str(data.get("symbol","")).upper()
+    symbol_orig = str(data.get("symbol","")).upper()
     sig    = str(data.get("sig","")).upper()
 
-    if not symbol or not sig:
+    if not symbol_orig or not sig:
         return jsonify({"ok": False, "error": "missing symbol/sig"}), 400
 
     if   sig.startswith("LONG"):  action = "OPEN_LONG"
@@ -895,7 +902,7 @@ def tv_proxy():
     private_base = os.getenv("PRIVATE_BASE", "http://bbangdol-bnc-bot-private:10000")
     payload = {
         "secret": os.getenv("BNC_SECRET", ""),
-        "symbol": symbol,  # .P 그대로 전달 → private에서 normalize
+        "symbol": symbol_orig,          # 원문 그대로 전달 (private에서 정규화)
         "action": action,
         "note":   note
     }
