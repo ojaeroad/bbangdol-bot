@@ -6,14 +6,14 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 import requests
 
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bbangdol-bot")
+
 # ===== Econ calendar =====
 if os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in ("0","false","no","off",""):
     from econ_calendar_tele_bot import init_econ_calendar
     init_econ_calendar(app)
-
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bbangdol-bot")
 
 # ===== Econ calendar (kept) =====
 init_econ_calendar(app)
