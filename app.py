@@ -907,6 +907,317 @@ def tv_proxy():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+
+
+
+
+
+
+
+# =======================
+# === BNC DEBUG LAYER ===
+# =======================
+def _env_true(name: str, default: str = "0") -> bool:
+    v = os.getenv(name, default)
+    return str(v).strip().lower() in ("1","true","on","yes")
+
+BNC_DEBUG  = _env_true("BNC_DEBUG", "0")   # 켜야만 동작 (기본 OFF)
+BNC_DRYRUN = _env_true("BNC_DRYRUN", "0")  # 실주문 막고 시뮬레이션
+
+def _mask(s: str, keep_head: int = 6, keep_tail: int = 4) -> str:
+    if not s: return ""
+    if len(s) <= keep_head + keep_tail: return "*" * len(s)
+    return s[:keep_head] + "…" + s[-keep_tail:]
+
+def _dbg(msg: str):
+    if BNC_DEBUG:
+        log.info("[BNC-DEBUG] " + msg)
+
+# --- 원함수 보존
+__ORIG__ = {}
+__ORIG__["_binance_get"]  = _binance_get
+__ORIG__["_binance_post"] = _binance_post
+__ORIG__["place_market_order"] = place_market_order
+__ORIG__["place_stop_market"]  = place_stop_market
+__ORIG__["place_trailing"]     = place_trailing
+__ORIG__["get_mark_price"]     = get_mark_price
+__ORIG__["get_account_available_usdt"] = get_account_available_usdt
+__ORIG__["get_symbol_filters"] = get_symbol_filters
+
+# --- 공통 래퍼
+def _wrap_http_call(kind: str, fn):
+    def _inner(path: str, params: dict):
+        if not BNC_DEBUG:
+            return fn(path, params)
+        try:
+            api_key = os.getenv("BINANCE_API_KEY","")
+            base = _binance_base()
+            _dbg(f"{kind} → {base}{path}  params={ {k:('***' if k in ('signature',) else v) for k,v in params.items()} }  key={_mask(api_key)}")
+            res = fn(path, params)
+            # 바이낸스 에러 포맷 일원화
+            if isinstance(res, dict) and "code" in res and str(res.get("code")).startswith("-"):
+                _dbg(f"{kind} ← ERROR code={res.get('code')} msg={res.get('msg')}")
+            else:
+                _dbg(f"{kind} ← OK keys={list(res.keys())[:8]}")
+            return res
+        except Exception as e:
+            _dbg(f"{kind} EXC: {e}")
+            raise
+    return _inner
+
+# _binance_get/post 트레이스
+_binance_get  = _wrap_http_call("GET",  __ORIG__["_binance_get"])
+_binance_post = _wrap_http_call("POST", __ORIG__["_binance_post"])
+
+# --- 주문류 래퍼 (DRYRUN 지원)
+def _wrap_order(name: str, fn):
+    def _inner(*args, **kwargs):
+        if not BNC_DEBUG:
+            return fn(*args, **kwargs)
+        try:
+            _dbg(f"{name} args={args} kwargs={kwargs}")
+            if BNC_DRYRUN and name in ("place_market_order","place_stop_market","place_trailing"):
+                # 실제 주문 없이 성공 형태 시뮬레이션
+                fake = {"orderId": int(now()), "status": "SIMULATED", "dryrun": True, "fn": name}
+                _dbg(f"{name} DRYRUN → {fake}")
+                return fake
+            res = fn(*args, **kwargs)
+            _dbg(f"{name} ← { {k:res.get(k) for k in ('orderId','status','msg','code') if k in res} }")
+            return res
+        except Exception as e:
+            _dbg(f"{name} EXC: {e}")
+            raise
+    return _inner
+
+place_market_order = _wrap_order("place_market_order", __ORIG__["place_market_order"])
+place_stop_market  = _wrap_order("place_stop_market",  __ORIG__["place_stop_market"])
+place_trailing     = _wrap_order("place_trailing",     __ORIG__["place_trailing"])
+
+# --- 시세/잔고/필터 조회 트레이스
+def _wrap_simple(name: str, fn):
+    def _inner(*args, **kwargs):
+        if not BNC_DEBUG:
+            return fn(*args, **kwargs)
+        try:
+            _dbg(f"{name} args={args} kwargs={kwargs}")
+            res = fn(*args, **kwargs)
+            _dbg(f"{name} ← {res}")
+            return res
+        except Exception as e:
+            _dbg(f"{name} EXC: {e}")
+            raise
+    return _inner
+
+get_mark_price = _wrap_simple("get_mark_price", __ORIG__["get_mark_price"])
+get_account_available_usdt = _wrap_simple("get_account_available_usdt", __ORIG__["get_account_available_usdt"])
+get_symbol_filters = _wrap_simple("get_symbol_filters", __ORIG__["get_symbol_filters"])
+
+# --- 라우트 단계별 원인 자동표시: /bnc/trade 가 어디서 막히는지 한눈에
+__ORIG__["bnc_trade"] = bnc_trade
+
+@app.post("/bnc/trade")
+def bnc_trade_with_trace():
+    if not BNC_DEBUG:
+        return __ORIG__["bnc_trade"]()
+
+    stage = "start"
+    try:
+        data = request.get_json(silent=True, force=True) or {}
+        _dbg(f"REQ /bnc/trade body={data}")
+
+        # 1) 인증
+        stage = "auth"
+        secret = os.getenv("BNC_SECRET")
+        if secret and data.get("secret") != secret:
+            _dbg("FAIL at auth: bad secret")
+            return jsonify({"ok": False, "stage": stage, "error": "bad secret"}), 401
+
+        # 2) 파라미터 정합
+        stage = "params"
+        symbol_orig = str(data.get("symbol", "")).upper()
+        base_sym    = normalize_binance_symbol(symbol_orig)
+        action      = str(data.get("action", "")).upper()
+        note        = str(data.get("note", ""))
+
+        if not symbol_orig or not action:
+            _dbg("FAIL at params: missing symbol/action")
+            return jsonify({"ok": False, "stage": stage, "error": "missing symbol/action"}), 400
+
+        if SYM_WHITELIST and (symbol_orig not in SYM_WHITELIST) and (base_sym not in SYM_WHITELIST):
+            _dbg(f"FAIL at params: symbol not allowed {symbol_orig}")
+            return jsonify({"ok": False, "stage": stage, "error": f"symbol not allowed: {symbol_orig}"}), 400
+
+        if action not in {"OPEN_LONG", "CLOSE_LONG", "OPEN_SHORT", "CLOSE_SHORT"}:
+            _dbg(f"FAIL at params: invalid action {action}")
+            return jsonify({"ok": False, "stage": stage, "error": "invalid action"}), 400
+
+        # 3) 모드 제한
+        stage = "mode-check"
+        side = "LONG" if "LONG" in action else "SHORT"
+        if action.startswith("OPEN") and not allowed_by_mode(symbol_orig, side):
+            _dbg("SKIP at mode-check: not allowed by mode")
+            return jsonify({"ok": True, "stage": stage, "skipped": "mode"})
+
+        # 4) 서버-바이낸스 시계 드리프트
+        stage = "time-drift"
+        try:
+            base = _binance_base()
+            t = requests.get(f"{base}/fapi/v1/time", timeout=5).json().get("serverTime")
+            drift_ms = abs(int(t) - _now_ms()) if t else None
+        except Exception:
+            drift_ms = None
+        _dbg(f"time drift(ms)={drift_ms}")
+
+        # 5) 시세/잔고/레버리지 파라미터
+        stage = "price-balance"
+        ep     = effective_params(symbol_orig)
+        price  = get_mark_price(base_sym)
+        avail  = get_account_available_usdt()
+        lev    = ep["lev"]
+        phases = ep["phases"]
+        legs   = ep["legs"]
+
+        # 6) 수량 계산 (분할 진입 포함)
+        stage = "qty-calc"
+        if STATE["split_enabled"]:
+            phase = phases[legs] if legs < len(phases) else 0.0
+        else:
+            phase = 1.0
+
+        filters = get_symbol_filters(base_sym)
+        step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
+
+        if action.startswith("OPEN"):
+            alloc_usdt = avail * phase
+            if alloc_usdt <= 0:
+                _dbg("FAIL at qty-calc: no available balance")
+                return jsonify({"ok": False, "stage": stage, "error": "no available balance"})
+            notional = alloc_usdt * lev
+            raw_qty = notional / price
+            qty = quantize_qty_for_symbol(base_sym, raw_qty)
+        else:
+            qty = quantize_qty_for_symbol(base_sym, 0.0 + step)
+
+        _dbg(f"calc → price={price} avail={avail} lev={lev} phase={phase} qty={qty} legs={legs} split={STATE['split_enabled']}")
+
+        # 7) 주문/청산 실행 (DRYRUN 지원)
+        stage = "place-order"
+        cid = f"bnc_{base_sym}_{action}_{int(now())}"
+        ps_long  = None if _is_oneway() else "LONG"
+        ps_short = None if _is_oneway() else "SHORT"
+
+        # 실주문 우회 (Dry-run)
+        def _sim(ok=True, extra=None):
+            d = {"ok": ok, "stage": stage, "dryrun": True, "action": action, "symbol": base_sym}
+            if extra: d.update(extra)
+            return jsonify(d)
+
+        if BNC_DRYRUN:
+            # 스탭별 성공 시뮬레이션
+            _dbg("DRYRUN: skip real exchange calls for order placement")
+            # trailing/stop 가정치도 함께 반환
+            return _sim(True, {"qty": qty, "note": note, "split": STATE["split_enabled"], "legs": legs, "risk": ep["risk"]})
+
+        if action == "OPEN_LONG":
+            res_open = place_market_order(base_sym, "BUY", qty, reduce_only=False, position_side=ps_long, client_id=cid)
+            sl_pct = float(ep["sl"]); sl_price = price * (1 - sl_pct/100.0)
+            place_stop_market(base_sym, "SELL", qty, stop_price_raw=sl_price, position_side=ps_long)
+            tr = ep["trail"]; act = float(tr.get("act")); cb = float(tr.get("cb"))
+            activation = price * (1 - act/100.0)
+            place_trailing(base_sym, "SELL", qty, activation_price_raw=activation, callback_rate=cb, position_side=ps_long)
+            save_pair_cfg(symbol_orig, {"legs": min(legs+1, len(phases))})
+            result = res_open
+
+        elif action == "OPEN_SHORT":
+            res_open = place_market_order(base_sym, "SELL", qty, reduce_only=False, position_side=ps_short, client_id=cid)
+            sl_pct = float(ep["sl"]); sl_price = price * (1 + sl_pct/100.0)
+            place_stop_market(base_sym, "BUY", qty, stop_price_raw=sl_price, position_side=ps_short)
+            tr = ep["trail"]; act = float(tr.get("act")); cb = float(tr.get("cb"))
+            activation = price * (1 + act/100.0)
+            place_trailing(base_sym, "BUY", qty, activation_price_raw=activation, callback_rate=cb, position_side=ps_short)
+            save_pair_cfg(symbol_orig, {"legs": min(legs+1, len(phases))})
+            result = res_open
+
+        elif action == "CLOSE_LONG":
+            result = place_market_order(base_sym, "SELL", qty, reduce_only=True, position_side=ps_long, client_id=cid)
+            save_pair_cfg(symbol_orig, {"legs": 0})
+
+        else:  # CLOSE_SHORT
+            result = place_market_order(base_sym, "BUY", qty, reduce_only=True, position_side=ps_short, client_id=cid)
+            save_pair_cfg(symbol_orig, {"legs": 0})
+
+        stage = "notify"
+        try:
+            bnc_token = os.getenv("BNC_BOT_TOKEN"); bnc_chat  = os.getenv("BNC_CHAT_ID")
+            confirm   = (f"[TRADE/DEBUG] {symbol_orig}({base_sym}) {action} qty={qty}\n"
+                         f"orderId={result.get('orderId')}  status={result.get('status')}\n"
+                         f"{note}\nstage={stage}  drift(ms)={locals().get('drift_ms',None)}")
+            if bnc_token and bnc_chat:
+                post_telegram_with_token(bnc_token, bnc_chat, confirm)
+        except Exception:
+            pass
+
+        return jsonify({"ok": True, "stage": stage, "result": result})
+
+    except Exception as e:
+        log.exception("bnc_trade_with_trace")
+        return jsonify({"ok": False, "stage": stage, "error": str(e)}), 500
+
+# --- 상태 종합 점검: /bnc/diag
+@app.get("/bnc/diag")
+def bnc_diag():
+    """실제 주문 없이 현재 환경/연결/권한/시계/기본심볼 필터를 한 번에 보여줌"""
+    try:
+        base = _binance_base()
+        api_key = os.getenv("BINANCE_API_KEY","")
+        is_testnet = "testnet" in base
+        drift_ms = None
+        try:
+            t = requests.get(f"{base}/fapi/v1/time", timeout=5).json().get("serverTime")
+            drift_ms = abs(int(t) - _now_ms()) if t else None
+        except Exception:
+            pass
+
+        ok_balance = True
+        bal = 0.0
+        err_balance = None
+        try:
+            bal = get_account_available_usdt()
+        except Exception as e:
+            ok_balance = False
+            err_balance = str(e)
+
+        sym = "BTCUSDT"
+        f = {}
+        err_filters = None
+        try:
+            f = get_symbol_filters(sym)
+        except Exception as e:
+            err_filters = str(e)
+
+        return jsonify({
+            "ok": True,
+            "binance_base": base,
+            "is_testnet": is_testnet,
+            "api_key_masked": _mask(api_key),
+            "time_drift_ms": drift_ms,
+            "balance_ok": ok_balance,
+            "available_usdt": bal,
+            "filters_ok": err_filters is None,
+            "filters_sample_symbol": sym,
+            "price_filter_tick": f.get("PRICE_FILTER", {}).get("tickSize"),
+            "lot_step": f.get("LOT_SIZE", {}).get("stepSize"),
+            "env_flags": {
+                "BNC_DEBUG": BNC_DEBUG,
+                "BNC_DRYRUN": BNC_DRYRUN,
+                "BINANCE_IS_TESTNET": os.getenv("BINANCE_IS_TESTNET",""),
+                "BINANCE_POSITION_MODE": os.getenv("BINANCE_POSITION_MODE","HEDGE")
+            }
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # =========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
