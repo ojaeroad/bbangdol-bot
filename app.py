@@ -11,12 +11,11 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
 
 # ===== Econ calendar =====
-if os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in ("0","false","no","off",""):
+import os
+if os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in ("0", "false", "", "no", "off"):
     from econ_calendar_tele_bot import init_econ_calendar
     init_econ_calendar(app)
 
-# ===== Econ calendar (kept) =====
-init_econ_calendar(app)
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60
