@@ -10,12 +10,11 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
 
-# ===== Econ calendar =====
-import os
+# ===== Econ calendar (optional, guarded single-call) =====
+# 켜고 싶을 때만: ECON_CAL_ENABLED = "1" / "true" / "on" / "yes"
 if os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in ("0", "false", "", "no", "off"):
     from econ_calendar_tele_bot import init_econ_calendar
     init_econ_calendar(app)
-
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60
@@ -780,7 +779,6 @@ def bnc_trade():
     note   = str(data.get("note", ""))
 
     if SYM_WHITELIST:
-        # 화이트리스트 비교 시도: 원문/정규화 둘 다 허용
         if (symbol_orig not in SYM_WHITELIST) and (base_sym not in SYM_WHITELIST):
             return jsonify({"ok": False, "error": f"symbol not allowed: {symbol_orig}"}), 400
     if action not in {"OPEN_LONG", "CLOSE_LONG", "OPEN_SHORT", "CLOSE_SHORT"}:
@@ -791,12 +789,10 @@ def bnc_trade():
         return jsonify({"ok": True, "skipped": "mode"})
 
     try:
-        # --- 설정/프리셋 결합 파라미터 로드 (원문 키 기준)
         ep   = effective_params(symbol_orig)
         legs = ep["legs"]
 
-        # --- 수량 계산
-        price = get_mark_price(base_sym)  # <<<< 정규화 심볼
+        price = get_mark_price(base_sym)
         avail = get_account_available_usdt()
         lev   = ep["lev"]
 
@@ -817,12 +813,10 @@ def bnc_trade():
             raw_qty = notional / price
             qty = quantize_qty_for_symbol(base_sym, raw_qty)
         else:
-            # 최소 수량으로 청산(모든 포지션을 정확히 닫으려면 별도 포지션 조회가 필요하나, 여기선 안전 최소치)
             qty = quantize_qty_for_symbol(base_sym, 0.0 + step)
 
         cid = f"bnc_{base_sym}_{action}_{int(now())}"
 
-        # === 실행 ===
         ps_long  = None if _is_oneway() else "LONG"
         ps_short = None if _is_oneway() else "SHORT"
 
@@ -864,7 +858,6 @@ def bnc_trade():
                                         position_side=ps_short, client_id=cid)
             save_pair_cfg(symbol_orig, {"legs": 0})
 
-        # 텔레그램 확인 메시지
         try:
             bnc_token = os.getenv("BNC_BOT_TOKEN")
             bnc_chat  = os.getenv("BNC_CHAT_ID")
@@ -884,7 +877,7 @@ def bnc_trade():
         log.exception("bbangdol-bot.bnc_trade error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# === TradingView → Private /bnc/trade 프록시 (기존 유지, 심볼 정규화만 추가 설명성 포함) ===
+# === TradingView → Private /bnc/trade 프록시 ===
 @app.post("/tv")
 def tv_proxy():
     data = request.get_json(silent=True, force=True) or {}
