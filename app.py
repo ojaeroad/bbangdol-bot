@@ -951,24 +951,40 @@ def _wrap_http_call(kind: str, fn):
         if not BNC_DEBUG:
             return fn(path, params)
         try:
-            api_key = os.getenv("BINANCE_API_KEY","")
+            api_key = os.getenv("BINANCE_API_KEY", "")
             base = _binance_base()
-            _dbg(f"{kind} → {base}{path}  params={ {k:('***' if k in ('signature',) else v) for k,v in params.items()} }  key={_mask(api_key)}")
+            safe_params = {k: ('***' if k in ('signature',) else v) for k, v in params.items()}
+            _dbg(f"{kind} → {base}{path}  params={safe_params}  key={_mask(api_key)}")
+
             res = fn(path, params)
+
             # 바이낸스 에러 포맷 일원화
             if isinstance(res, dict) and "code" in res and str(res.get("code")).startswith("-"):
                 _dbg(f"{kind} ← ERROR code={res.get('code')} msg={res.get('msg')}")
             else:
-                _dbg(f"{kind} ← OK keys={list(res.keys())[:8]}")
+                # 안전 로그(dict/list/기타 모두 대응)
+                if isinstance(res, dict):
+                    _dbg(f"{kind} ← OK dict keys={list(res.keys())[:8]}")
+                elif isinstance(res, list):
+                    first = res[0] if res else None
+                    if isinstance(first, dict):
+                        _dbg(f"{kind} ← OK list len={len(res)} sample_keys={list(first.keys())[:8]}")
+                    else:
+                        _dbg(f"{kind} ← OK list len={len(res)}")
+                else:
+                    _dbg(f"{kind} ← OK type={type(res).__name__}")
+
             return res
         except Exception as e:
             _dbg(f"{kind} EXC: {e}")
             raise
     return _inner
 
+
 # _binance_get/post 트레이스
 _binance_get  = _wrap_http_call("GET",  __ORIG__["_binance_get"])
 _binance_post = _wrap_http_call("POST", __ORIG__["_binance_post"])
+
 
 # --- 주문류 래퍼 (DRYRUN 지원)
 def _wrap_order(name: str, fn):
@@ -977,18 +993,27 @@ def _wrap_order(name: str, fn):
             return fn(*args, **kwargs)
         try:
             _dbg(f"{name} args={args} kwargs={kwargs}")
-            if BNC_DRYRUN and name in ("place_market_order","place_stop_market","place_trailing"):
+
+            if BNC_DRYRUN and name in ("place_market_order", "place_stop_market", "place_trailing"):
                 # 실제 주문 없이 성공 형태 시뮬레이션
                 fake = {"orderId": int(now()), "status": "SIMULATED", "dryrun": True, "fn": name}
                 _dbg(f"{name} DRYRUN → {fake}")
                 return fake
+
             res = fn(*args, **kwargs)
-            _dbg(f"{name} ← { {k:res.get(k) for k in ('orderId','status','msg','code') if k in res} }")
+
+            # 응답 요약
+            if isinstance(res, dict):
+                _dbg(f"{name} ← {{'orderId': {res.get('orderId')}, 'status': {res.get('status')}, 'code': {res.get('code')}, 'msg': {res.get('msg')}}}")
+            else:
+                _dbg(f"{name} ← type={type(res).__name__}")
+
             return res
         except Exception as e:
             _dbg(f"{name} EXC: {e}")
             raise
     return _inner
+
 
 place_market_order = _wrap_order("place_market_order", __ORIG__["place_market_order"])
 place_stop_market  = _wrap_order("place_stop_market",  __ORIG__["place_stop_market"])
