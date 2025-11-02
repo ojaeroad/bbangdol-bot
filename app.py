@@ -283,7 +283,8 @@ def normalize_binance_symbol(sym: str) -> str:
     s = sym.strip().upper()
     if s.endswith(".P"):
         s = s[:-2]  # drop trailing ".P"
-    s = re.sub(r'[^A-Z0-9]', '', s)  # 안전하게 기타 특수문자 제거
+    # 안전하게 기타 특수문자 제거
+    s = re.sub(r'[^A-Z0-9]', '', s)
     return s
 
 def _decimals_from_step(step: float) -> int:
@@ -597,7 +598,9 @@ def tg_webhook():
             post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data.startswith("RISK:"):
             st["cfg"]["risk"] = data.split(":")[1]
-            post_telegram(chat_id, f"리스크 모드: {st['cfg']['risk']}", reply_markup=kb_main(st["cfg"]))
+            risk_val = st["cfg"]["risk"]
+            cfg_for_kb = st["cfg"]
+            post_telegram(chat_id, f"리스크 모드: {risk_val}", reply_markup=kb_main(cfg_for_kb))
         elif data == "ADD:SAVE":
             cfg = st["cfg"]; sym = cfg.get("symbol")
             if not sym:
@@ -652,7 +655,8 @@ def tg_webhook():
         elif data.startswith("TRAIL:"):
             _, act, cb = data.split(":")
             st["cfg"]["trail"] = {"act": float(act), "cb": float(cb)}
-            post_telegram(chat_id, f"트레일링 {act}/{cb} 설정", reply_markup=kb_main(st["cfg"]))
+            cfg_for_kb = st["cfg"]
+            post_telegram(chat_id, f"트레일링 {act}/{cb} 설정", reply_markup=kb_main(cfg_for_kb))
         elif data == "GLOB:MODE":
             nxt = {"BOTH":"LONG_ONLY", "LONG_ONLY":"SHORT_ONLY", "SHORT_ONLY":"BOTH"}[STATE["global_mode"]]
             STATE["global_mode"] = nxt
@@ -681,7 +685,8 @@ def tg_webhook():
             st["cfg"]["sl"]    = pc["sl"]
             st["cfg"]["trail"] = pc["trail"]
             st["cfg"]["risk"]  = pc["risk"]
-            post_telegram(chat_id, f"{sym} 불러옴.", reply_markup=kb_main(st["cfg"]))
+            cfg_for_kb = st["cfg"]
+            post_telegram(chat_id, f"{sym} 불러옴.", reply_markup=kb_main(cfg_for_kb))
         elif data.startswith("LIST:DEL:"):
             sym = data.split(":")[2]
             STATE["pairs"].pop(sym, None)
@@ -777,18 +782,12 @@ def _unsupported_symbol_reason(base_sym: str) -> Optional[str]:
         return f"filter check error: {e}"
     return None
 
-# --- stage1 브로드캐스트 음소거 옵션 ---
-BNC_NOTIFY = os.getenv("BNC_NOTIFY", "1").strip().lower() not in ("0","false","no","off")
-
 @app.post("/bnc")
 def bnc_send():
     data = request.get_json(silent=True, force=True) or {}
     secret = os.getenv("BNC_SECRET")
     if secret and data.get("secret") != secret:
         return jsonify({"ok": False, "error": "bad secret"}), 401
-
-    if not BNC_NOTIFY:
-        return jsonify({"ok": True, "muted": True})
 
     bnc_token = os.getenv("BNC_BOT_TOKEN")
     bnc_chat  = os.getenv("BNC_CHAT_ID")
@@ -848,7 +847,7 @@ def bnc_trade():
         if action.startswith("OPEN") and not allowed_by_mode(symbol_orig, side):
             return jsonify({"ok": True, "skipped": "mode"}), 200
 
-        # --- (NEW) 선물 미상장/미지원 사전 차단 ---
+        # --- 선물 미상장/미지원 사전 차단 ---
         reason = _unsupported_symbol_reason(base_sym)
         if reason:
             try:
@@ -896,7 +895,6 @@ def bnc_trade():
             sl_pct = float(ep["sl"])
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
 
-            # 즉시발동 방지(최소 간격 보장)
             sl_price, activation = _apply_min_gap("LONG", price, sl_pct, act)
 
             place_stop_market(base_sym, "SELL", qty, stop_price_raw=sl_price,
