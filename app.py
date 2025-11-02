@@ -1047,6 +1047,7 @@ def bnc_diag():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
 
+
 # =========================================================
 if __name__ == "__main__":
     # 원한다면 부팅 시 자동 setWebhook (TG_SET_WEBHOOK_ON_BOOT=1)
