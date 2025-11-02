@@ -597,7 +597,7 @@ def tg_webhook():
             post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data.startswith("RISK:"):
             st["cfg"]["risk"] = data.split(":")[1]
-            post_telegram(chat_id, f"리스크 모드: {st['cfg']['risk']}", reply_markup=kb_main(st["cfg"])]
+            post_telegram(chat_id, f"리스크 모드: {st['cfg']['risk']}", reply_markup=kb_main(st["cfg"]))
         elif data == "ADD:SAVE":
             cfg = st["cfg"]; sym = cfg.get("symbol")
             if not sym:
@@ -629,7 +629,7 @@ def tg_webhook():
             ui_reset(chat_id)
             post_telegram(chat_id, "취소했습니다. /add 로 다시 시작하세요.")
         elif data == "LEV:BACK":
-            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]})
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data == "LEV:CUSTOM":
             st["mode"] = "ask_lev"
             post_telegram(chat_id, "레버리지를 숫자로 입력 (예: 10)", reply_markup=force_reply("10"))
@@ -637,7 +637,7 @@ def tg_webhook():
             st["cfg"]["lev"] = int(data.split(":")[1])
             post_telegram(chat_id, f"레버리지 {st['cfg']['lev']}x 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "SL:BACK":
-            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"])}
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data == "SL:CUSTOM":
             st["mode"] = "ask_sl"
             post_telegram(chat_id, "손절 % 입력 (예: 1)", reply_markup=force_reply("1"))
@@ -645,7 +645,7 @@ def tg_webhook():
             st["cfg"]["sl"] = float(data.split(":")[1])
             post_telegram(chat_id, f"손절 {st['cfg']['sl']}% 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "TRAIL:BACK":
-            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]) }
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data == "TRAIL:CUSTOM":
             st["mode"] = "ask_trail_act"
             post_telegram(chat_id, "트레일 활성 % 입력 (예: 0.6)", reply_markup=force_reply("0.6"))
