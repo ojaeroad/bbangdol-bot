@@ -655,7 +655,7 @@ def tg_webhook():
             st["cfg"]["trail"] = {"act": float(act), "cb": float(cb)}
             post_telegram(chat_id, f"트레일링 {act}/{cb} 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "GLOB:MODE":
-            nxt = {"BOTH":"LONG_ONLY", "LONG_ONLY":"SHORT_ONLY", "SHORT_ONLY":"BOTH"}[STATE["global_mode"]}
+            nxt = {"BOTH":"LONG_ONLY", "LONG_ONLY":"SHORT_ONLY", "SHORT_ONLY":"BOTH"}[STATE["global_mode"]]
             STATE["global_mode"] = nxt
             post_telegram(chat_id, f"🌐 GLOBAL 모드: {STATE['global_mode']}", reply_markup=kb_main(st["cfg"]))
         elif data == "SPLIT:TOGGLE":
