@@ -641,6 +641,7 @@ def tg_webhook():
             post_telegram(chat_id, "취소했습니다. /add 로 다시 시작하세요.")
         elif data == "LEV:BACK":
             post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
+
         elif data == "LEV:CUSTOM":
             st["mode"] = "ask_lev"
             post_telegram(chat_id, "레버리지를 숫자로 입력 (예: 10)", reply_markup=force_reply("10"))
@@ -715,24 +716,29 @@ def tg_webhook():
                     assert sym.endswith("USDT") or sym.endswith("USDT.P")
                     st["cfg"]["symbol"] = sym
                     post_telegram(chat_id, f"종목 설정: {sym}", reply_markup=kb_main(st["cfg"]))
+
                 elif st["mode"] == "ask_lev":
                     lev = int(float(text)); assert 1 <= lev <= 125
                     st["cfg"]["lev"] = lev
                     post_telegram(chat_id, f"레버리지 {lev}x 설정", reply_markup=kb_main(st["cfg"]))
+
                 elif st["mode"] == "ask_sl":
                     sl = float(text); assert 0.1 <= sl <= 10
                     st["cfg"]["sl"] = sl
                     post_telegram(chat_id, f"손절 {sl}% 설정", reply_markup=kb_main(st["cfg"]))
+
                 elif st["mode"] == "ask_trail_act":
                     act = float(text); assert 0.1 <= act <= 10
                     st["cfg"].setdefault("trail", {})["act"] = act
                     st["mode"] = "ask_trail_cb"
                     post_telegram(chat_id, "콜백 % 입력 (예: 0.2)", reply_markup=force_reply("0.2"))
                     return jsonify({"ok": True})
+
                 elif st["mode"] == "ask_trail_cb":
                     cb = float(text); assert 0.1 <= cb <= 5
                     st["cfg"].setdefault("trail", {})["cb"] = cb
                     post_telegram(chat_id, f"트레일링 {st['cfg']['trail']['act']}/{cb} 설정", reply_markup=kb_main(st["cfg"]))
+
                 st["mode"] = "idle"
             except Exception:
                 post_telegram(chat_id, "입력이 올바르지 않습니다. 다시 시도해 주세요.")
