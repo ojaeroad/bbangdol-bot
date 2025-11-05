@@ -14,6 +14,10 @@ log = logging.getLogger("bbangdol-bot")
 APP_VERSION  = os.getenv("APP_VERSION", "dev")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong", 200
+
 @app.get("/version")
 def version():
     return jsonify({"service": SERVICE_NAME, "version": APP_VERSION})
