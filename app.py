@@ -653,7 +653,7 @@ def tg_webhook():
             st["cfg"]["lev"] = int(data.split(":")[1])
             post_telegram(chat_id, f"레버리지 {st['cfg']['lev']}x 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "SL:BACK":
-            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"])]
         elif data == "SL:CUSTOM":
             st["mode"] = "ask_sl"
             post_telegram(chat_id, "손절 % 입력 (예: 1)", reply_markup=force_reply("1"))
@@ -716,33 +716,27 @@ def tg_webhook():
             try:
                 if st["mode"] == "ask_symbol":
                     sym = text.upper().replace(" ","")
-                    # 저장은 원문 그대로 (BTCUSDT 또는 BTCUSDT.P)
                     assert sym.endswith("USDT") or sym.endswith("USDT.P")
                     st["cfg"]["symbol"] = sym
                     post_telegram(chat_id, f"종목 설정: {sym}", reply_markup=kb_main(st["cfg"]))
-
                 elif st["mode"] == "ask_lev":
                     lev = int(float(text)); assert 1 <= lev <= 125
                     st["cfg"]["lev"] = lev
                     post_telegram(chat_id, f"레버리지 {lev}x 설정", reply_markup=kb_main(st["cfg"]))
-
                 elif st["mode"] == "ask_sl":
                     sl = float(text); assert 0.1 <= sl <= 10
                     st["cfg"]["sl"] = sl
                     post_telegram(chat_id, f"손절 {sl}% 설정", reply_markup=kb_main(st["cfg"]))
-
                 elif st["mode"] == "ask_trail_act":
                     act = float(text); assert 0.1 <= act <= 10
                     st["cfg"].setdefault("trail", {})["act"] = act
                     st["mode"] = "ask_trail_cb"
                     post_telegram(chat_id, "콜백 % 입력 (예: 0.2)", reply_markup=force_reply("0.2"))
                     return jsonify({"ok": True})
-
                 elif st["mode"] == "ask_trail_cb":
                     cb = float(text); assert 0.1 <= cb <= 5
                     st["cfg"].setdefault("trail", {})["cb"] = cb
                     post_telegram(chat_id, f"트레일링 {st['cfg']['trail']['act']}/{cb} 설정", reply_markup=kb_main(st["cfg"]))
-
                 st["mode"] = "idle"
             except Exception:
                 post_telegram(chat_id, "입력이 올바르지 않습니다. 다시 시도해 주세요.")
@@ -759,7 +753,8 @@ def tg_webhook():
 
         if text == "/list":
             lines = [f"GLOBAL={STATE['global_mode']}  SPLIT={'ON' if STATE['split_enabled'] else 'OFF'}"]
-            for s,c in STATE["pairs"].items(): lines.append(f"{s}: {c}")
+            for s,c in STATE["pairs"].items():
+                lines.append(f"{s}: {c}")
             post_telegram(chat_id, "SETTINGS\n" + "\n".join(lines))
             return jsonify({"ok": True})
 
@@ -793,7 +788,6 @@ def _unsupported_symbol_reason(base_sym: str) -> Optional[str]:
         f = get_symbol_filters(base_sym)
         if not f:
             return "unsupported symbol on Binance Futures"
-        # 필수 필터가 없으면 미지원 처리
         if "PRICE_FILTER" not in f or "LOT_SIZE" not in f:
             return "missing filters (PRICE_FILTER/LOT_SIZE)"
     except Exception as e:
@@ -834,7 +828,7 @@ def bnc_send():
         return jsonify({"ok": bool(res.get("ok")), "detail": res})
     except Exception as e:
         log.exception("BNC Telegram send exception")
-        return jsonify({"ok": False, "error": str(e)}), 200  # 200로 변환
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 @app.post("/bnc/trade")
 def bnc_trade():
@@ -843,7 +837,6 @@ def bnc_trade():
       {"secret":"<BNC_SECRET>", "symbol":"BTCUSDT.P", "action":"OPEN_LONG|OPEN_SHORT|CLOSE_LONG|CLOSE_SHORT", "note":"tf=..."}
     qty는 비워도 서버가 자동 계산.
     """
-    # === 항상 200으로 응답하도록 최상위 예외 처리 ===
     try:
         data = request.get_json(silent=True, force=True) or {}
         secret = os.getenv("BNC_SECRET")
@@ -865,7 +858,6 @@ def bnc_trade():
         if action.startswith("OPEN") and not allowed_by_mode(symbol_orig, side):
             return jsonify({"ok": True, "skipped": "mode"}), 200
 
-        # --- 선물 미상장/미지원 사전 차단 ---
         reason = _unsupported_symbol_reason(base_sym)
         if reason:
             try:
@@ -912,9 +904,7 @@ def bnc_trade():
                                           position_side=ps_long, client_id=cid)
             sl_pct = float(ep["sl"])
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
-
             sl_price, activation = _apply_min_gap("LONG", price, sl_pct, act)
-
             place_stop_market(base_sym, "SELL", qty, stop_price_raw=sl_price,
                               position_side=ps_long)
             place_trailing(base_sym, "SELL", qty, activation_price_raw=activation,
@@ -927,9 +917,7 @@ def bnc_trade():
                                           position_side=ps_short, client_id=cid)
             sl_pct = float(ep["sl"])
             tr = ep["trail"]; act = float(tr.get("act")); cb=float(tr.get("cb"))
-
             sl_price, activation = _apply_min_gap("SHORT", price, sl_pct, act)
-
             place_stop_market(base_sym, "BUY", qty, stop_price_raw=sl_price,
                               position_side=ps_short)
             place_trailing(base_sym, "BUY", qty, activation_price_raw=activation,
@@ -947,7 +935,6 @@ def bnc_trade():
                                         position_side=ps_short, client_id=cid)
             save_pair_cfg(symbol_orig, {"legs": 0})
 
-        # 텔레그램 확인 알림
         try:
             bnc_token = os.getenv("BNC_BOT_TOKEN")
             bnc_chat  = os.getenv("BNC_CHAT_ID")
@@ -964,7 +951,6 @@ def bnc_trade():
         return jsonify({"ok": True, "result": result}), 200
 
     except Exception as e:
-        # ❗여기로 떨어져도 200으로 응답 — TV/텔레그램 끊김 방지
         log.exception("bbangdol-bot.bnc_trade error")
         err = str(e)
         try:
@@ -980,29 +966,51 @@ def bnc_trade():
 @app.post("/tv")
 def tv_proxy():
     data = request.get_json(silent=True, force=True) or {}
-    # Pine 포맷: {"secret":"...","tag":"BNC_POSITION","symbol":"BTCUSDT.P","tf":"5","p":"...","sig":"LONG_5m"}
-    symbol_orig = str(data.get("symbol","")).upper()
-    sig    = str(data.get("sig","")).upper()
+    # 새 포맷: {"symbol":"BTCUSDT.P","side":"BUY"}   ← 이걸 1순위로 봄
+    # 구 포맷: {"symbol":"BTCUSDT.P","sig":"LONG_5m"} ← 여전히 지원
 
-    if not symbol_orig or not sig:
-        return jsonify({"ok": False, "error": "missing symbol/sig"}), 200
+    symbol_orig = str(data.get("symbol", "")).upper()
+    side        = str(data.get("side", "")).upper()
+    sig         = str(data.get("sig", "")).upper()  # backward compat
 
-    if   sig.startswith("LONG"):  action = "OPEN_LONG"
-    elif sig.startswith("SHORT"): action = "OPEN_SHORT"
-    else:                         return jsonify({"ok": True, "skipped": "unknown-sig"}), 200
+    if not symbol_orig:
+        return jsonify({"ok": False, "error": "missing symbol"}), 200
 
-    note = f"tf={data.get('tf','')}, price={data.get('p','')}, sig={sig}"
+    action = None
+
+    # 1) side 기반 새 포맷
+    if side:
+        if side in ("BUY", "LONG"):
+            action = "OPEN_LONG"
+        elif side in ("SELL", "SHORT"):
+            action = "OPEN_SHORT"
+        else:
+            return jsonify({"ok": False, "error": f"unsupported side: {side}"}), 200
+
+    # 2) 옛날 sig 포맷도 살려둠
+    elif sig:
+        if sig.startswith("LONG"):
+            action = "OPEN_LONG"
+        elif sig.startswith("SHORT"):
+            action = "OPEN_SHORT"
+        else:
+            return jsonify({"ok": True, "skipped": "unknown-sig"}), 200
+
+    # 아무 방향 정보도 없으면 거절
+    if not action:
+        return jsonify({"ok": False, "error": "missing side/sig"}), 200
+
+    note = f"tf={data.get('tf','')}, price={data.get('p','')}, side={side or sig}"
 
     private_base = os.getenv("PRIVATE_BASE", "http://bbangdol-bnc-bot-private:10000")
     payload = {
         "secret": os.getenv("BNC_SECRET", ""),
-        "symbol": symbol_orig,          # 원문 그대로 전달 (private에서 정규화)
+        "symbol": symbol_orig,
         "action": action,
         "note":   note
     }
     try:
         r = requests.post(f"{private_base}/bnc/trade", json=payload, timeout=10)
-        # private는 항상 200을 주므로 그대로 전달
         return (r.text, r.status_code, r.headers.items())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
@@ -1010,7 +1018,6 @@ def tv_proxy():
 # --- 상태 종합 점검: /bnc/diag
 @app.get("/bnc/diag")
 def bnc_diag():
-    """실제 주문 없이 현재 환경/연결/권한/시계/기본심볼 필터를 한 번에 보여줌"""
     try:
         base = _binance_base()
         api_key = os.getenv("BINANCE_API_KEY","")
@@ -1065,10 +1072,8 @@ def bnc_diag():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
 
-
 # =========================================================
 if __name__ == "__main__":
-    # 원한다면 부팅 시 자동 setWebhook (TG_SET_WEBHOOK_ON_BOOT=1)
     if os.getenv("TG_SET_WEBHOOK_ON_BOOT", "0").lower() in ("1","true","on","yes"):
         try:
             app.logger.info(f"Setting Telegram webhook to {TG_WEBHOOK_BASE}/tg ...")
