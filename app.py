@@ -179,6 +179,7 @@ def build_route_map() -> Dict[str, str]:
         val = _read_optional(envk)
         if val is not None:
             m[k] = val
+    # 기존 라우트들
     add_if("OS_SCALP", "OS_SCALP_CHAT_ID")
     add_if("OS_SHORT", "OS_SHORT_CHAT_ID")
     add_if("OS_LONG",  "OS_LONG_CHAT_ID")
@@ -193,6 +194,7 @@ def build_route_map() -> Dict[str, str]:
     add_if("OS_SHORT_KRW", "KRW_SHORT")
     add_if("OS_SWING_KRW", "KRW_SWING")
     add_if("OS_LONG_KRW",  "KRW_LONG")
+    # 너가 최근 파인코드에서 쓰는 4트리거용
     add_if("LONG_5M",  "LONG_5M")
     add_if("SHORT_5M", "SHORT_5M")
     add_if("LONG_30M", "LONG_30M")
@@ -298,13 +300,11 @@ def normalize_binance_symbol(sym: str) -> str:
         return sym
     s = sym.strip().upper()
     if s.endswith(".P"):
-        s = s[:-2]  # drop trailing ".P"
-    # 안전하게 기타 특수문자 제거
+        s = s[:-2]
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s
 
 def _decimals_from_step(step: float) -> int:
-    # 0.01000000 -> 2
     s = f"{step:.16f}".rstrip('0')
     return len(s.split('.')[-1]) if '.' in s else 0
 
@@ -314,7 +314,7 @@ def round_to_step(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
 def format_price_for_symbol(symbol: str, raw_price: float) -> str:
-    filters = get_symbol_filters(symbol)  # symbol은 정규화된 심볼이어야 함
+    filters = get_symbol_filters(symbol)
     tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01"))
     adj = round_to_step(raw_price, tick)
     dec = _decimals_from_step(tick)
@@ -390,14 +390,14 @@ def place_market_order(symbol: str, side: str, qty: float,
                        client_id: Optional[str] = None) -> dict:
     params = {
         "symbol": symbol,
-        "side": side,               # BUY / SELL
+        "side": side,
         "type": "MARKET",
-        "quantity": qty,            # 코인 수량(필터 반영된 값이어야 함)
+        "quantity": qty,
     }
     if reduce_only:
         params["reduceOnly"] = "true"
     if position_side:
-        params["positionSide"] = position_side  # LONG / SHORT (양방향 모드)
+        params["positionSide"] = position_side
     if client_id:
         params["newClientOrderId"] = client_id[:36]
     return _binance_post("/fapi/v1/order", params)
@@ -610,13 +610,12 @@ def tg_webhook():
             post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data.startswith("RISK:"):
             st["cfg"]["risk"] = data.split(":")[1]
-            risk_val = st["cfg"]["risk"]
-            cfg_for_kb = st["cfg"]
-            post_telegram(chat_id, f"리스크 모드: {risk_val}", reply_markup=kb_main(cfg_for_kb))
+            post_telegram(chat_id, f"리스크 모드: {st['cfg']['risk']}", reply_markup=kb_main(st["cfg"]))
         elif data == "ADD:SAVE":
             cfg = st["cfg"]; sym = cfg.get("symbol")
             if not sym:
-                post_telegram(chat_id, "먼저 종목을 입력하세요.", reply_markup=kb_main(st["cfg"])); return jsonify({"ok":True})
+                post_telegram(chat_id, "먼저 종목을 입력하세요.", reply_markup=kb_main(st["cfg"]))
+                return jsonify({"ok":True})
             mode = cfg.get("dir","BOTH")
             lev  = int(cfg.get("lev",10))
             risk = _risk_or_default(cfg.get("risk","normal"))
@@ -645,7 +644,6 @@ def tg_webhook():
             post_telegram(chat_id, "취소했습니다. /add 로 다시 시작하세요.")
         elif data == "LEV:BACK":
             post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
-
         elif data == "LEV:CUSTOM":
             st["mode"] = "ask_lev"
             post_telegram(chat_id, "레버리지를 숫자로 입력 (예: 10)", reply_markup=force_reply("10"))
@@ -653,7 +651,7 @@ def tg_webhook():
             st["cfg"]["lev"] = int(data.split(":")[1])
             post_telegram(chat_id, f"레버리지 {st['cfg']['lev']}x 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "SL:BACK":
-            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"])]
+            post_telegram(chat_id, "메인으로 돌아갑니다.", reply_markup=kb_main(st["cfg"]))
         elif data == "SL:CUSTOM":
             st["mode"] = "ask_sl"
             post_telegram(chat_id, "손절 % 입력 (예: 1)", reply_markup=force_reply("1"))
@@ -668,8 +666,7 @@ def tg_webhook():
         elif data.startswith("TRAIL:"):
             _, act, cb = data.split(":")
             st["cfg"]["trail"] = {"act": float(act), "cb": float(cb)}
-            cfg_for_kb = st["cfg"]
-            post_telegram(chat_id, f"트레일링 {act}/{cb} 설정", reply_markup=kb_main(cfg_for_kb))
+            post_telegram(chat_id, f"트레일링 {act}/{cb} 설정", reply_markup=kb_main(st["cfg"]))
         elif data == "GLOB:MODE":
             nxt = {"BOTH":"LONG_ONLY", "LONG_ONLY":"SHORT_ONLY", "SHORT_ONLY":"BOTH"}[STATE["global_mode"]]
             STATE["global_mode"] = nxt
@@ -698,8 +695,7 @@ def tg_webhook():
             st["cfg"]["sl"]    = pc["sl"]
             st["cfg"]["trail"] = pc["trail"]
             st["cfg"]["risk"]  = pc["risk"]
-            cfg_for_kb = st["cfg"]
-            post_telegram(chat_id, f"{sym} 불러옴.", reply_markup=kb_main(cfg_for_kb))
+            post_telegram(chat_id, f"{sym} 불러옴.", reply_markup=kb_main(st["cfg"]))
         elif data.startswith("LIST:DEL:"):
             sym = data.split(":")[2]
             STATE["pairs"].pop(sym, None)
@@ -966,19 +962,18 @@ def bnc_trade():
 @app.post("/tv")
 def tv_proxy():
     data = request.get_json(silent=True, force=True) or {}
-    # 새 포맷: {"symbol":"BTCUSDT.P","side":"BUY"}   ← 이걸 1순위로 봄
-    # 구 포맷: {"symbol":"BTCUSDT.P","sig":"LONG_5m"} ← 여전히 지원
+    # 새 포맷: {"symbol":"BTCUSDT.P","side":"BUY"}
+    # 구 포맷: {"symbol":"BTCUSDT.P","sig":"LONG_5m"}
 
     symbol_orig = str(data.get("symbol", "")).upper()
     side        = str(data.get("side", "")).upper()
-    sig         = str(data.get("sig", "")).upper()  # backward compat
+    sig         = str(data.get("sig", "")).upper()
 
     if not symbol_orig:
         return jsonify({"ok": False, "error": "missing symbol"}), 200
 
     action = None
 
-    # 1) side 기반 새 포맷
     if side:
         if side in ("BUY", "LONG"):
             action = "OPEN_LONG"
@@ -986,8 +981,6 @@ def tv_proxy():
             action = "OPEN_SHORT"
         else:
             return jsonify({"ok": False, "error": f"unsupported side: {side}"}), 200
-
-    # 2) 옛날 sig 포맷도 살려둠
     elif sig:
         if sig.startswith("LONG"):
             action = "OPEN_LONG"
@@ -996,7 +989,6 @@ def tv_proxy():
         else:
             return jsonify({"ok": True, "skipped": "unknown-sig"}), 200
 
-    # 아무 방향 정보도 없으면 거절
     if not action:
         return jsonify({"ok": False, "error": "missing side/sig"}), 200
 
