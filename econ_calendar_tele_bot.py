@@ -30,6 +30,7 @@ ENV
   ECON_POLL_SEC               : 실시간 폴링 주기(초) 기본 60
   ECON_RELEASE_LOOKAHEAD_MIN  : 결과 감지용 앞 시간(분) 기본 5
   ECON_RAW_TTL_SEC            : 원시 응답 캐시 TTL (기본 45초)
+  ECON_PREVIEW_KEY            : /econ/preview_now 호출용 간단한 비밀키(?key=...)
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -51,10 +52,10 @@ from apscheduler.triggers.cron import CronTrigger
 from pytz import timezone, utc
 
 try:
-    from flask import Blueprint, request
-except Exception:
-    Blueprint = None
-    request = None
+    # Flask는 app.py 쪽에서 이미 사용 중
+    from flask import request
+except Exception:  # Render 환경 등에서만
+    request = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
@@ -160,7 +161,7 @@ def _is_number_like(v: Any) -> bool:
         return False
 
 
-def _safe_float(v: Any) -> float | None:
+def _safe_float(v: Any) -> Optional[float]:
     if not _is_number_like(v):
         return None
     try:
@@ -277,7 +278,7 @@ def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]
 # 텔레그램 전송
 # ─────────────────────────────────────────────────────────────
 
-def _tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+def _tg_api(method: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not TG_TOKEN or not TG_CHAT:
         return None
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
@@ -290,7 +291,7 @@ def _tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
         return None
 
 
-def send_text(msg: str, parse_mode: str | None = None):
+def send_text(msg: str, parse_mode: Optional[str] = None):
     payload: Dict[str, Any] = {"chat_id": TG_CHAT, "text": msg}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -531,54 +532,74 @@ def poll_releases_job():
 
 
 # ─────────────────────────────────────────────────────────────
-# Flask Blueprint 통합
+# Flask endpoint 함수
 # ─────────────────────────────────────────────────────────────
 
-econ_bp = Blueprint("econ_calendar", __name__) if Blueprint else None
-_scheduler: BackgroundScheduler | None = None
-
-
-@econ_bp.route("/econ/health", methods=["GET"]) if econ_bp else lambda *a, **k: None
-def econ_health():
-    """상태 확인용 엔드포인트 /econ/health"""
+def econ_health() -> str:
+    """상태 확인용 엔드포인트 핸들러."""
     now = _sg_now()
-    return json.dumps(
-        {
-            "enabled": ENABLED,
-            "ok": bool(ENABLED and TG_TOKEN and TG_CHAT),
-            "countries": COUNTRIES,
-            "importance": IMPORTANCE,
-            "preview_times": PREVIEW_TIMES,
-            "poll_sec": POLL_SEC,
-            "raw_ttl_sec": RAW_TTL_SEC,
-            "detail_before_min": DETAIL_BEFORE_MIN,
-            "now": now.isoformat(),
-            "tz": "Asia/Singapore",
-            "te_auth_mode": "custom" if TE_AUTH else "guest",
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    body = {
+        "enabled": ENABLED,
+        "ok": bool(ENABLED and TG_TOKEN and TG_CHAT),
+        "countries": COUNTRIES,
+        "importance": IMPORTANCE,
+        "preview_times": PREVIEW_TIMES,
+        "poll_sec": POLL_SEC,
+        "raw_ttl_sec": RAW_TTL_SEC,
+        "detail_before_min": DETAIL_BEFORE_MIN,
+        "now": now.isoformat(),
+        "tz": "Asia/Singapore",
+        "te_auth_mode": "custom" if TE_AUTH else "guest",
+    }
+    return json.dumps(body, ensure_ascii=False, indent=2)
 
 
-@econ_bp.route("/econ/preview_now", methods=["GET"]) if econ_bp else lambda *a, **k: None
-def preview_now():
-    """강제 프리뷰 테스트용 엔드포인트 /econ/preview_now?key=..."""
-    key = request.args.get("key") if request else None
+def econ_preview_now() -> str:
+    """강제 프리뷰 테스트용 엔드포인트."""
+    if request is None:
+        return "request unavailable"
+    key = request.args.get("key", "")
     env_key = os.getenv("ECON_PREVIEW_KEY", "")
     if env_key and key != env_key:
-        return "forbidden", 403
+        return "forbidden", 403  # Flask가 튜플을 응답으로 처리
     send_preview_job()
     return "ok"
 
 
-def init_econ_calendar(app) -> BackgroundScheduler | None:
+# ─────────────────────────────────────────────────────────────
+# 초기화 (app.py 에서 호출)
+# ─────────────────────────────────────────────────────────────
+
+_scheduler: Optional[BackgroundScheduler] = None
+
+
+def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
+    """app.py 에서 한 번만 호출.
+
+    예)
+        from econ_calendar_tele_bot import init_econ_calendar
+        ...
+        init_econ_calendar(app)
+    """
     global _scheduler
     if not ENABLED:
         log.info("econ_calendar disabled (ECON_CAL_ENABLED=0)")
         return None
     if _scheduler:
         return _scheduler
+
+    # Flask 라우트 등록
+    try:
+        if app is not None:
+            # 중복 등록 방지
+            vf = getattr(app, "view_functions", {})
+            if "econ_health" not in vf:
+                app.add_url_rule("/econ/health", "econ_health", econ_health, methods=["GET"])
+            if "econ_preview_now" not in vf:
+                app.add_url_rule("/econ/preview_now", "econ_preview_now", econ_preview_now, methods=["GET"])
+            log.info("econ_calendar routes registered: /econ/health, /econ/preview_now")
+    except Exception as e:
+        log.warning("failed to register econ_calendar routes: %s", e)
 
     if not TG_TOKEN or not TG_CHAT:
         log.warning("econ_calendar enabled, but TG_TOKEN / TG_CHAT missing")
