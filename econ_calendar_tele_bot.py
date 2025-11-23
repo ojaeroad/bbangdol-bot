@@ -14,32 +14,34 @@ ENV
   ECON_CAL_ENABLED            : "1"이면 활성(기본 0=비활성)
 
   # TradingEconomics 인증
-  TE_AUTH                     : "email:apikey" (우선)
-  ECON_API_KEY                : 없을 때 대체로 사용
-                                둘 다 없으면 guest:guest
+  TE_AUTH                     : "email:apikey" (우선, 유료 계정에서만 사용)
+  ECON_API_KEY                : TE_AUTH 대신 쓸 수 있는 별칭
+                                둘 다 비어 있으면 public endpoint(무인증) 사용
 
   # Telegram
-  ECON_TG_TOKEN               : 우선 사용
-  TELEGRAM_BOT_TOKEN          : 위가 없을 때 fallback
-  ECON_CHAT_ID                : 우선 사용
-  TELEGRAM_CHAT_ID            : 위가 없을 때 fallback
+  ECON_TG_TOKEN               : 텔레그램 봇 토큰 (없으면 TELEGRAM_BOT_TOKEN 사용)
+  ECON_CHAT_ID                : 텔레그램 chat_id (없으면 TELEGRAM_CHAT_ID 사용)
 
-  # 필터 (로컬 필터용)
-  ECON_COUNTRIES              : 기본 "United States,Japan"
-  ECON_IMPORTANCE             : 기본 "2,3"
-  ECON_PREVIEW_TIMES          : 기본 "08:55,20:55" (Asia/Singapore 기준)
+  # 필터
+  ECON_COUNTRIES              : "United States,Japan" 처럼 쉼표 구분 국가 목록
+  ECON_IMPORTANCE             : "2,3" (기본) — 중요도 필터
+  ECON_PREVIEW_TIMES          : "07:00,13:00,19:00" 처럼 로컬(Asia/Seoul or SG) 시각들
+  ECON_POLL_SEC               : 실시간 폴링 주기(초) 기본 60
+  ECON_RELEASE_LOOKAHEAD_MIN  : 앞으로 몇 분 안의 이벤트를 "곧 발표"로 볼지 (기본 5분)
+  ECON_RAW_TTL_SEC            : 원시 응답 캐시 TTL (기본 45초)
 
-  # 기타 동작 옵션
-  ECON_POLL_SEC               : 기본 60  (poll 주기, 초)
-  ECON_RELEASE_LOOKAHEAD_MIN  : 기본 5   (발표 직후 몇 분까지 감시할지)
-  ECON_ADMIN_KEY              : /econ/preview_now?key=... 보호용 키 (선택)
-  ECON_RAW_TTL_SEC            : TE 원본 응답 캐시 TTL (기본 45초)
+주의
+  - 무료 API Free 계정 기준으로, 인증 없이 public calendar endpoint 사용
+  - 유료 계정에서 email:apikey 를 넣으면 자동으로 인증 파라미터 추가
 """
 
-import os
-import time
+from __future__ import annotations
+
+import json
 import logging
+import os
 import random
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
@@ -57,32 +59,28 @@ except Exception:
     Blueprint = None
     request = None
 
-# ─────────────────────────────────────────────────────────────
-# Logger
-# ─────────────────────────────────────────────────────────────
-log = logging.getLogger("econ-calendar")
-if not log.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# ENV
+# 설정/환경변수
 # ─────────────────────────────────────────────────────────────
+
+ASIA_SG = timezone("Asia/Singapore")  # 인도에서 쓰기 편하게 SG 기준
 ENABLED = os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in (
     "0", "false", "", "no", "off"
 )
 
-# TradingEconomics 인증: TE_AUTH > ECON_API_KEY > guest:guest
-_te_auth_env = os.getenv("TE_AUTH") or os.getenv("ECON_API_KEY") or "guest:guest"
-TE_AUTH = _te_auth_env.strip() or "guest:guest"
+# TradingEconomics 인증(선택): 유료 계정에서만 사용.
+# 무료(API Free) 계정은 TE_AUTH/ECON_API_KEY 를 비워 두고,
+# 비인증 public endpoint 를 사용한다.
+_te_auth_env = (os.getenv("TE_AUTH") or os.getenv("ECON_API_KEY") or "").strip()
+TE_AUTH = _te_auth_env  # 빈 문자열이면 인증 파라미터를 붙이지 않는다.
 
 # Telegram
 TG_TOKEN = os.getenv("ECON_TG_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("ECON_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 
-# 필터 (로컬 필터용)
+# 필터
 COUNTRIES = [
     s.strip()
     for s in os.getenv("ECON_COUNTRIES", "United States,Japan").split(",")
@@ -95,29 +93,25 @@ IMPORTANCE = [
 ]
 PREVIEW_TIMES = [
     s.strip()
-    for s in os.getenv("ECON_PREVIEW_TIMES", "08:55,20:55").split(",")
+    for s in os.getenv("ECON_PREVIEW_TIMES", "07:00,13:00,19:00").split(",")
     if s.strip()
 ]
 
 POLL_SEC = int(os.getenv("ECON_POLL_SEC", "60"))
 LOOKAHEAD_MIN = int(os.getenv("ECON_RELEASE_LOOKAHEAD_MIN", "5"))
-ADMIN_KEY = os.getenv("ECON_ADMIN_KEY", "")
 RAW_TTL_SEC = int(os.getenv("ECON_RAW_TTL_SEC", "45"))
 
-ASIA_SG = timezone("Asia/Singapore")
+# ─────────────────────────────────────────────────────────────
+# HTTP 세션 (재시도 포함)
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# HTTP Session
-# ─────────────────────────────────────────────────────────────
 def _build_session() -> requests.Session:
     s = requests.Session()
     r = Retry(
-        total=1,
-        connect=1,
-        read=1,
-        backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
     ad = HTTPAdapter(max_retries=r, pool_connections=8, pool_maxsize=8)
@@ -151,120 +145,189 @@ def _ymd(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
 
-def tg_send(text: str) -> None:
-    """텔레그램 전송 — 오류는 조용히 로그만 남기고 무시."""
-    if not TG_TOKEN or not TG_CHAT or not text:
-        return
+def _strip(s: Any) -> str:
+    return (str(s) if s is not None else "").strip()
+
+
+def _is_number_like(v: Any) -> bool:
+    if v is None:
+        return False
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={
-                "chat_id": TG_CHAT,
-                "text": text[:3500],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=(3, 10),
-        )
-    except Exception as e:
-        log.info("telegram send skipped: %s", e)
+        float(str(v).replace(",", ""))
+        return True
+    except Exception:
+        return False
+
+
+def _safe_float(v: Any) -> float | None:
+    if not _is_number_like(v):
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return None
+
 
 # ─────────────────────────────────────────────────────────────
-# Fetch (무료 계정 호환)
-#   - TE API에는 날짜/국가/중요도 파라미터를 넣지 않음
-#   - 전체 캘린더를 받은 뒤 로컬에서 필터링
+# 간단 캐시 (메모리)
 # ─────────────────────────────────────────────────────────────
-_last_raw_events: List[Dict[str, Any]] = []
-_last_raw_ts: float = 0.0
+
+class TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        self.store: Dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str):
+        now = time.time()
+        v = self.store.get(key)
+        if not v:
+            return None
+        ts, data = v
+        if now - ts > self.ttl:
+            self.store.pop(key, None)
+            return None
+        return data
+
+    def set(self, key: str, value: Any):
+        self.store[key] = (time.time(), value)
 
 
+raw_cache = TTLCache(RAW_TTL_SEC)
+sent_cache = TTLCache(60 * 60 * 24)  # 24h 중복 방지용
+
+# ─────────────────────────────────────────────────────────────
+# TradingEconomics fetch
+# ─────────────────────────────────────────────────────────────
+# fetch_day / fetch_window_sg
+#   - 무료 계정: 인증 파라미터 없이 f=json 사용
+#   - 유료 계정: TE_AUTH 있으면 c=TE_AUTH 붙여서 사용
+#   - 날짜는 UTC 기준 Date 필드를 쓰되, 쿼리에는 날짜(YYYY-MM-DD)만 사용
+#   - 5xx/429 → 조용히 [] 반환 (로그 INFO 한 줄)
+# ─────────────────────────────────────────────────────────────
 def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
-    """무료 계정 호환용: TE API에는 날짜/국가/중요도 파라미터를 넣지 않고
-    전체 캘린더를 받아온 뒤, 이후 단계에서 로컬 필터링만 수행한다."""
-    global _last_raw_events, _last_raw_ts
-    now_ts = time.time()
-    if _last_raw_events and (now_ts - _last_raw_ts) < RAW_TTL_SEC:
-        return _last_raw_events
-
+    # 무료(API Free) 기본: 인증 파라미터 없이 public endpoint 사용
     params = {
-        "c": TE_AUTH,
-        "format": "json",
+        "f": "json",
+        "country": ",".join(COUNTRIES),
+        "importance": ",".join(IMPORTANCE),
+        "d1": _ymd(d1),
+        "d2": _ymd(d2),
     }
+    # 유료 계정에서 email:apikey 를 지정한 경우에만 인증 파라미터 추가
+    if TE_AUTH:
+        params["c"] = TE_AUTH
     try:
+        # 인스턴스 동시 호출 완화용 지터
         time.sleep(random.uniform(0, 0.6))
         r = HTTP.get(TE_BASE, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code in (429, 500, 502, 503, 504):
             log.info("econ-cal skip: HTTP %s", r.status_code)
-            return _last_raw_events
+            return []
         data = r.json()
-        if isinstance(data, list):
-            _last_raw_events = data
-            _last_raw_ts = now_ts
-            return _last_raw_events
-        log.info("econ-cal unexpected payload type: %s", type(data))
-        return _last_raw_events
+        return data if isinstance(data, list) else []
     except Exception as e:
         log.info("econ-cal transient error ignored: %s", e)
-        return _last_raw_events
+        return []
 
 
 def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]]:
-    """SGT 윈도우 범위를 전체 캘린더에서 로컬 필터."""
-    raw = fetch_day(start_sg, end_sg)
-    out: List[Dict[str, Any]] = []
+    """SG 기준 start~end 사이의 이벤트를 모두 가져오기 (raw + filter)."""
+    # d1/d2는 UTC 날짜 기준으로 조금 넉넉하게 잡는다.
+    d1 = (start_sg - timedelta(days=1)).astimezone(utc)
+    d2 = (end_sg + timedelta(days=1)).astimezone(utc)
+
+    cache_key = f"{_ymd(d1)}::{_ymd(d2)}"
+    cached = raw_cache.get(cache_key)
+    if cached is not None:
+        raw = cached
+    else:
+        raw = fetch_day(d1, d2)
+        raw_cache.set(cache_key, raw)
+
+    events: List[Dict[str, Any]] = []
     for e in raw:
         try:
-            t = _to_sg(e.get("Date") or e.get("DateTime"))
+            dt = e.get("Date") or e.get("DateTime")
+            if not dt:
+                continue
+            tt = _to_sg(dt)
+            if not (start_sg <= tt <= end_sg):
+                continue
+            # 국가/중요도 필터는 fetch_day에서 이미 걸었지만, 혹시 모르니 한 번 더
+            country = _strip(e.get("Country"))
+            importance = str(e.get("Importance") or "")
+            if COUNTRIES and country not in COUNTRIES:
+                continue
+            if IMPORTANCE and importance not in IMPORTANCE:
+                continue
+            e["_sg_time"] = tt
+            events.append(e)
         except Exception:
             continue
+    return events
 
-        if not (start_sg <= t < end_sg):
-            continue
-
-        country = (e.get("Country") or "").strip()
-        if COUNTRIES and country and (country not in COUNTRIES):
-            continue
-
-        imp_val = str(e.get("Importance", "")).strip()
-        if IMPORTANCE and imp_val and (imp_val not in IMPORTANCE):
-            continue
-
-        e["_sg_time"] = t
-        out.append(e)
-
-    out.sort(key=lambda x: x.get("_sg_time"))
-    return out
 
 # ─────────────────────────────────────────────────────────────
-# Message builders
+# 텔레그램 전송
 # ─────────────────────────────────────────────────────────────
+
+def _tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    if not TG_TOKEN or not TG_CHAT:
+        return None
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+    try:
+        r = HTTP.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning("telegram error: %s", e)
+        return None
+
+
+def send_text(msg: str, parse_mode: str | None = None):
+    payload: Dict[str, Any] = {"chat_id": TG_CHAT, "text": msg}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return _tg_api("sendMessage", payload)
+
+
+# ─────────────────────────────────────────────────────────────
+# 메시지 빌더
+# ─────────────────────────────────────────────────────────────
+
 def _crypto_generic_hint() -> str:
-    """
-    암호화폐 영향에 대한 아주 일반적인 힌트 텍스트.
-    (지표 개별 해석까지는 하지 않고, 방향성만 간단히 안내)
-    """
     return (
-        "\n\n"
-        "📌 <b>코인 시장 참고</b>\n"
-        "• 물가·고용 등 지표가 예상보다 <b>강하게</b> 나오면 → 달러·금리 ↑ → 위험자산(주식·코인)에는 단기적으로 부담.\n"
-        "• 지표가 예상보다 <b>약하게</b> 나오면 → 달러·금리 ↓ → 위험자산에는 단기적으로 우호적인 편."
+        "\n\n💡 *암호화폐 영향 일반 가이드*\n"
+        "- 예상보다 *강한 지표* (실제치 > 예상치): 위험자산(비트코인 등)에 단기 하락 압력 가능\n"
+        "- 예상보다 *약한 지표* (실제치 < 예상치): 완화 기대 → 위험자산에 우호적일 수 있음\n"
+        "- 결과가 *예상과 비슷*하면, 이미 시장에 반영돼 변동성이 제한될 수 있음"
     )
 
 
 def build_preview(events: List[Dict[str, Any]]) -> str:
-    lines = ["<b>📅 24시간 경제 이벤트 (사전)</b>\n"]
+    if not events:
+        return "📆 향후 24시간 내 고중요 경제지표/이벤트 없음"
+
+    # 시간순 정렬
+    events = sorted(events, key=lambda e: e["_sg_time"])
+    lines = ["📆 *향후 24시간 경제 캘린더(중요 이벤트)*\n"]
+
     count = 0
     for e in events:
-        title = (e.get("Event") or e.get("Category") or "").strip() or "Unknown"
-        tt = e.get("_sg_time") or _to_sg(e.get("Date") or e.get("DateTime"))
-        info = []
-        if e.get("Forecast") not in (None, ""):
-            info.append(f"예상 {e['Forecast']}")
-        if e.get("Previous") not in (None, ""):
-            info.append(f"이전 {e['Previous']}")
-        core = " — " + ", ".join(info) if info else ""
-        country = e.get("Country") or ""
-        imp = e.get("Importance", "")
+        country = _strip(e.get("Country"))
+        title = _strip(e.get("Event") or e.get("Category"))
+        imp = str(e.get("Importance") or "")
+        tt = e["_sg_time"]
+
+        ref = _strip(e.get("Reference"))
+        ref_dt = _strip(e.get("ReferenceDate"))
+        core = ""
+        if ref:
+            core += f" ({ref}"
+            if ref_dt:
+                core += f", 기준일 {ref_dt}"
+            core += ")"
+
         imp_txt = f"[{country} / 중요도 {imp}]" if country or imp else ""
         lines.append(
             f"🕒 {tt.strftime('%m/%d %H:%M')} {imp_txt}\n"
@@ -295,117 +358,176 @@ def build_release_note(e: Dict[str, Any]) -> str:
         info.append(f"예상 {forecast}")
     if previous not in (None, ""):
         info.append(f"이전 {previous}")
-    core = "📊 " + ", ".join(info) if info else "발표 확인"
 
-    base = "\n".join(
-        [
-            f"<b>📢 {title}</b>",
-            f"⏱ {tt.strftime('%m/%d %H:%M')} SGT",
-            core,
-        ]
-    )
-    return base + _crypto_generic_hint()
+    info_line = ", ".join(info) if info else "값 정보 없음"
 
+    # 숫자이면 방향성 코멘트 생성
+    hint = ""
+    a = _safe_float(actual)
+    f = _safe_float(forecast)
+    p = _safe_float(previous)
 
-def build_speech_note(e: Dict[str, Any]) -> str:
-    title = (e.get("Event") or e.get("Category") or "").strip()
-    tt = e.get("_sg_time") or _to_sg(e.get("Date") or e.get("DateTime"))
-    return "\n".join(
-        [
-            "<b>🎤 연설/발언</b>",
-            title,
-            f"⏱ {tt.strftime('%m/%d %H:%M')} SGT",
-            "• 매파 톤 → 달러/수익률 ↑ → 위험자산(주식·코인) 압박",
-            "• 비둘기 톤 → 달러/수익률 ↓ → 위험자산(주식·코인) 우호",
-        ]
-    )
+    # 간단 로직: 물가/고용처럼 "강한 지표 = 긴축/달러강세 → BTC 하락 압력" 가정
+    if a is not None and f is not None:
+        if a > f * 1.01:
+            hint = (
+                "📉 실제치가 *예상보다 강하게* 나왔습니다.\n"
+                "   → 위험자산(비트코인 등)에 단기 하락 압력 가능성을 염두에 두세요."
+            )
+        elif a < f * 0.99:
+            hint = (
+                "📈 실제치가 *예상보다 약하게* 나왔습니다.\n"
+                "   → 긴축 완화 기대가 커질 수 있어, 위험자산(비트코인 등)에 우호적일 수 있습니다."
+            )
+        else:
+            hint = (
+                "⚖️ 실제치가 *예상과 거의 비슷*합니다.\n"
+                "   → 이미 시장에 상당 부분 반영되었을 수 있으며, 변동성은 제한될 수 있습니다."
+            )
+    elif a is not None and p is not None:
+        if a > p * 1.01:
+            hint = (
+                "📉 실제치가 *이전 값보다 강하게* 나왔습니다.\n"
+                "   → 전반적으로 긴축/달러강세 쪽 신호로 해석될 수 있어, 비트코인에는 부담일 수 있습니다."
+            )
+        elif a < p * 0.99:
+            hint = (
+                "📈 실제치가 *이전 값보다 약하게* 나왔습니다.\n"
+                "   → 완화적 신호로 받아들여질 수 있어, 비트코인에는 우호적일 수 있습니다."
+            )
 
+    lines = [
+        f"📊 *{title}* 발표 결과",
+        f"🕒 {_to_sg(str(tt)).strftime('%m/%d %H:%M')} (Asia/Singapore 기준)",
+        f"ℹ️ {info_line}",
+    ]
+    if hint:
+        lines.append("\n" + hint)
+    else:
+        lines.append(_crypto_generic_hint())
+    return "\n".join(lines)
 
-def _is_speech(e: Dict[str, Any]) -> bool:
-    name = (e.get("Event") or e.get("Category") or "").lower()
-    return any(
-        k in name
-        for k in (
-            "speech",
-            "speaks",
-            "remarks",
-            "press",
-            "testifies",
-            "testimony",
-            "hearing",
-        )
-    )
 
 # ─────────────────────────────────────────────────────────────
-# Jobs & state
+# 스케줄러 잡
 # ─────────────────────────────────────────────────────────────
-_sent_keys: Dict[str, float] = {}
-
 
 def send_preview_job():
     now = _sg_now()
-    evts = fetch_window_sg(now, now + timedelta(hours=24))
-    if evts:
-        tg_send(build_preview(evts))
+    end = now + timedelta(hours=24)
+    events = fetch_window_sg(now, end)
+    msg = build_preview(events)
+    send_text(msg, parse_mode="Markdown")
 
 
 def poll_releases_job():
     now = _sg_now()
-    evts = fetch_window_sg(
-        now - timedelta(minutes=1),
-        now + timedelta(minutes=LOOKAHEAD_MIN),
-    )
-    for e in evts:
-        tt = e.get("_sg_time") or now
-        key = f"{e.get('Event')}|{e.get('Date')}|{e.get('Actual')}"
+    window_end = now + timedelta(minutes=LOOKAHEAD_MIN)
+    events = fetch_window_sg(now - timedelta(minutes=5), window_end)
 
-        # ① 실제치가 있으면 '발표'로 간주
-        if e.get("Actual") not in (None, ""):
-            if key not in _sent_keys:
-                _sent_keys[key] = time.time()
-                tg_send(build_release_note(e))
+    for e in events:
+        # 이벤트 고유 ID 비슷하게 구성
+        key_parts = [
+            _strip(e.get("Country")),
+            _strip(e.get("Event") or e.get("Category")),
+            _strip(e.get("ReferenceDate") or e.get("Reference")),
+        ]
+        ev_id = "::".join(key_parts)
+        if not ev_id:
             continue
 
-        # ② 연설 시작 안내
-        if _is_speech(e) and (tt <= now + timedelta(seconds=5)):
-            k2 = f"SPEECH|{e.get('Event')}|{e.get('Date')}"
-            if k2 not in _sent_keys:
-                _sent_keys[k2] = time.time()
-                tg_send(build_speech_note(e))
+        # 이미 보낸 이벤트는 스킵
+        if sent_cache.get(ev_id):
+            continue
 
+        actual = e.get("Actual")
+        is_speech = str(e.get("Category") or "").lower().find("speech") >= 0
 
-def clean_cache_job():
-    now_ts = time.time()
-    for k in list(_sent_keys.keys()):
-        if now_ts - _sent_keys[k] > 86400:  # 24h
-            _sent_keys.pop(k, None)
+        # 연설(speech)은 시작 직전에 한 번 안내
+        if is_speech and not actual:
+            # 발표 시점 5분 전 안에 들어온 것만 공지
+            tt = e.get("_sg_time")
+            if tt and now <= tt <= window_end:
+                title = _strip(e.get("Event") or e.get("Category"))
+                country = _strip(e.get("Country"))
+                msg = (
+                    f"🗣 *주요 연설 예정 안내*\n"
+                    f"🕒 {tt.strftime('%m/%d %H:%M')} (Asia/Singapore)\n"
+                    f"국가: {country}\n"
+                    f"제목: {title}\n\n"
+                    "연설 내용에 따라 달러/금리 기대가 바뀌면 비트코인에도 영향을 줄 수 있습니다."
+                )
+                send_text(msg, parse_mode="Markdown")
+                sent_cache.set(ev_id, True)
+            continue
+
+        # 일반 지표는 Actual 나왔을 때만 알림
+        if actual in (None, ""):
+            continue
+
+        msg = build_release_note(e)
+        send_text(msg, parse_mode="Markdown")
+        sent_cache.set(ev_id, True)
+
 
 # ─────────────────────────────────────────────────────────────
-# Init entry
+# Flask Blueprint 통합
 # ─────────────────────────────────────────────────────────────
+
+econ_bp = Blueprint("econ_calendar", __name__) if Blueprint else None
 _scheduler: BackgroundScheduler | None = None
-_bp = None
 
 
-def init_econ_calendar(app=None):
-    """
-    app.py 에서 조건부로 호출되는 진입점.
+@econ_bp.route("/econ/health", methods=["GET"]) if econ_bp else lambda *a, **k: None
+def econ_health():
+    """상태 확인용 엔드포인트 /econ/health"""
+    now = _sg_now()
+    return json.dumps(
+        {
+            "enabled": ENABLED,
+            "ok": bool(ENABLED and TG_TOKEN and TG_CHAT),
+            "countries": COUNTRIES,
+            "importance": IMPORTANCE,
+            "preview_times": PREVIEW_TIMES,
+            "poll_sec": POLL_SEC,
+            "raw_ttl_sec": RAW_TTL_SEC,
+            "now": now.isoformat(),
+            "tz": "Asia/Singapore",
+            "te_auth_mode": "custom" if TE_AUTH else "guest",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
-    예)
-      from econ_calendar_tele_bot import init_econ_calendar
-      init_econ_calendar(app)
-    """
-    global _scheduler, _bp
+
+@econ_bp.route("/econ/preview_now", methods=["GET"]) if econ_bp else lambda *a, **k: None
+def preview_now():
+    """강제 프리뷰 테스트용 엔드포인트 /econ/preview_now?key=..."""
+    # 간단 보호용 key
+    key = request.args.get("key") if request else None
+    env_key = os.getenv("ECON_PREVIEW_KEY", "")
+    if env_key and key != env_key:
+        return "forbidden", 403
+    send_preview_job()
+    return "ok"
+
+
+def init_econ_calendar(app) -> BackgroundScheduler | None:
+    global _scheduler
     if not ENABLED:
-        log.info("econ calendar disabled by ENV (ECON_CAL_ENABLED=0)")
+        log.info("econ_calendar disabled (ECON_CAL_ENABLED=0)")
         return None
     if _scheduler:
         return _scheduler
 
-    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    if not TG_TOKEN or not TG_CHAT:
+        log.warning("econ_calendar enabled, but TG_TOKEN / TG_CHAT missing")
+    else:
+        log.info("econ_calendar Telegram: chat=%s", TG_CHAT)
+
     _scheduler = BackgroundScheduler(timezone=str(ASIA_SG))
 
-    # 프리뷰 스케줄
+    # 미리보기: 지정 시각들
     for t in PREVIEW_TIMES:
         try:
             hh, mm = [int(x) for x in t.split(":")]
@@ -413,53 +535,26 @@ def init_econ_calendar(app=None):
         except Exception:
             log.warning("invalid ECON_PREVIEW_TIMES entry ignored: %s", t)
 
-    # 실시간 폴링
+    # 실시간 폴링: 지터 부여
     _scheduler.add_job(
         poll_releases_job,
         "interval",
-        seconds=POLL_SEC + random.randint(0, 5),
+        seconds=POLL_SEC,
+        jitter=10,
     )
-    _scheduler.add_job(clean_cache_job, "interval", minutes=30)
+
     _scheduler.start()
-
-    # 수동 트리거
-    if app is not None and Blueprint is not None:
-        _bp = Blueprint("econ", __name__)
-
-        @_bp.get("/econ/preview_now")
-        def _preview_now():
-            if ADMIN_KEY and request.args.get("key") != ADMIN_KEY:
-                return "forbidden", 403
-            send_preview_job()
-            return "ok", 200
-
-        @_bp.get("/econ/health")
-        def _health():
-            return (
-                {
-                    "ok": True,
-                    "enabled": True,
-                    "countries": COUNTRIES,
-                    "importance": IMPORTANCE,
-                    "preview_times": PREVIEW_TIMES,
-                    "poll_sec": POLL_SEC,
-                    "raw_ttl_sec": RAW_TTL_SEC,
-                },
-                200,
-            )
-
-        app.register_blueprint(_bp)
-
     log.info(
-        "econ calendar started: enabled=1, preview=%s, poll=%ss(+jitter), importance=%s, TE=%s",
-        PREVIEW_TIMES,
+        "econ_calendar started: poll=%ss, countries=%s, importance=%s, auth_mode=%s",
         POLL_SEC,
+        COUNTRIES,
         IMPORTANCE,
-        "custom" if TE_AUTH != "guest:guest" else "guest",
+        "custom" if TE_AUTH else "guest",
     )
     return _scheduler
 
 
+# 이 파일을 단독으로 실행했을 때도 동작하게 옵션 제공 (디버그용)
 if __name__ == "__main__":
     if not ENABLED:
         print("ECON_CAL_ENABLED=0 이라서 동작하지 않습니다.")
@@ -468,6 +563,6 @@ if __name__ == "__main__":
         init_econ_calendar(None)
         try:
             while True:
-                time.sleep(3600)
+                time.sleep(5)
         except KeyboardInterrupt:
-            print("stopped.")
+            print("종료합니다.")
