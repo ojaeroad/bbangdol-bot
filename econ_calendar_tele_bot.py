@@ -1,7 +1,13 @@
-# econ_calendar.py
+# econ_calendar_tele_bot.py
 # -*- coding: utf-8 -*-
 """
-TradingEconomics 경제 캘린더 알림 (프리뷰 + 발표 후 요약)
+TradingEconomics 경제 캘린더 알림 (프리뷰 + 발표 후 요약) — 무료 계정 호환 버전
+
+[핵심 차이점]
+- TradingEconomics API 에서 country / importance / d1 / d2 같은 필터 파라미터를 전혀 사용하지 않음
+- 항상 `calendar?c=email:apikey&format=json` 전체 캘린더를 받아온 뒤,
+  파이썬 코드에서 나라 / 중요도 / 시간 범위를 필터링한다.
+- 무료 계정에서도 HTTP 500 / "An error has occurred" 문제가 발생하지 않도록 설계
 
 기능
   1) 매일 지정된 시각(복수 가능)에 24시간 프리뷰 전송
@@ -24,7 +30,7 @@ ENV
   ECON_CHAT_ID                : 우선 사용
   TELEGRAM_CHAT_ID            : 위가 없을 때 fallback
 
-  # 필터
+  # 필터 (※ API 파라미터가 아니라 "로컬 필터"용)
   ECON_COUNTRIES              : 기본 "United States,Japan"
   ECON_IMPORTANCE             : 기본 "2,3"
   ECON_PREVIEW_TIMES          : 기본 "08:55,20:55" (Asia/Singapore 기준)
@@ -33,6 +39,7 @@ ENV
   ECON_POLL_SEC               : 기본 60  (poll 주기, 초)
   ECON_RELEASE_LOOKAHEAD_MIN  : 기본 5   (발표 직후 몇 분까지 감시할지)
   ECON_ADMIN_KEY              : /econ/preview_now?key=... 보호용 키 (선택)
+  ECON_RAW_TTL_SEC            : TE 원본 응답 캐시 TTL (기본 45초)
 
 의존성
   - requests
@@ -87,7 +94,7 @@ TE_AUTH = _te_auth_env.strip() or "guest:guest"
 TG_TOKEN = os.getenv("ECON_TG_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("ECON_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 
-# 필터
+# 필터 (로컬 필터용)
 COUNTRIES = [
     s.strip()
     for s in os.getenv("ECON_COUNTRIES", "United States,Japan").split(",")
@@ -107,12 +114,14 @@ PREVIEW_TIMES = [
 POLL_SEC = int(os.getenv("ECON_POLL_SEC", "60"))
 LOOKAHEAD_MIN = int(os.getenv("ECON_RELEASE_LOOKAHEAD_MIN", "5"))
 ADMIN_KEY = os.getenv("ECON_ADMIN_KEY", "")
+RAW_TTL_SEC = int(os.getenv("ECON_RAW_TTL_SEC", "45"))
 
 ASIA_SG = timezone("Asia/Singapore")
 
 # ─────────────────────────────────────────────────────────────
 # HTTP Session (fail-safe)
-#  - 5xx/429이면 스킵(재시도 1회), timeout 짧게
+#   - 항상 calendar?c=... 한번만 호출
+#   - 5xx/429이면 스킵(재시도 1회), timeout 짧게
 # ─────────────────────────────────────────────────────────────
 def _build_session() -> requests.Session:
     s = requests.Session()
@@ -152,10 +161,6 @@ def _to_sg(dt_utc_str: str) -> datetime:
     return dt.astimezone(ASIA_SG)
 
 
-def _ymd(d: datetime) -> str:
-    return d.strftime("%Y-%m-%d")
-
-
 def tg_send(text: str) -> None:
     """텔레그램 전송 — 오류는 조용히 로그만 남기고 무시."""
     if not TG_TOKEN or not TG_CHAT or not text:
@@ -175,45 +180,91 @@ def tg_send(text: str) -> None:
         log.info("telegram send skipped: %s", e)
 
 # ─────────────────────────────────────────────────────────────
-# Fetch (에러 억제)
-#   - d1/d2는 날짜(YYYY-MM-DD)만 사용
-#   - 5xx/429 → 조용히 [] 반환 (로그 INFO 한 줄)
+# Fetch (무료 계정 호환)
+#
+#   - API 파라미터는 오직 c / format 만 사용
+#   - 날짜/국가/중요도 필터는 모두 "로컬"에서 처리
+#   - 원본 응답은 RAW_TTL_SEC 동안 캐시하여 호출 수 절감
 # ─────────────────────────────────────────────────────────────
-def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
+_last_raw_events: List[Dict[str, Any]] = []
+_last_raw_ts: float = 0.0
+
+
+def fetch_all_recent() -> List[Dict[str, Any]]:
+    """
+    TradingEconomics calendar 전체를 가져온 뒤 캐시.
+    무료 계정에서도 허용되는 최소 파라미터만 사용.
+    """
+    global _last_raw_events, _last_raw_ts
+    now_ts = time.time()
+
+    # TTL 내이면 캐시 사용
+    if _last_raw_events and (now_ts - _last_raw_ts) < RAW_TTL_SEC:
+        return _last_raw_events
+
     params = {
         "c": TE_AUTH,
         "format": "json",
-        "country": ",".join(COUNTRIES),
-        "importance": ",".join(IMPORTANCE),
-        "d1": _ymd(d1),
-        "d2": _ymd(d2),
     }
     try:
         # 인스턴스 동시 호출 완화용 지터
-        time.sleep(random.uniform(0, 0.6))
+        time.sleep(random.uniform(0, 0.4))
         r = HTTP.get(TE_BASE, params=params, timeout=REQUEST_TIMEOUT)
+
         if r.status_code in (429, 500, 502, 503, 504):
             log.info("econ-cal skip: HTTP %s", r.status_code)
-            return []
+            # 직전 캐시가 있으면 그것이라도 사용
+            return _last_raw_events
+
         data = r.json()
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            _last_raw_events = data
+            _last_raw_ts = now_ts
+            return _last_raw_events
+
+        # dict 형태(에러 메시지 등)면 캐시 유지하고 스킵
+        log.info("econ-cal unexpected payload type: %s", type(data))
+        return _last_raw_events
+
     except Exception as e:
         log.info("econ-cal transient error ignored: %s", e)
-        return []
+        return _last_raw_events
 
 
 def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]]:
-    """SGT 윈도우 범위를 day API로 가져와 로컬 필터."""
-    raw = fetch_day(start_sg, end_sg)
+    """
+    SGT 기준 [start_sg, end_sg) 범위의 이벤트들만 필터링.
+
+    1) 전체 캘린더 fetch_all_recent() 호출
+    2) Date / DateTime → SGT 변환
+    3) COUNTRIES / IMPORTANCE / 시간범위 로컬 필터링
+    """
+    raw = fetch_all_recent()
     out: List[Dict[str, Any]] = []
+
     for e in raw:
         try:
-            t = _to_sg(e.get("Date") or e.get("DateTime"))
+            raw_dt = e.get("Date") or e.get("DateTime")
+            if not raw_dt:
+                continue
+            t = _to_sg(raw_dt)
         except Exception:
             continue
-        if start_sg <= t < end_sg and (e.get("Country") in COUNTRIES):
-            e["_sg_time"] = t
-            out.append(e)
+
+        if not (start_sg <= t < end_sg):
+            continue
+
+        country = (e.get("Country") or "").strip()
+        if COUNTRIES and country and (country not in COUNTRIES):
+            continue
+
+        imp_val = str(e.get("Importance", "")).strip()
+        if IMPORTANCE and imp_val and (imp_val not in IMPORTANCE):
+            continue
+
+        e["_sg_time"] = t
+        out.append(e)
+
     out.sort(key=lambda x: x.get("_sg_time"))
     return out
 
@@ -292,7 +343,7 @@ def build_release_note(e: Dict[str, Any]) -> str:
 def build_speech_note(e: Dict[str, Any]) -> str:
     title = (e.get("Event") or e.get("Category") or "").strip()
     tt = e.get("_sg_time") or _to_sg(e.get("Date") or e.get("DateTime"))
-    return "\n".join(
+    return "\n.join(
         [
             "<b>🎤 연설/발언</b>",
             title,
@@ -372,7 +423,7 @@ def init_econ_calendar(app=None):
     app.py 에서 조건부로 호출되는 진입점.
 
     예)
-      from econ_calendar import init_econ_calendar
+      from econ_calendar_tele_bot import init_econ_calendar
       init_econ_calendar(app)
 
     - ECON_CAL_ENABLED=0 이면 아무 것도 안 함.
@@ -427,6 +478,7 @@ def init_econ_calendar(app=None):
                     "importance": IMPORTANCE,
                     "preview_times": PREVIEW_TIMES,
                     "poll_sec": POLL_SEC,
+                    "raw_ttl_sec": RAW_TTL_SEC,
                 },
                 200,
             )
