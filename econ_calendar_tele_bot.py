@@ -1,16 +1,19 @@
 # econ_calendar_tele_bot.py
 # -*- coding: utf-8 -*-
 """
-TradingEconomics 경제 캘린더 알림 (프리뷰 + 20분 전 상세 설명 + 발표 후 요약)
+TradingEconomics 경제 캘린더 알림 (프리뷰 + 20분 전 상세 설명 + 발표 후 요약 + 주간 미리보기)
 
 기능
   1) 매일 지정된 시각(복수 가능)에 24시간 프리뷰 전송
      - 각 이벤트 라인 앞에 중요도 이모티콘(💎/⭐️/⚡️)
      - 각 이벤트 바로 아래에, 예상치 대비 실적치 3단계 시나리오(상회/부합/하회)가 줄마다 표시
+     - BTC/암호화폐 영향 코멘트 포함
   2) 각 이벤트 약 20분 전에 상세 설명 + 3단계 시나리오 전송
      - 메시지 맨 앞에 중요도 이모티콘 포함
-  3) 실제 값(Actual)이 나오면 결과 요약 + 암호화폐 영향 코멘트 전송
+     - BTC 영향 설명 강화
+  3) 실제 값(Actual)이 나오면 결과 요약 + 암호화폐(BTC 중심) 영향 코멘트 전송
   4) 같은 이벤트에 대해 20분 전 / 결과 요약은 각각 24h에 1회만 전송 (프리뷰는 매번 전송)
+  5) 주 1회, "이번 주 주요 이벤트 미리보기 주간 알림" 전송 (기본: 월요일 오전 7시 한국 기준)
 
 ENV
   ECON_CAL_ENABLED            : "1"이면 활성(기본 0=비활성)
@@ -26,11 +29,21 @@ ENV
   # 필터
   ECON_COUNTRIES              : "United States,Japan" 처럼 쉼표 구분 국가 목록
   ECON_IMPORTANCE             : "2,3" (기본) — 중요도 필터
-  ECON_PREVIEW_TIMES          : "07:00,13:00,19:00" 처럼 로컬(Asia/Singapore) 시각들
+
+  # 24h 프리뷰 시각 (로컬 Asia/Singapore 기준)
+  #   한국시간 07:00 / 13:00 / 19:00 에 받으려면 기본값 그대로 두면 됨.
+  ECON_PREVIEW_TIMES          : "06:00,12:00,18:00" (기본값)
+
   ECON_POLL_SEC               : 실시간 폴링 주기(초) 기본 60
   ECON_RELEASE_LOOKAHEAD_MIN  : 결과 감지용 앞 시간(분) 기본 5
   ECON_RAW_TTL_SEC            : 원시 응답 캐시 TTL (기본 45초)
   ECON_PREVIEW_KEY            : /econ/preview_now 호출용 간단한 비밀키(?key=...)
+
+  # 주간 미리보기 ("이번 주 주요 이벤트 미리보기 주간 알림")
+  #   기본: 매주 월요일 한국시간 07:00 (싱가포르 06:00)
+  ECON_WEEKLY_ENABLED         : "1" 이면 켜짐 (기본 1)
+  ECON_WEEKLY_DAY             : "mon" (apscheduler Cron day_of_week 형식, 기본 mon)
+  ECON_WEEKLY_TIME            : "06:00" (Asia/Singapore 기준 시각)
 """
 
 from __future__ import annotations
@@ -90,9 +103,11 @@ COUNTRIES = [
 IMPORTANCE = [
     s.strip() for s in os.getenv("ECON_IMPORTANCE", "2,3").split(",") if s.strip()
 ]
+
+# ⚠️ 기본값을 06/12/18 로 변경 → 한국시간 07/13/19 에 해당
 PREVIEW_TIMES = [
     s.strip()
-    for s in os.getenv("ECON_PREVIEW_TIMES", "07:00,13:00,19:00").split(",")
+    for s in os.getenv("ECON_PREVIEW_TIMES", "06:00,12:00,18:00").split(",")
     if s.strip()
 ]
 
@@ -101,6 +116,17 @@ LOOKAHEAD_MIN = int(os.getenv("ECON_RELEASE_LOOKAHEAD_MIN", "5"))
 RAW_TTL_SEC = int(os.getenv("ECON_RAW_TTL_SEC", "45"))
 
 DETAIL_BEFORE_MIN = 20  # 이벤트 20분 전 상세 설명
+
+# 주간 미리보기 설정
+WEEKLY_ENABLED = os.getenv("ECON_WEEKLY_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "",
+    "no",
+    "off",
+)
+WEEKLY_DAY = os.getenv("ECON_WEEKLY_DAY", "mon").strip()  # Cron day_of_week 형식
+WEEKLY_TIME = os.getenv("ECON_WEEKLY_TIME", "06:00").strip()  # Asia/Singapore 기준 시각
 
 # ─────────────────────────────────────────────────────────────
 # HTTP 세션
@@ -299,13 +325,13 @@ def send_text(msg: str, parse_mode: Optional[str] = None):
 
 
 # ─────────────────────────────────────────────────────────────
-# 메시지 빌더 (3단계 시나리오 포함)
+# 메시지 빌더 (3단계 시나리오 + BTC 영향 강화)
 # ─────────────────────────────────────────────────────────────
 
 SCENARIO_BRIEF_MULTI = (
-    "   • 상회 → 암호화폐에 긍정적, 단기 급등 가능\n"
-    "   • 부합 → 암호화폐에 긍정적, 단기 상승 가능\n"
-    "   • 하회 → 암호화폐에 부정적, 단기 급락 가능"
+    "   • 상회 → 비트코인 및 주요 알트코인에 *긍정적*, 단기 급등 가능\n"
+    "   • 부합 → 비트코인 및 주요 알트코인에 *완만한 호재*, 단기 상승 가능\n"
+    "   • 하회 → 비트코인 및 주요 알트코인에 *부정적*, 단기 급락 가능"
 )
 
 
@@ -317,17 +343,17 @@ def scenario_detail_text(title: str, importance: Any) -> str:
         "",
         "🔍 *왜 중요한가?*",
         "최근 시장에서 해당 지표는 금리 경로와 달러 강세/약세를 가르는 핵심 변수로 취급되며,",
-        "결과에 따라 비트코인·알트코인 등 암호화폐의 단기 방향성이 크게 바뀔 수 있습니다.",
+        "결과에 따라 *비트코인(BTC)* 및 주요 알트코인의 단기 방향성이 크게 바뀔 수 있습니다.",
         "",
         "📌 *해석 가이드 (예상치 대비 실제치 기준)*",
         "• 상회(실제치 > 예상치)",
-        "  → 암호화폐에 *긍정적*, 단기 급등 가능성이 커집니다.",
+        "  → BTC·알트코인에 *강한 호재*, 단기 급등 가능성이 커집니다.",
         "",
         "• 부합(실제치 ≈ 예상치)",
-        "  → 암호화폐에 *긍정적*, 완만한 단기 상승 흐름을 기대할 수 있습니다.",
+        "  → BTC·알트코인에 *완만한 호재*, 우상향 흐름을 기대할 수 있습니다.",
         "",
         "• 하회(실제치 < 예상치)",
-        "  → 암호화폐에 *부정적*, 단기적으로 충격 하락이 나올 수 있습니다.",
+        "  → BTC·알트코인에 *악재*, 단기적으로 급락성 조정이 나올 수 있습니다.",
         "",
         "※ 실제 시장 반응은 동시에 발표되는 다른 지표, 뉴스, 유동성 상황에 따라 달라질 수 있으니 ",
         "   과도한 레버리지는 피하는 것이 좋습니다.",
@@ -337,9 +363,10 @@ def scenario_detail_text(title: str, importance: Any) -> str:
 
 def _crypto_generic_hint() -> str:
     return (
-        "\n\n💡 *참고*\n"
-        "- 지표 결과는 다른 뉴스/자금 흐름과 함께 해석해야 하며,\n"
-        "  위 내용은 방향성을 이해하기 위한 간단한 가이드일 뿐입니다."
+        "\n\n💡 *BTC/암호화폐 해석 팁*\n"
+        "- 지표 결과는 다른 매크로 뉴스·자금 흐름과 함께 보셔야 하며,\n"
+        "  위 내용은 *비트코인(BTC) 중심* 단기 방향성을 이해하기 위한 간단한 가이드입니다.\n"
+        "- 레버리지는 항상 보수적으로, 손절·리스크 관리를 우선하세요."
     )
 
 
@@ -348,7 +375,10 @@ def build_preview(events: List[Dict[str, Any]]) -> str:
         return "📆 향후 24시간 내 고중요 경제지표/이벤트 없음"
 
     events = sorted(events, key=lambda e: e["_sg_time"])
-    lines = ["📆 *향후 24시간 경제 캘린더(중요 이벤트)*\n"]
+    lines = [
+        "📆 *향후 24시간 경제 캘린더(중요 이벤트)*",
+        "📌 BTC 영향 관점으로 참고용 가이드를 함께 제공합니다.\n",
+    ]
 
     count = 0
     for e in events:
@@ -376,6 +406,55 @@ def build_preview(events: List[Dict[str, Any]]) -> str:
         lines.append(SCENARIO_BRIEF_MULTI)
         count += 1
         if count >= 20:  # 너무 길어지지 않도록 안전 장치
+            break
+
+    lines.append(_crypto_generic_hint())
+    return "\n".join(lines)
+
+
+def build_weekly_preview(events: List[Dict[str, Any]]) -> str:
+    """'이번 주 주요 이벤트 미리보기 주간 알림' 전용 메시지."""
+    if not events:
+        return (
+            "📌 *이번 주 주요 이벤트 미리보기 주간 알림*\n"
+            "이번 주 7일 동안 일정 내에 필터 조건에 해당하는 고중요 경제지표/이벤트가 없습니다."
+        )
+
+    events = sorted(events, key=lambda e: e["_sg_time"])
+
+    lines = [
+        "📌 *이번 주 주요 이벤트 미리보기 주간 알림*",
+        "   (BTC 영향 관점 강화 버전)\n",
+        "이번 주 7일 동안 매크로 일정 중, BTC 및 암호화폐 시장에 영향이 클 수 있는\n"
+        "고중요 이벤트들을 모아서 정리했습니다.\n",
+    ]
+
+    count = 0
+    for e in events:
+        country = _strip(e.get("Country"))
+        title = _strip(e.get("Event") or e.get("Category"))
+        imp = str(e.get("Importance") or "")
+        icon = importance_icon(imp)
+        tt = e["_sg_time"]
+
+        weekday = tt.strftime("%a")  # Mon, Tue ...
+        ref = _strip(e.get("Reference"))
+        ref_dt = _strip(e.get("ReferenceDate"))
+        core = ""
+        if ref:
+            core += f" ({ref}"
+            if ref_dt:
+                core += f", 기준일 {ref_dt}"
+            core += ")"
+
+        imp_txt = f"[{country} / 중요도 {imp}]" if country or imp else ""
+        lines.append(
+            f"{icon} {tt.strftime('%m/%d(%a) %H:%M')} {imp_txt}\n"
+            f"   {title}{core}"
+        )
+        lines.append(SCENARIO_BRIEF_MULTI)
+        count += 1
+        if count >= 40:  # 주간이니 조금 더 많이 허용
             break
 
     lines.append(_crypto_generic_hint())
@@ -411,33 +490,33 @@ def build_release_note(e: Dict[str, Any]) -> str:
         if a > f * 1.01:
             hint = (
                 "✅ *상회(실제치 > 예상치)*\n"
-                "   → 암호화폐에 긍정적, 단기 급등 가능성이 있는 결과입니다."
+                "   → BTC·알트코인에 *강한 호재*, 단기 급등 가능성이 있는 결과입니다."
             )
         elif a < f * 0.99:
             hint = (
                 "⚠️ *하회(실제치 < 예상치)*\n"
-                "   → 암호화폐에 부정적, 단기 충격 하락이 나올 수 있는 결과입니다."
+                "   → BTC·알트코인에 *악재*, 단기 충격 하락이 나올 수 있는 결과입니다."
             )
         else:
             hint = (
                 "✅ *부합(실제치 ≈ 예상치)*\n"
-                "   → 암호화폐에 긍정적, 점진적인 단기 상승 흐름을 기대할 수 있습니다."
+                "   → BTC·알트코인에 *완만한 호재*, 우상향 흐름을 기대할 수 있습니다."
             )
     elif a is not None and p is not None:
         if a > p * 1.01:
             hint = (
                 "✅ *상회(실제치 > 이전치)*\n"
-                "   → 암호화폐에 긍정적, 단기 급등 가능성이 있는 결과입니다."
+                "   → BTC·알트코인에 *강한 호재*로 해석될 수 있습니다."
             )
         elif a < p * 0.99:
             hint = (
                 "⚠️ *하회(실제치 < 이전치)*\n"
-                "   → 암호화폐에 부정적, 단기 충격 하락이 나올 수 있는 결과입니다."
+                "   → BTC·알트코인에 *악재*, 단기 급락성 조정 가능성이 큽니다."
             )
         else:
             hint = (
                 "✅ *부합(실제치 ≈ 이전치)*\n"
-                "   → 암호화폐에 긍정적, 완만한 상승 쪽으로 해석될 수 있습니다."
+                "   → BTC·알트코인에 *완만한 호재* 쪽으로 해석될 수 있습니다."
             )
 
     lines = [
@@ -469,6 +548,14 @@ def send_preview_job():
     end = now + timedelta(hours=24)
     events = fetch_window_sg(now, end)
     msg = build_preview(events)
+    send_text(msg, parse_mode="Markdown")
+
+
+def send_weekly_preview_job():
+    now = _sg_now()
+    end = now + timedelta(days=7)
+    events = fetch_window_sg(now, end)
+    msg = build_weekly_preview(events)
     send_text(msg, parse_mode="Markdown")
 
 
@@ -513,7 +600,7 @@ def poll_releases_job():
                     f"국가: {country}\n"
                     f"제목: {title}\n\n"
                     "연설 내용에 따라 기대 인플레이션/금리 전망이 바뀌면 "
-                    "비트코인 등 암호화폐 가격에도 영향을 줄 수 있습니다."
+                    "*비트코인(BTC)* 등 암호화폐 가격에도 영향을 줄 수 있습니다."
                 )
                 send_text(msg, parse_mode="Markdown")
                 sent_cache.set(speech_key, True)
@@ -550,6 +637,9 @@ def econ_health() -> str:
         "now": now.isoformat(),
         "tz": "Asia/Singapore",
         "te_auth_mode": "custom" if TE_AUTH else "guest",
+        "weekly_enabled": WEEKLY_ENABLED,
+        "weekly_day": WEEKLY_DAY,
+        "weekly_time": WEEKLY_TIME,
     }
     return json.dumps(body, ensure_ascii=False, indent=2)
 
@@ -608,7 +698,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
 
     _scheduler = BackgroundScheduler(timezone=str(ASIA_SG))
 
-    # 프리뷰: 지정 시각들 (매번 전송, 캐시 사용 안 함)
+    # (1) 24h 프리뷰: 지정 시각들 (매번 전송, 캐시 사용 안 함)
     for t in PREVIEW_TIMES:
         try:
             hh, mm = [int(x) for x in t.split(":")]
@@ -616,7 +706,23 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception:
             log.warning("invalid ECON_PREVIEW_TIMES entry ignored: %s", t)
 
-    # 실시간 폴링
+    # (2) 주간 미리보기 ("이번 주 주요 이벤트 미리보기 주간 알림")
+    if WEEKLY_ENABLED:
+        try:
+            hh, mm = [int(x) for x in WEEKLY_TIME.split(":")]
+            _scheduler.add_job(
+                send_weekly_preview_job,
+                CronTrigger(day_of_week=WEEKLY_DAY, hour=hh, minute=mm),
+            )
+            log.info(
+                "econ_calendar weekly preview enabled: day=%s time=%s (Asia/Singapore)",
+                WEEKLY_DAY,
+                WEEKLY_TIME,
+            )
+        except Exception as e:
+            log.warning("invalid weekly preview config ignored: %s", e)
+
+    # (3) 실시간 폴링
     _scheduler.add_job(
         poll_releases_job,
         "interval",
