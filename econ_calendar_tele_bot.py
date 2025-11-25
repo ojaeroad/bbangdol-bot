@@ -13,7 +13,7 @@ TradingEconomics 경제 캘린더 알림 (프리뷰 + 20분 전 상세 설명 + 
      - BTC 영향 설명 강화
   3) 실제 값(Actual)이 나오면 결과 요약 + 암호화폐(BTC 중심) 영향 코멘트 전송
   4) 같은 이벤트에 대해 20분 전 / 결과 요약은 각각 24h에 1회만 전송 (프리뷰는 매번 전송)
-  5) 주 1회, "이번 주 주요 이벤트 미리보기 주간 알림" 전송 (기본: 월요일 오전 7시 한국 기준)
+  5) 주 1회, "이번 주 주요 이벤트 미리보기 주간 알림" 전송 (기본: 월요일 오전 8시 한국 기준)
 
 ENV
   ECON_CAL_ENABLED            : "1"이면 활성(기본 0=비활성)
@@ -30,9 +30,9 @@ ENV
   ECON_COUNTRIES              : "United States,Japan" 처럼 쉼표 구분 국가 목록
   ECON_IMPORTANCE             : "2,3" (기본) — 중요도 필터
 
-  # 24h 프리뷰 시각 (로컬 Asia/Singapore 기준)
+  # 24h 프리뷰 시각 (로컬 Asia/Seoul = 한국시간 기준)
   #   한국시간 07:00 / 13:00 / 19:00 에 받으려면 기본값 그대로 두면 됨.
-  ECON_PREVIEW_TIMES          : "06:00,12:00,18:00" (기본값)
+  ECON_PREVIEW_TIMES          : "07:00,13:00,19:00" (기본값)
 
   ECON_POLL_SEC               : 실시간 폴링 주기(초) 기본 60
   ECON_RELEASE_LOOKAHEAD_MIN  : 결과 감지용 앞 시간(분) 기본 5
@@ -40,10 +40,10 @@ ENV
   ECON_PREVIEW_KEY            : /econ/preview_now 호출용 간단한 비밀키(?key=...)
 
   # 주간 미리보기 ("이번 주 주요 이벤트 미리보기 주간 알림")
-  #   기본: 매주 월요일 한국시간 07:00 (싱가포르 06:00)
+  #   기본: 매주 월요일 한국시간 08:00
   ECON_WEEKLY_ENABLED         : "1" 이면 켜짐 (기본 1)
   ECON_WEEKLY_DAY             : "mon" (apscheduler Cron day_of_week 형식, 기본 mon)
-  ECON_WEEKLY_TIME            : "06:00" (Asia/Singapore 기준 시각)
+  ECON_WEEKLY_TIME            : "08:00" (Asia/Seoul 기준 시각)
 """
 
 from __future__ import annotations
@@ -76,7 +76,8 @@ log = logging.getLogger(__name__)
 # 설정/환경변수
 # ─────────────────────────────────────────────────────────────
 
-ASIA_SG = timezone("Asia/Singapore")
+# ★ 한국시간 기준 타임존
+ASIA_SG = timezone("Asia/Seoul")
 
 ENABLED = os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in (
     "0",
@@ -104,10 +105,10 @@ IMPORTANCE = [
     s.strip() for s in os.getenv("ECON_IMPORTANCE", "2,3").split(",") if s.strip()
 ]
 
-# ⚠️ 기본값을 06/12/18 로 변경 → 한국시간 07/13/19 에 해당
+# 기본값을 07/13/19 로 변경 → 한국시간 그대로 사용
 PREVIEW_TIMES = [
     s.strip()
-    for s in os.getenv("ECON_PREVIEW_TIMES", "06:00,12:00,18:00").split(",")
+    for s in os.getenv("ECON_PREVIEW_TIMES", "07:00,13:00,19:00").split(",")
     if s.strip()
 ]
 
@@ -126,7 +127,7 @@ WEEKLY_ENABLED = os.getenv("ECON_WEEKLY_ENABLED", "1").strip().lower() not in (
     "off",
 )
 WEEKLY_DAY = os.getenv("ECON_WEEKLY_DAY", "mon").strip()  # Cron day_of_week 형식
-WEEKLY_TIME = os.getenv("ECON_WEEKLY_TIME", "06:00").strip()  # Asia/Singapore 기준 시각
+WEEKLY_TIME = os.getenv("ECON_WEEKLY_TIME", "08:00").strip()  # Asia/Seoul 기준 시각
 
 # ─────────────────────────────────────────────────────────────
 # HTTP 세션
@@ -160,7 +161,7 @@ def _sg_now() -> datetime:
 
 
 def _to_sg(dt_utc_str: str) -> datetime:
-    """TradingEconomics ISO 문자열을 Asia/Singapore 로 변환."""
+    """TradingEconomics ISO 문자열을 Asia/Seoul 로 변환."""
     try:
         dt = datetime.fromisoformat(dt_utc_str.replace("Z", "+00:00"))
     except Exception:
@@ -259,14 +260,31 @@ def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
             log.info("econ-cal skip: HTTP %s", r.status_code)
             return []
         data = r.json()
-        return data if isinstance(data, list) else []
+
+        # 정상(list) 이면 그대로 반환
+        if isinstance(data, list):
+            return data
+
+        # TE_AUTH 설정이 잘못됐을 가능성 → public 모드로 한 번 더 시도
+        if TE_AUTH:
+            log.warning("econ-cal TE_AUTH response not list, fallback to public: %s", data)
+            params.pop("c", None)
+            time.sleep(random.uniform(0, 0.6))
+            r2 = HTTP.get(TE_BASE, params=params, timeout=REQUEST_TIMEOUT)
+            if r2.status_code in (429, 500, 502, 503, 504):
+                log.info("econ-cal public fallback skip: HTTP %s", r2.status_code)
+                return []
+            data2 = r2.json()
+            return data2 if isinstance(data2, list) else []
+
+        return []
     except Exception as e:
         log.info("econ-cal transient error ignored: %s", e)
         return []
 
 
 def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]]:
-    """SG 기준 start~end 사이의 이벤트를 모두 가져오기."""
+    """한국시간 기준 start~end 사이의 이벤트를 모두 가져오기."""
     d1 = (start_sg - timedelta(days=1)).astimezone(utc)
     d2 = (end_sg + timedelta(days=1)).astimezone(utc)
 
@@ -353,7 +371,7 @@ def scenario_detail_text(title: str, importance: Any) -> str:
         "  → BTC·알트코인에 *완만한 호재*, 우상향 흐름을 기대할 수 있습니다.",
         "",
         "• 하회(실제치 < 예상치)",
-        "  → BTC·알트코인에 *악재*, 단기적으로 급락성 조정이 나올 수 있습니다.",
+        "  → BTC·알트코인에 *악재*, 단기적으로 급락성 조정이 날 수 있습니다.",
         "",
         "※ 실제 시장 반응은 동시에 발표되는 다른 지표, 뉴스, 유동성 상황에 따라 달라질 수 있으니 ",
         "   과도한 레버리지는 피하는 것이 좋습니다.",
@@ -417,6 +435,7 @@ def build_weekly_preview(events: List[Dict[str, Any]]) -> str:
     if not events:
         return (
             "📌 *이번 주 주요 이벤트 미리보기 주간 알림*\n"
+            "📌 *BTC 영향 분석 강화*\n\n"
             "이번 주 7일 동안 일정 내에 필터 조건에 해당하는 고중요 경제지표/이벤트가 없습니다."
         )
 
@@ -424,7 +443,7 @@ def build_weekly_preview(events: List[Dict[str, Any]]) -> str:
 
     lines = [
         "📌 *이번 주 주요 이벤트 미리보기 주간 알림*",
-        "   (BTC 영향 관점 강화 버전)\n",
+        "📌 *BTC 영향 분석 강화*\n",
         "이번 주 7일 동안 매크로 일정 중, BTC 및 암호화폐 시장에 영향이 클 수 있는\n"
         "고중요 이벤트들을 모아서 정리했습니다.\n",
     ]
@@ -521,7 +540,7 @@ def build_release_note(e: Dict[str, Any]) -> str:
 
     lines = [
         f"📊 *{title}* 발표 결과",
-        f"🕒 {_to_sg(str(tt)).strftime('%m/%d %H:%M')} (Asia/Singapore 기준)",
+        f"🕒 {_to_sg(str(tt)).strftime('%m/%d %H:%M')} (Asia/Seoul 기준)",
         f"ℹ️ {info_line}",
     ]
     if hint:
@@ -596,7 +615,7 @@ def poll_releases_job():
                 icon = importance_icon(e.get("Importance"))
                 msg = (
                     f"{icon} *주요 연설 예정 안내*\n"
-                    f"🕒 {tt.strftime('%m/%d %H:%M')} (Asia/Singapore)\n"
+                    f"🕒 {tt.strftime('%m/%d %H:%M')} (Asia/Seoul)\n"
                     f"국가: {country}\n"
                     f"제목: {title}\n\n"
                     "연설 내용에 따라 기대 인플레이션/금리 전망이 바뀌면 "
@@ -635,7 +654,7 @@ def econ_health() -> str:
         "raw_ttl_sec": RAW_TTL_SEC,
         "detail_before_min": DETAIL_BEFORE_MIN,
         "now": now.isoformat(),
-        "tz": "Asia/Singapore",
+        "tz": "Asia/Seoul",
         "te_auth_mode": "custom" if TE_AUTH else "guest",
         "weekly_enabled": WEEKLY_ENABLED,
         "weekly_day": WEEKLY_DAY,
@@ -715,7 +734,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
                 CronTrigger(day_of_week=WEEKLY_DAY, hour=hh, minute=mm),
             )
             log.info(
-                "econ_calendar weekly preview enabled: day=%s time=%s (Asia/Singapore)",
+                "econ_calendar weekly preview enabled: day=%s time=%s (Asia/Seoul)",
                 WEEKLY_DAY,
                 WEEKLY_TIME,
             )
