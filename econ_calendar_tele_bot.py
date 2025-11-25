@@ -19,8 +19,9 @@ ENV
   ECON_CAL_ENABLED            : "1"이면 활성(기본 0=비활성)
 
   # TradingEconomics 인증
-  TE_AUTH                     : "email:apikey" (유료 계정에서만 사용, 없으면 public endpoint)
+  TE_AUTH                     : "email:apikey" 또는 "guest:guest"
   ECON_API_KEY                : TE_AUTH 대신 쓸 수 있는 별칭
+  # → 둘 다 비어있으면 코드가 자동으로 guest:guest 를 사용
 
   # Telegram
   ECON_TG_TOKEN               : 텔레그램 봇 토큰 (없으면 TELEGRAM_BOT_TOKEN 사용)
@@ -31,7 +32,6 @@ ENV
   ECON_IMPORTANCE             : "2,3" (기본) — 중요도 필터
 
   # 24h 프리뷰 시각 (로컬 Asia/Seoul = 한국시간 기준)
-  #   한국시간 07:00 / 13:00 / 19:00 에 받으려면 기본값 그대로 두면 됨.
   ECON_PREVIEW_TIMES          : "07:00,13:00,19:00" (기본값)
 
   ECON_POLL_SEC               : 실시간 폴링 주기(초) 기본 60
@@ -40,9 +40,8 @@ ENV
   ECON_PREVIEW_KEY            : /econ/preview_now 호출용 간단한 비밀키(?key=...)
 
   # 주간 미리보기 ("이번 주 주요 이벤트 미리보기 주간 알림")
-  #   기본: 매주 월요일 한국시간 08:00
   ECON_WEEKLY_ENABLED         : "1" 이면 켜짐 (기본 1)
-  ECON_WEEKLY_DAY             : "mon" (apscheduler Cron day_of_week 형식, 기본 mon)
+  ECON_WEEKLY_DAY             : "mon" (Cron day_of_week 형식, 기본 mon)
   ECON_WEEKLY_TIME            : "08:00" (Asia/Seoul 기준 시각)
 """
 
@@ -65,9 +64,8 @@ from apscheduler.triggers.cron import CronTrigger
 from pytz import timezone, utc
 
 try:
-    # Flask는 app.py 쪽에서 이미 사용 중
     from flask import request
-except Exception:  # Render 환경 등에서만
+except Exception:
     request = None  # type: ignore
 
 log = logging.getLogger(__name__)
@@ -76,7 +74,7 @@ log = logging.getLogger(__name__)
 # 설정/환경변수
 # ─────────────────────────────────────────────────────────────
 
-# ★ 한국시간 기준 타임존
+# 한국시간 기준
 ASIA_SG = timezone("Asia/Seoul")
 
 ENABLED = os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in (
@@ -87,9 +85,15 @@ ENABLED = os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in (
     "off",
 )
 
-# TradingEconomics 인증(선택)
+# TradingEconomics 인증
 _te_auth_env = (os.getenv("TE_AUTH") or os.getenv("ECON_API_KEY") or "").strip()
-TE_AUTH = _te_auth_env  # 비어 있으면 public endpoint 사용
+if _te_auth_env:
+    TE_AUTH = _te_auth_env
+    TE_AUTH_MODE = "custom"
+else:
+    # 환경변수가 없으면 기본 guest:guest 사용
+    TE_AUTH = "guest:guest"
+    TE_AUTH_MODE = "guest"
 
 # Telegram
 TG_TOKEN = os.getenv("ECON_TG_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -105,7 +109,6 @@ IMPORTANCE = [
     s.strip() for s in os.getenv("ECON_IMPORTANCE", "2,3").split(",") if s.strip()
 ]
 
-# 기본값을 07/13/19 로 변경 → 한국시간 그대로 사용
 PREVIEW_TIMES = [
     s.strip()
     for s in os.getenv("ECON_PREVIEW_TIMES", "07:00,13:00,19:00").split(",")
@@ -115,10 +118,9 @@ PREVIEW_TIMES = [
 POLL_SEC = int(os.getenv("ECON_POLL_SEC", "60"))
 LOOKAHEAD_MIN = int(os.getenv("ECON_RELEASE_LOOKAHEAD_MIN", "5"))
 RAW_TTL_SEC = int(os.getenv("ECON_RAW_TTL_SEC", "45"))
-
 DETAIL_BEFORE_MIN = 20  # 이벤트 20분 전 상세 설명
 
-# 주간 미리보기 설정
+# 주간 미리보기
 WEEKLY_ENABLED = os.getenv("ECON_WEEKLY_ENABLED", "1").strip().lower() not in (
     "0",
     "false",
@@ -126,8 +128,8 @@ WEEKLY_ENABLED = os.getenv("ECON_WEEKLY_ENABLED", "1").strip().lower() not in (
     "no",
     "off",
 )
-WEEKLY_DAY = os.getenv("ECON_WEEKLY_DAY", "mon").strip()  # Cron day_of_week 형식
-WEEKLY_TIME = os.getenv("ECON_WEEKLY_TIME", "08:00").strip()  # Asia/Seoul 기준 시각
+WEEKLY_DAY = os.getenv("ECON_WEEKLY_DAY", "mon").strip()
+WEEKLY_TIME = os.getenv("ECON_WEEKLY_TIME", "08:00").strip()
 
 # ─────────────────────────────────────────────────────────────
 # HTTP 세션
@@ -149,8 +151,10 @@ def _build_session() -> requests.Session:
 
 
 HTTP = _build_session()
-TE_BASE = "https://api.tradingeconomics.com/calendar"
-REQUEST_TIMEOUT = (5, 10)  # (connect, read)
+
+# ★ 새 엔드포인트: /calendar/country/{countries}
+TE_BASE = "https://api.tradingeconomics.com/calendar/country"
+REQUEST_TIMEOUT = (5, 10)
 
 # ─────────────────────────────────────────────────────────────
 # Util
@@ -161,7 +165,6 @@ def _sg_now() -> datetime:
 
 
 def _to_sg(dt_utc_str: str) -> datetime:
-    """TradingEconomics ISO 문자열을 Asia/Seoul 로 변환."""
     try:
         dt = datetime.fromisoformat(dt_utc_str.replace("Z", "+00:00"))
     except Exception:
@@ -198,7 +201,6 @@ def _safe_float(v: Any) -> Optional[float]:
 
 
 def importance_icon(importance: Any) -> str:
-    """중요도에 따른 이모티콘 반환."""
     s = _strip(importance)
     if s == "3":
         return "💎"
@@ -234,49 +236,39 @@ class TTLCache:
 
 
 raw_cache = TTLCache(RAW_TTL_SEC)
-# 이벤트별 중복 방지: 24시간 (프리뷰는 사용 안 함)
 sent_cache = TTLCache(60 * 60 * 24)
 
 # ─────────────────────────────────────────────────────────────
-# TradingEconomics fetch
+# TradingEconomics fetch (새 엔드포인트)
 # ─────────────────────────────────────────────────────────────
 
 def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
-    # 무료(API Free) 기본: 인증 파라미터 없이 public endpoint 사용
+    """
+    UTC 기준 d1~d2 날짜 범위에 해당하는 이벤트를
+    /calendar/country/{countries}?c=...&importance=...&d1=...&d2=... 에서 가져온다.
+    """
+    # countries path: "United States,Japan" → requests가 공백/콤마 알아서 인코딩
+    countries_path = ",".join(COUNTRIES) if COUNTRIES else "United States"
+    url = f"{TE_BASE}/{countries_path}"
+
     params = {
         "f": "json",
-        "country": ",".join(COUNTRIES),
-        "importance": ",".join(IMPORTANCE),
+        "importance": ",".join(IMPORTANCE) if IMPORTANCE else "",
         "d1": _ymd(d1),
         "d2": _ymd(d2),
+        "c": TE_AUTH,  # 항상 키 붙이기 (환경변수 없으면 guest:guest)
     }
-    # 유료 계정에서 email:apikey 를 지정한 경우에만 인증 파라미터 추가
-    if TE_AUTH:
-        params["c"] = TE_AUTH
+
     try:
         time.sleep(random.uniform(0, 0.6))
-        r = HTTP.get(TE_BASE, params=params, timeout=REQUEST_TIMEOUT)
+        r = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code in (429, 500, 502, 503, 504):
             log.info("econ-cal skip: HTTP %s", r.status_code)
             return []
         data = r.json()
-
-        # 정상(list) 이면 그대로 반환
         if isinstance(data, list):
             return data
-
-        # TE_AUTH 설정이 잘못됐을 가능성 → public 모드로 한 번 더 시도
-        if TE_AUTH:
-            log.warning("econ-cal TE_AUTH response not list, fallback to public: %s", data)
-            params.pop("c", None)
-            time.sleep(random.uniform(0, 0.6))
-            r2 = HTTP.get(TE_BASE, params=params, timeout=REQUEST_TIMEOUT)
-            if r2.status_code in (429, 500, 502, 503, 504):
-                log.info("econ-cal public fallback skip: HTTP %s", r2.status_code)
-                return []
-            data2 = r2.json()
-            return data2 if isinstance(data2, list) else []
-
+        log.warning("econ-cal unexpected response: %s", data)
         return []
     except Exception as e:
         log.info("econ-cal transient error ignored: %s", e)
@@ -284,7 +276,6 @@ def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
 
 
 def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]]:
-    """한국시간 기준 start~end 사이의 이벤트를 모두 가져오기."""
     d1 = (start_sg - timedelta(days=1)).astimezone(utc)
     d2 = (end_sg + timedelta(days=1)).astimezone(utc)
 
@@ -343,18 +334,17 @@ def send_text(msg: str, parse_mode: Optional[str] = None):
 
 
 # ─────────────────────────────────────────────────────────────
-# 메시지 빌더 (3단계 시나리오 + BTC 영향 강화)
+# 메시지 빌더
 # ─────────────────────────────────────────────────────────────
 
 SCENARIO_BRIEF_MULTI = (
     "   • 상회 → 비트코인 및 주요 알트코인에 *긍정적*, 단기 급등 가능\n"
     "   • 부합 → 비트코인 및 주요 알트코인에 *완만한 호재*, 단기 상승 가능\n"
-    "   • 하회 → 비트코인 및 주요 알트코인에 *부정적*, 단기 급락 가능"
+    "   • 하회 → 비트코인 및 주요 알트코인에 *부정적*, 단기 충격 하락 가능"
 )
 
 
 def scenario_detail_text(title: str, importance: Any) -> str:
-    """이벤트 20분 전 상세 설명용 텍스트."""
     icon = importance_icon(importance)
     lines = [
         f"{icon} *{title}* 발표 20분 전 안내",
@@ -420,10 +410,9 @@ def build_preview(events: List[Dict[str, Any]]) -> str:
             f"{icon} {tt.strftime('%m/%d %H:%M')} {imp_txt}\n"
             f"   {title}{core}"
         )
-        # 각 이벤트 바로 아래에 3단계 시나리오 여러 줄
         lines.append(SCENARIO_BRIEF_MULTI)
         count += 1
-        if count >= 20:  # 너무 길어지지 않도록 안전 장치
+        if count >= 20:
             break
 
     lines.append(_crypto_generic_hint())
@@ -431,7 +420,6 @@ def build_preview(events: List[Dict[str, Any]]) -> str:
 
 
 def build_weekly_preview(events: List[Dict[str, Any]]) -> str:
-    """'이번 주 주요 이벤트 미리보기 주간 알림' 전용 메시지."""
     if not events:
         return (
             "📌 *이번 주 주요 이벤트 미리보기 주간 알림*\n"
@@ -456,7 +444,6 @@ def build_weekly_preview(events: List[Dict[str, Any]]) -> str:
         icon = importance_icon(imp)
         tt = e["_sg_time"]
 
-        weekday = tt.strftime("%a")  # Mon, Tue ...
         ref = _strip(e.get("Reference"))
         ref_dt = _strip(e.get("ReferenceDate"))
         core = ""
@@ -473,7 +460,7 @@ def build_weekly_preview(events: List[Dict[str, Any]]) -> str:
         )
         lines.append(SCENARIO_BRIEF_MULTI)
         count += 1
-        if count >= 40:  # 주간이니 조금 더 많이 허용
+        if count >= 40:
             break
 
     lines.append(_crypto_generic_hint())
@@ -499,7 +486,6 @@ def build_release_note(e: Dict[str, Any]) -> str:
 
     info_line = ", ".join(info) if info else "값 정보 없음"
 
-    # 숫자이면 3단계 해석
     hint = ""
     a = _safe_float(actual)
     f = _safe_float(forecast)
@@ -580,7 +566,6 @@ def send_weekly_preview_job():
 
 def poll_releases_job():
     now = _sg_now()
-    # 넉넉하게 앞뒤로 잡아서 한 번에 처리
     window_start = now - timedelta(minutes=DETAIL_BEFORE_MIN + 5)
     window_end = now + timedelta(minutes=LOOKAHEAD_MIN)
     events = fetch_window_sg(window_start, window_end)
@@ -596,7 +581,6 @@ def poll_releases_job():
         actual = e.get("Actual")
         is_speech = str(e.get("Category") or "").lower().find("speech") >= 0
 
-        # 1) 이벤트 20분 전 상세 설명 (아직 Actual 없음)
         if actual in (None, "") and 18 <= delta_min <= 22:
             pre_key = ev_id + "::pre20"
             if not sent_cache.get(pre_key):
@@ -604,9 +588,7 @@ def poll_releases_job():
                 msg = scenario_detail_text(title, e.get("Importance"))
                 send_text(msg, parse_mode="Markdown")
                 sent_cache.set(pre_key, True)
-            # 20분 전 설명은 보내고 나서도 결과 알림을 위해 계속 진행
 
-        # 2) 연설(speech) 5분 전 안내
         if is_speech and actual in (None, "") and 0 <= delta_min <= LOOKAHEAD_MIN:
             speech_key = ev_id + "::speech"
             if not sent_cache.get(speech_key):
@@ -623,14 +605,12 @@ def poll_releases_job():
                 )
                 send_text(msg, parse_mode="Markdown")
                 sent_cache.set(speech_key, True)
-            continue  # 연설은 Actual 이 따로 안 나오는 경우가 많아서 여기까지만
+            continue
 
-        # 3) 일반 지표 결과 발표 직후 (Actual 존재)
         if actual not in (None, ""):
             res_key = ev_id + "::result"
             if sent_cache.get(res_key):
                 continue
-            # 실제 발표 시점 근처(조금 과거/미래 허용)
             if -10 <= delta_min <= LOOKAHEAD_MIN:
                 msg = build_release_note(e)
                 send_text(msg, parse_mode="Markdown")
@@ -638,11 +618,10 @@ def poll_releases_job():
 
 
 # ─────────────────────────────────────────────────────────────
-# Flask endpoint 함수
+# Flask endpoint
 # ─────────────────────────────────────────────────────────────
 
 def econ_health() -> str:
-    """상태 확인용 엔드포인트 핸들러."""
     now = _sg_now()
     body = {
         "enabled": ENABLED,
@@ -655,7 +634,7 @@ def econ_health() -> str:
         "detail_before_min": DETAIL_BEFORE_MIN,
         "now": now.isoformat(),
         "tz": "Asia/Seoul",
-        "te_auth_mode": "custom" if TE_AUTH else "guest",
+        "te_auth_mode": TE_AUTH_MODE,
         "weekly_enabled": WEEKLY_ENABLED,
         "weekly_day": WEEKLY_DAY,
         "weekly_time": WEEKLY_TIME,
@@ -664,32 +643,24 @@ def econ_health() -> str:
 
 
 def econ_preview_now() -> str:
-    """강제 프리뷰 테스트용 엔드포인트."""
     if request is None:
         return "request unavailable"
     key = request.args.get("key", "")
     env_key = os.getenv("ECON_PREVIEW_KEY", "")
     if env_key and key != env_key:
-        return "forbidden", 403  # Flask가 튜플을 응답으로 처리
+        return "forbidden", 403
     send_preview_job()
     return "ok"
 
 
 # ─────────────────────────────────────────────────────────────
-# 초기화 (app.py 에서 호출)
+# 초기화
 # ─────────────────────────────────────────────────────────────
 
 _scheduler: Optional[BackgroundScheduler] = None
 
 
 def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
-    """app.py 에서 한 번만 호출.
-
-    예)
-        from econ_calendar_tele_bot import init_econ_calendar
-        ...
-        init_econ_calendar(app)
-    """
     global _scheduler
     if not ENABLED:
         log.info("econ_calendar disabled (ECON_CAL_ENABLED=0)")
@@ -697,10 +668,8 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
     if _scheduler:
         return _scheduler
 
-    # Flask 라우트 등록
     try:
         if app is not None:
-            # 중복 등록 방지
             vf = getattr(app, "view_functions", {})
             if "econ_health" not in vf:
                 app.add_url_rule("/econ/health", "econ_health", econ_health, methods=["GET"])
@@ -717,7 +686,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
 
     _scheduler = BackgroundScheduler(timezone=str(ASIA_SG))
 
-    # (1) 24h 프리뷰: 지정 시각들 (매번 전송, 캐시 사용 안 함)
     for t in PREVIEW_TIMES:
         try:
             hh, mm = [int(x) for x in t.split(":")]
@@ -725,7 +693,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception:
             log.warning("invalid ECON_PREVIEW_TIMES entry ignored: %s", t)
 
-    # (2) 주간 미리보기 ("이번 주 주요 이벤트 미리보기 주간 알림")
     if WEEKLY_ENABLED:
         try:
             hh, mm = [int(x) for x in WEEKLY_TIME.split(":")]
@@ -741,7 +708,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception as e:
             log.warning("invalid weekly preview config ignored: %s", e)
 
-    # (3) 실시간 폴링
     _scheduler.add_job(
         poll_releases_job,
         "interval",
@@ -755,7 +721,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         POLL_SEC,
         COUNTRIES,
         IMPORTANCE,
-        "custom" if TE_AUTH else "guest",
+        TE_AUTH_MODE,
     )
     return _scheduler
 
