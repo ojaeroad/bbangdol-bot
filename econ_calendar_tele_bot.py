@@ -6,13 +6,13 @@ TradingEconomics 경제 캘린더 알림 (프리뷰 + 20분 전 상세 설명 + 
 기능
   1) 매일 지정된 시각(복수 가능)에 24시간 프리뷰 전송
      - 각 이벤트 라인 앞에 중요도 이모티콘(💎/⭐️/⚡️)
-     - 각 이벤트 바로 아래에, 예상치 대비 실적치 3단계 시나리오(상회/부합/하회)가 줄마다 표시
+     - 각 이벤트 바로 아래에, 예상치 대비 실적치 3단계 시나리오(상회/부합/하회) 줄마다 표시
      - BTC/암호화폐 영향 코멘트 포함
   2) 각 이벤트 약 20분 전에 상세 설명 + 3단계 시나리오 전송
      - 메시지 맨 앞에 중요도 이모티콘 포함
      - BTC 영향 설명 강화
-  3) 실제 값(Actual)이 나오면 결과 요약 + 암호화폐(BTC 중심) 영향 코멘트 전송
-  4) 같은 이벤트에 대해 20분 전 / 결과 요약은 각각 24h에 1회만 전송 (프리뷰는 매번 전송)
+  3) 실제 값(Actual)이 나오면 결과 요약 + BTC 중심 영향 코멘트 전송
+  4) 같은 이벤트에 대해 20분 전 / 결과 요약은 각각 24h에 1회만 전송
   5) 주 1회, "이번 주 주요 이벤트 미리보기 주간 알림" 전송 (기본: 월요일 오전 8시 한국 기준)
 
 ENV
@@ -74,7 +74,6 @@ log = logging.getLogger(__name__)
 # 설정/환경변수
 # ─────────────────────────────────────────────────────────────
 
-# 한국시간 기준
 ASIA_SG = timezone("Asia/Seoul")
 
 ENABLED = os.getenv("ECON_CAL_ENABLED", "0").strip().lower() not in (
@@ -91,7 +90,7 @@ if _te_auth_env:
     TE_AUTH = _te_auth_env
     TE_AUTH_MODE = "custom"
 else:
-    # 환경변수가 없으면 기본 guest:guest 사용
+    # 환경변수 없으면 자동 guest:guest 사용
     TE_AUTH = "guest:guest"
     TE_AUTH_MODE = "guest"
 
@@ -152,7 +151,8 @@ def _build_session() -> requests.Session:
 
 HTTP = _build_session()
 
-# ★ 새 엔드포인트: /calendar/country/{countries}
+# ★ 공식 캘린더 By date 엔드포인트
+# 예: /calendar/country/All/2016-12-02/2016-12-03?c=guest:guest
 TE_BASE = "https://api.tradingeconomics.com/calendar/country"
 REQUEST_TIMEOUT = (5, 10)
 
@@ -245,29 +245,32 @@ sent_cache = TTLCache(60 * 60 * 24)
 def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
     """
     UTC 기준 d1~d2 날짜 범위에 해당하는 이벤트를
-    /calendar/country/{countries}?c=...&importance=...&d1=...&d2=... 에서 가져온다.
+    /calendar/country/{countries}/{d1}/{d2}?c=... 엔드포인트에서 가져온다.
+    docs 예시:
+      /calendar/country/All/2016-12-02/2016-12-03?c=guest:guest
     """
-    # countries path: "United States,Japan" → requests가 공백/콤마 알아서 인코딩
-    countries_path = ",".join(COUNTRIES) if COUNTRIES else "United States"
-    url = f"{TE_BASE}/{countries_path}"
+    countries_path = ",".join(COUNTRIES) if COUNTRIES else "All"
+    url = f"{TE_BASE}/{countries_path}/{_ymd(d1)}/{_ymd(d2)}"
 
     params = {
         "f": "json",
-        "importance": ",".join(IMPORTANCE) if IMPORTANCE else "",
-        "d1": _ymd(d1),
-        "d2": _ymd(d2),
-        "c": TE_AUTH,  # 항상 키 붙이기 (환경변수 없으면 guest:guest)
+        "c": TE_AUTH,  # 환경변수 없으면 위에서 guest:guest 로 세팅됨
     }
+    if IMPORTANCE:
+        params["importance"] = ",".join(IMPORTANCE)
 
     try:
         time.sleep(random.uniform(0, 0.6))
         r = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
         if r.status_code in (429, 500, 502, 503, 504):
             log.info("econ-cal skip: HTTP %s", r.status_code)
             return []
+
         data = r.json()
         if isinstance(data, list):
             return data
+
         log.warning("econ-cal unexpected response: %s", data)
         return []
     except Exception as e:
@@ -276,6 +279,7 @@ def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
 
 
 def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]]:
+    # TE는 UTC 기준이므로 하루 여유를 두고 가져온 뒤, 한국시간에서 다시 필터링
     d1 = (start_sg - timedelta(days=1)).astimezone(utc)
     d2 = (end_sg + timedelta(days=1)).astimezone(utc)
 
@@ -296,12 +300,14 @@ def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]
             tt = _to_sg(dt)
             if not (start_sg <= tt <= end_sg):
                 continue
+
             country = _strip(e.get("Country"))
             importance = str(e.get("Importance") or "")
             if COUNTRIES and country not in COUNTRIES:
                 continue
             if IMPORTANCE and importance not in IMPORTANCE:
                 continue
+
             e["_sg_time"] = tt
             events.append(e)
         except Exception:
@@ -581,6 +587,7 @@ def poll_releases_job():
         actual = e.get("Actual")
         is_speech = str(e.get("Category") or "").lower().find("speech") >= 0
 
+        # 20분 전 상세 설명
         if actual in (None, "") and 18 <= delta_min <= 22:
             pre_key = ev_id + "::pre20"
             if not sent_cache.get(pre_key):
@@ -589,6 +596,7 @@ def poll_releases_job():
                 send_text(msg, parse_mode="Markdown")
                 sent_cache.set(pre_key, True)
 
+        # 연설 안내
         if is_speech and actual in (None, "") and 0 <= delta_min <= LOOKAHEAD_MIN:
             speech_key = ev_id + "::speech"
             if not sent_cache.get(speech_key):
@@ -607,6 +615,7 @@ def poll_releases_job():
                 sent_cache.set(speech_key, True)
             continue
 
+        # 결과 요약
         if actual not in (None, ""):
             res_key = ev_id + "::result"
             if sent_cache.get(res_key):
@@ -668,6 +677,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
     if _scheduler:
         return _scheduler
 
+    # Flask 라우트 등록
     try:
         if app is not None:
             vf = getattr(app, "view_functions", {})
@@ -686,6 +696,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
 
     _scheduler = BackgroundScheduler(timezone=str(ASIA_SG))
 
+    # 매일 24h 프리뷰
     for t in PREVIEW_TIMES:
         try:
             hh, mm = [int(x) for x in t.split(":")]
@@ -693,6 +704,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception:
             log.warning("invalid ECON_PREVIEW_TIMES entry ignored: %s", t)
 
+    # 주간 미리보기
     if WEEKLY_ENABLED:
         try:
             hh, mm = [int(x) for x in WEEKLY_TIME.split(":")]
@@ -708,6 +720,7 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception as e:
             log.warning("invalid weekly preview config ignored: %s", e)
 
+    # 실시간 폴링
     _scheduler.add_job(
         poll_releases_job,
         "interval",
