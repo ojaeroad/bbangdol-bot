@@ -9,8 +9,6 @@ TradingEconomics 경제 캘린더 알림 (프리뷰 + 20분 전 상세 설명 + 
      - 각 이벤트 바로 아래에, 예상치 대비 실적치 3단계 시나리오(상회/부합/하회) 줄마다 표시
      - BTC/암호화폐 영향 코멘트 포함
   2) 각 이벤트 약 20분 전에 상세 설명 + 3단계 시나리오 전송
-     - 메시지 맨 앞에 중요도 이모티콘 포함
-     - BTC 영향 설명 강화
   3) 실제 값(Actual)이 나오면 결과 요약 + BTC 중심 영향 코멘트 전송
   4) 같은 이벤트에 대해 20분 전 / 결과 요약은 각각 24h에 1회만 전송
   5) 주 1회, "이번 주 주요 이벤트 미리보기 주간 알림" 전송 (기본: 월요일 오전 8시 한국 기준)
@@ -62,6 +60,7 @@ from urllib3.util import Retry
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from pytz import timezone, utc
+from urllib.parse import quote
 
 try:
     from flask import request
@@ -90,7 +89,6 @@ if _te_auth_env:
     TE_AUTH = _te_auth_env
     TE_AUTH_MODE = "custom"
 else:
-    # 환경변수 없으면 자동 guest:guest 사용
     TE_AUTH = "guest:guest"
     TE_AUTH_MODE = "guest"
 
@@ -101,7 +99,7 @@ TG_CHAT = os.getenv("ECON_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 # 필터
 COUNTRIES = [
     s.strip()
-    for s in os.getenv("ECON_COUNTRIES", "United States,Japan").split(",")
+    for s in os.getenv("ECON_COUNTRIES", "United States").split(",")
     if s.strip()
 ]
 IMPORTANCE = [
@@ -151,8 +149,8 @@ def _build_session() -> requests.Session:
 
 HTTP = _build_session()
 
-# ★ 공식 캘린더 By date 엔드포인트
-# 예: /calendar/country/All/2016-12-02/2016-12-03?c=guest:guest
+# TradingEconomics country 캘린더 엔드포인트
+# 예: /calendar/country/united%20states?c=guest:guest&importance=3
 TE_BASE = "https://api.tradingeconomics.com/calendar/country"
 REQUEST_TIMEOUT = (5, 10)
 
@@ -239,56 +237,83 @@ raw_cache = TTLCache(RAW_TTL_SEC)
 sent_cache = TTLCache(60 * 60 * 24)
 
 # ─────────────────────────────────────────────────────────────
-# TradingEconomics fetch (새 엔드포인트)
+# TradingEconomics fetch
 # ─────────────────────────────────────────────────────────────
 
 def fetch_day(d1: datetime, d2: datetime) -> List[Dict[str, Any]]:
     """
-    UTC 기준 d1~d2 날짜 범위에 해당하는 이벤트를
-    /calendar/country/{countries}/{d1}/{d2}?c=... 엔드포인트에서 가져온다.
-    docs 예시:
-      /calendar/country/All/2016-12-02/2016-12-03?c=guest:guest
+    TradingEconomics country 캘린더에서 일정 전체를 받아온 뒤,
+    실제 필터링은 fetch_window_sg 쪽에서 한국시간 기준으로 수행한다.
+
+    엔드포인트 예시:
+      https://api.tradingeconomics.com/calendar/country/united%20states?c=guest:guest&importance=2,3&f=json
     """
-    countries_path = ",".join(COUNTRIES) if COUNTRIES else "All"
-    url = f"{TE_BASE}/{countries_path}/{_ymd(d1)}/{_ymd(d2)}"
+    countries_path = ",".join(COUNTRIES) if COUNTRIES else "United States"
+    # 공백, 쉼표 인코딩
+    encoded_countries = quote(countries_path, safe=",")
+    url = f"{TE_BASE}/{encoded_countries}"
 
     params = {
         "f": "json",
-        "c": TE_AUTH,  # 환경변수 없으면 위에서 guest:guest 로 세팅됨
+        "c": TE_AUTH,
     }
     if IMPORTANCE:
         params["importance"] = ",".join(IMPORTANCE)
 
+    # 디버깅용 로그 (Render 로그에서 확인 가능)
+    print("[ECON DEBUG] TE URL =", url)
+    print("[ECON DEBUG] params =", params)
+
     try:
         time.sleep(random.uniform(0, 0.6))
         r = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+        # 상태 코드만 한 번 찍어보자
+        print("[ECON DEBUG] status =", r.status_code)
 
         if r.status_code in (429, 500, 502, 503, 504):
             log.info("econ-cal skip: HTTP %s", r.status_code)
             return []
 
         data = r.json()
-        if isinstance(data, list):
-            return data
 
-        log.warning("econ-cal unexpected response: %s", data)
-        return []
+        # 혹시 dict 형태의 에러 메시지면 로그 찍기
+        if not isinstance(data, list):
+            print("[ECON DEBUG] non-list response:", data)
+            log.warning("econ-cal unexpected response: %s", data)
+            return []
+
+        # 너무 길면 일부만 로그
+        if data:
+            first = data[0]
+            print("[ECON DEBUG] first item sample:", {
+                "Date": first.get("Date"),
+                "Country": first.get("Country"),
+                "Event": first.get("Event") or first.get("Category"),
+                "Importance": first.get("Importance"),
+            })
+
+        return data
     except Exception as e:
         log.info("econ-cal transient error ignored: %s", e)
+        print("[ECON DEBUG] exception:", repr(e))
         return []
 
 
 def fetch_window_sg(start_sg: datetime, end_sg: datetime) -> List[Dict[str, Any]]:
-    # TE는 UTC 기준이므로 하루 여유를 두고 가져온 뒤, 한국시간에서 다시 필터링
-    d1 = (start_sg - timedelta(days=1)).astimezone(utc)
-    d2 = (end_sg + timedelta(days=1)).astimezone(utc)
-
-    cache_key = f"{_ymd(d1)}::{_ymd(d2)}"
+    """
+    한국시간 start_sg ~ end_sg 사이에 속하는 이벤트만 필터링.
+    TE 쪽에는 날짜를 안 넘기고, 나라 기준 전체 일정 받아서 여기서 시간 필터.
+    """
+    # 캐시는 날짜 문자열만 Key 로 사용 (한국시간 기준)
+    cache_key = f"{_ymd(start_sg)}::{_ymd(end_sg)}"
     cached = raw_cache.get(cache_key)
     if cached is not None:
         raw = cached
     else:
-        raw = fetch_day(d1, d2)
+        # d1, d2 인자는 지금 fetch_day 내부에서는 사용 안 하지만
+        # 시그니처 유지 차원에서 그대로 넘긴다.
+        raw = fetch_day(start_sg.astimezone(utc), end_sg.astimezone(utc))
         raw_cache.set(cache_key, raw)
 
     events: List[Dict[str, Any]] = []
@@ -587,7 +612,6 @@ def poll_releases_job():
         actual = e.get("Actual")
         is_speech = str(e.get("Category") or "").lower().find("speech") >= 0
 
-        # 20분 전 상세 설명
         if actual in (None, "") and 18 <= delta_min <= 22:
             pre_key = ev_id + "::pre20"
             if not sent_cache.get(pre_key):
@@ -596,7 +620,6 @@ def poll_releases_job():
                 send_text(msg, parse_mode="Markdown")
                 sent_cache.set(pre_key, True)
 
-        # 연설 안내
         if is_speech and actual in (None, "") and 0 <= delta_min <= LOOKAHEAD_MIN:
             speech_key = ev_id + "::speech"
             if not sent_cache.get(speech_key):
@@ -615,7 +638,6 @@ def poll_releases_job():
                 sent_cache.set(speech_key, True)
             continue
 
-        # 결과 요약
         if actual not in (None, ""):
             res_key = ev_id + "::result"
             if sent_cache.get(res_key):
@@ -677,7 +699,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
     if _scheduler:
         return _scheduler
 
-    # Flask 라우트 등록
     try:
         if app is not None:
             vf = getattr(app, "view_functions", {})
@@ -696,7 +717,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
 
     _scheduler = BackgroundScheduler(timezone=str(ASIA_SG))
 
-    # 매일 24h 프리뷰
     for t in PREVIEW_TIMES:
         try:
             hh, mm = [int(x) for x in t.split(":")]
@@ -704,7 +724,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception:
             log.warning("invalid ECON_PREVIEW_TIMES entry ignored: %s", t)
 
-    # 주간 미리보기
     if WEEKLY_ENABLED:
         try:
             hh, mm = [int(x) for x in WEEKLY_TIME.split(":")]
@@ -720,7 +739,6 @@ def init_econ_calendar(app) -> Optional[BackgroundScheduler]:
         except Exception as e:
             log.warning("invalid weekly preview config ignored: %s", e)
 
-    # 실시간 폴링
     _scheduler.add_job(
         poll_releases_job,
         "interval",
