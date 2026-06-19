@@ -194,11 +194,13 @@ def build_route_map() -> Dict[str, str]:
     add_if("OS_SHORT_KRW", "KRW_SHORT")
     add_if("OS_SWING_KRW", "KRW_SWING")
     add_if("OS_LONG_KRW",  "KRW_LONG")
-    # 너가 최근 파인코드에서 쓰는 4트리거용
-    add_if("LONG_5M",  "LONG_5M")
-    add_if("SHORT_5M", "SHORT_5M")
-    add_if("LONG_30M", "LONG_30M")
-    add_if("SHORT_30M","SHORT_30M")
+    # ===== 1Q 대형주 =====
+    add_if("BUY_SWING_1Q", "BUY_SWING_1Q")
+    add_if("SELL_SWING_1Q", "SELL_SWING_1Q")
+    add_if("BUY_LONG_1Q", "BUY_LONG_1Q")
+    add_if("SELL_LONG_1Q", "SELL_LONG_1Q")
+    add_if("BUY_LIFE_1Q", "BUY_LIFE_1Q")
+    add_if("SELL_LIFE_1Q", "SELL_LIFE_1Q")
     return m
 
 ROUTE_TO_CHAT: Dict[str, str] = build_route_map()
