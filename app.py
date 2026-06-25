@@ -194,7 +194,20 @@ def build_route_map() -> Dict[str, str]:
     add_if("OS_SHORT_KRW", "KRW_SHORT")
     add_if("OS_SWING_KRW", "KRW_SWING")
     add_if("OS_LONG_KRW",  "KRW_LONG")
-    # ===== 1Q 대형주 =====
+    # ===== 빵돌이 별꽃 타점 / BD 8개 그룹 =====
+    # Render 환경변수명 권장:
+    # BD_BUY_SHORT, BD_BUY_SWING, BD_BUY_LONG, BD_BUY_LIFE
+    # BD_SELL_SHORT, BD_SELL_SWING, BD_SELL_LONG, BD_SELL_LIFE
+    add_if("BD_BUY_SHORT", "BD_BUY_SHORT")
+    add_if("BD_BUY_SWING", "BD_BUY_SWING")
+    add_if("BD_BUY_LONG",  "BD_BUY_LONG")
+    add_if("BD_BUY_LIFE",  "BD_BUY_LIFE")
+    add_if("BD_SELL_SHORT", "BD_SELL_SHORT")
+    add_if("BD_SELL_SWING", "BD_SELL_SWING")
+    add_if("BD_SELL_LONG",  "BD_SELL_LONG")
+    add_if("BD_SELL_LIFE",  "BD_SELL_LIFE")
+
+    # ===== 1Q 대형주 기존 라우트 호환용 =====
     add_if("BUY_SWING_1Q", "BUY_SWING_1Q")
     add_if("SELL_SWING_1Q", "SELL_SWING_1Q")
     add_if("BUY_LONG_1Q", "BUY_LONG_1Q")
