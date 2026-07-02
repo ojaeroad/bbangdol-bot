@@ -1,5 +1,5 @@
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
-import os, json, logging, time, re, hmac, hashlib, math
+import os, json, logging, time, re, hmac, hashlib, math, threading
 from time import time as now
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlencode
@@ -243,26 +243,35 @@ def routes_dump():
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
         return jsonify({"ok": False, "error": "missing route or msg"}), 400
+
     chat_id = route_to_chat_id(route)
     if not chat_id:
         log.error(f"[DROP] Unknown route={route} (symbol={symbol})")
         return jsonify({"ok": False, "error": "unknown_route"}), 200
+
     bucket = _bucket_key(chat_id, symbol, route, msg)
     msg_norm = safe_text(msg)
+
     if not _can_send_now(bucket):
-        return jsonify({"ok": True, "skipped": "cooldown", "bucket": bucket})
+        return jsonify({"ok": True, "skipped": "cooldown", "bucket": bucket}), 200
+
     if _is_duplicate(bucket, msg_norm):
-        return jsonify({"ok": True, "skipped": "dedup", "bucket": bucket})
-    try:
-        res = post_telegram(chat_id, msg_norm)
-        if not bool(res.get("ok")):
-            log.error(f"TG send failed: {res} (route={route}, symbol={symbol})")
-            return jsonify({"ok": False, "error": "telegram_failed", "detail": res}), 500
-        _mark_sent(bucket)
-        return jsonify({"ok": True})
-    except Exception as e:
-        log.exception("Telegram send exception")
-        return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
+        return jsonify({"ok": True, "skipped": "dedup", "bucket": bucket}), 200
+
+    def _send_telegram_background():
+        try:
+            res = post_telegram(chat_id, msg_norm)
+            if not bool(res.get("ok")):
+                log.error(f"TG send failed: {res} (route={route}, symbol={symbol})")
+                return
+            _mark_sent(bucket)
+            log.info(f"TG sent ok route={route} symbol={symbol}")
+        except Exception:
+            log.exception(f"Telegram send exception route={route} symbol={symbol}")
+
+    threading.Thread(target=_send_telegram_background, daemon=True).start()
+
+    return jsonify({"ok": True, "queued": True}), 200
 
 # --- old endpoint (legacy for 불꽃타점) ---
 @app.post("/bot")
