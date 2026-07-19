@@ -4,7 +4,7 @@ from time import time as now
 from typing import Dict, Any, Optional, Tuple
 from functools import wraps
 from urllib.parse import urlencode
-from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort, Response
 import requests
 
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
@@ -258,6 +258,264 @@ def routes_dump():
     return jsonify({"routes": ROUTE_TO_CHAT})
 
 # --- 회원 운영용 성과 분석 DB 상태 (민감정보는 노출하지 않음) ---
+
+
+# =========================================================
+# 기간별·진입시간봉별 회원 성과 계산
+# =========================================================
+TIMEFRAME_ORDER_MINUTES = {
+    "1m": 1,
+    "3m": 3,
+    "5m": 5,
+    "10m": 10,
+    "15m": 15,
+    "30m": 30,
+    "45m": 45,
+    "1h": 60,
+    "2h": 120,
+    "3h": 180,
+    "4h": 240,
+    "6h": 360,
+    "8h": 480,
+    "12h": 720,
+    "1d": 1440,
+    "3d": 4320,
+    "1w": 10080,
+}
+
+
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    if hasattr(value, "tzinfo"):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _period_start(period_key: str):
+    now = datetime.now(timezone.utc)
+    if period_key == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period_key == "7d":
+        return now - timedelta(days=7)
+    if period_key == "30d":
+        return now - timedelta(days=30)
+    return None
+
+
+def _cycle_in_period(cycle, start_at):
+    if start_at is None:
+        return True
+
+    exit_results = cycle.get("exit_results") or []
+    if not exit_results:
+        return False
+
+    for result in exit_results:
+        exit_time = _parse_iso_datetime(
+            (result.get("exit") or {}).get("time")
+        )
+        if exit_time and exit_time >= start_at:
+            return True
+    return False
+
+
+def _member_symbol_statistics(symbol_data, period_key="all"):
+    start_at = _period_start(period_key)
+    cycles = [
+        cycle
+        for cycle in (symbol_data.get("completed_cycles") or [])
+        if _cycle_in_period(cycle, start_at)
+    ]
+
+    all_returns = []
+    holding_values = []
+    entry_tf_map = {}
+    exit_tf_map = {}
+
+    for cycle in cycles:
+        for result in cycle.get("exit_results") or []:
+            exit_obj = result.get("exit") or {}
+            exit_tf = exit_obj.get("timeframe") or "unknown"
+
+            result_values = []
+
+            max_tf_return = result.get("max_timeframe_return_pct")
+            if max_tf_return is not None:
+                result_values.append(float(max_tf_return))
+
+            all_split_return = result.get("all_split_return_pct")
+            if all_split_return is not None:
+                result_values.append(float(all_split_return))
+
+            max_hold = result.get("max_timeframe_holding_minutes")
+            if max_hold is not None:
+                holding_values.append(float(max_hold))
+
+            for tf_result in result.get("timeframe_split_results") or []:
+                value = tf_result.get("return_pct")
+                if value is None:
+                    continue
+
+                value = float(value)
+                entry_tf = tf_result.get("timeframe") or "unknown"
+                tf_bucket = entry_tf_map.setdefault(
+                    entry_tf,
+                    {
+                        "timeframe": entry_tf,
+                        "timeframe_minutes": TIMEFRAME_ORDER_MINUTES.get(
+                            entry_tf, 999999
+                        ),
+                        "returns": [],
+                        "holding_minutes": [],
+                        "entry_count": 0,
+                    },
+                )
+                tf_bucket["returns"].append(value)
+                tf_bucket["entry_count"] += int(
+                    tf_result.get("entry_count") or 0
+                )
+
+                tf_hold = tf_result.get("holding_minutes")
+                if tf_hold is not None:
+                    tf_bucket["holding_minutes"].append(float(tf_hold))
+
+                result_values.append(value)
+
+            for individual in result.get("individual_results") or []:
+                value = individual.get("return_pct")
+                if value is None:
+                    continue
+                value = float(value)
+                result_values.append(value)
+
+                entry = individual.get("entry") or {}
+                entry_tf = entry.get("timeframe") or "unknown"
+                tf_bucket = entry_tf_map.setdefault(
+                    entry_tf,
+                    {
+                        "timeframe": entry_tf,
+                        "timeframe_minutes": TIMEFRAME_ORDER_MINUTES.get(
+                            entry_tf, 999999
+                        ),
+                        "returns": [],
+                        "holding_minutes": [],
+                        "entry_count": 0,
+                    },
+                )
+                tf_bucket["returns"].append(value)
+                tf_bucket["entry_count"] += 1
+
+                hold = individual.get("holding_minutes")
+                if hold is not None:
+                    tf_bucket["holding_minutes"].append(float(hold))
+
+            if result_values:
+                exit_bucket = exit_tf_map.setdefault(
+                    exit_tf,
+                    {
+                        "timeframe": exit_tf,
+                        "timeframe_minutes": TIMEFRAME_ORDER_MINUTES.get(
+                            exit_tf, 999999
+                        ),
+                        "returns": [],
+                    },
+                )
+                exit_bucket["returns"].extend(result_values)
+                all_returns.extend(result_values)
+
+    def finalize_bucket(bucket):
+        values = bucket.pop("returns", [])
+        holding = bucket.pop("holding_minutes", [])
+        wins = [value for value in values if value > 0]
+        bucket.update(
+            {
+                "result_count": len(values),
+                "win_rate_pct": (
+                    len(wins) / len(values) * 100
+                    if values else None
+                ),
+                "average_return_pct": (
+                    sum(values) / len(values)
+                    if values else None
+                ),
+                "best_return_pct": max(values) if values else None,
+                "worst_return_pct": min(values) if values else None,
+                "average_holding_minutes": (
+                    sum(holding) / len(holding)
+                    if holding else None
+                ),
+            }
+        )
+        return bucket
+
+    entry_timeframes = [
+        finalize_bucket(bucket.copy())
+        for _, bucket in sorted(
+            entry_tf_map.items(),
+            key=lambda item: item[1]["timeframe_minutes"],
+        )
+    ]
+
+    entry_timeframes_1h_plus = [
+        item
+        for item in entry_timeframes
+        if item["timeframe_minutes"] >= 60
+    ]
+
+    exit_timeframes = []
+    for _, bucket in sorted(
+        exit_tf_map.items(),
+        key=lambda item: item[1]["timeframe_minutes"],
+    ):
+        values = bucket.pop("returns", [])
+        wins = [value for value in values if value > 0]
+        bucket.update(
+            {
+                "result_count": len(values),
+                "win_rate_pct": (
+                    len(wins) / len(values) * 100
+                    if values else None
+                ),
+                "average_return_pct": (
+                    sum(values) / len(values)
+                    if values else None
+                ),
+                "best_return_pct": max(values) if values else None,
+                "worst_return_pct": min(values) if values else None,
+            }
+        )
+        exit_timeframes.append(bucket)
+
+    wins = [value for value in all_returns if value > 0]
+
+    return {
+        "has_results": bool(all_returns),
+        "period_key": period_key,
+        "completed_cycle_count": len(cycles),
+        "result_count": len(all_returns),
+        "average_return_pct": (
+            sum(all_returns) / len(all_returns)
+            if all_returns else None
+        ),
+        "best_return_pct": max(all_returns) if all_returns else None,
+        "worst_return_pct": min(all_returns) if all_returns else None,
+        "win_rate_pct": (
+            len(wins) / len(all_returns) * 100
+            if all_returns else None
+        ),
+        "average_holding_minutes": (
+            sum(holding_values) / len(holding_values)
+            if holding_values else None
+        ),
+        "entry_timeframes": entry_timeframes,
+        "entry_timeframes_1h_plus": entry_timeframes_1h_plus,
+        "exit_timeframes": exit_timeframes,
+    }
+
 
 # =========================================================
 # 회원용 / 관리자용 성과 화면 접근 제어
@@ -544,23 +802,46 @@ def performance_member():
             None,
         )
 
+        period_key = request.args.get("period", "all").strip().lower()
+        if period_key not in {"today", "7d", "30d", "all"}:
+            period_key = "all"
+
         ranked_symbols = []
         average_ranking = []
         best_ranking = []
         win_rate_ranking = []
         chart_scale = 1.0
+        market_stats = {
+            "has_results": False,
+            "average_return_pct": None,
+            "best_return_pct": None,
+            "win_rate_pct": None,
+            "average_holding_minutes": None,
+            "result_symbol_count": 0,
+            "result_count": 0,
+        }
 
         if selected:
+            symbol_stats = []
+            for item in selected["symbols"]:
+                stats = _member_symbol_statistics(item, period_key)
+                enriched = dict(item)
+                enriched["member_stats"] = stats
+                symbol_stats.append(enriched)
+
+            selected = dict(selected)
+            selected["symbols"] = symbol_stats
+
             ranked_symbols = [
                 item for item in selected["symbols"]
-                if item["performance_summary"]["has_results"]
+                if item["member_stats"]["has_results"]
             ]
 
             average_ranking = sorted(
                 ranked_symbols,
                 key=lambda item: (
-                    item["performance_summary"]["average_return_pct"]
-                    if item["performance_summary"]["average_return_pct"] is not None
+                    item["member_stats"]["average_return_pct"]
+                    if item["member_stats"]["average_return_pct"] is not None
                     else float("-inf")
                 ),
                 reverse=True,
@@ -569,8 +850,8 @@ def performance_member():
             best_ranking = sorted(
                 ranked_symbols,
                 key=lambda item: (
-                    item["performance_summary"]["best_return_pct"]
-                    if item["performance_summary"]["best_return_pct"] is not None
+                    item["member_stats"]["best_return_pct"]
+                    if item["member_stats"]["best_return_pct"] is not None
                     else float("-inf")
                 ),
                 reverse=True,
@@ -579,20 +860,68 @@ def performance_member():
             win_rate_ranking = sorted(
                 ranked_symbols,
                 key=lambda item: (
-                    item["performance_summary"]["win_rate_pct"]
-                    if item["performance_summary"]["win_rate_pct"] is not None
+                    item["member_stats"]["win_rate_pct"]
+                    if item["member_stats"]["win_rate_pct"] is not None
                     else float("-inf"),
-                    item["performance_summary"]["result_count"],
+                    item["member_stats"]["result_count"],
                 ),
                 reverse=True,
             )[:5]
 
             chart_values = [
-                abs(item["performance_summary"]["average_return_pct"])
+                abs(item["member_stats"]["average_return_pct"])
                 for item in ranked_symbols
-                if item["performance_summary"]["average_return_pct"] is not None
+                if item["member_stats"]["average_return_pct"] is not None
             ]
             chart_scale = max(chart_values) if chart_values else 1.0
+
+            all_market_returns = []
+            market_holding = []
+            for item in ranked_symbols:
+                stats = item["member_stats"]
+                if stats["average_return_pct"] is not None:
+                    all_market_returns.append(stats["average_return_pct"])
+                if stats["average_holding_minutes"] is not None:
+                    market_holding.append(stats["average_holding_minutes"])
+
+            total_results = sum(
+                item["member_stats"]["result_count"]
+                for item in ranked_symbols
+            )
+            weighted_wins = sum(
+                (
+                    item["member_stats"]["win_rate_pct"] / 100
+                    * item["member_stats"]["result_count"]
+                )
+                for item in ranked_symbols
+                if item["member_stats"]["win_rate_pct"] is not None
+            )
+
+            market_stats = {
+                "has_results": bool(ranked_symbols),
+                "average_return_pct": (
+                    sum(all_market_returns) / len(all_market_returns)
+                    if all_market_returns else None
+                ),
+                "best_return_pct": (
+                    max(
+                        item["member_stats"]["best_return_pct"]
+                        for item in ranked_symbols
+                        if item["member_stats"]["best_return_pct"] is not None
+                    )
+                    if ranked_symbols else None
+                ),
+                "win_rate_pct": (
+                    weighted_wins / total_results * 100
+                    if total_results else None
+                ),
+                "average_holding_minutes": (
+                    sum(market_holding) / len(market_holding)
+                    if market_holding else None
+                ),
+                "result_symbol_count": len(ranked_symbols),
+                "result_count": total_results,
+            }
 
         return render_template_string(
             """
@@ -661,10 +990,21 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 <div class="tabs">
 {% for category in data.categories %}
 <a class="{{'active' if category.category_key == selected_category else ''}}"
-href="/performance/member?category={{category.category_key}}">
+href="/performance/member?category={{category.category_key}}&period={{period_key}}">
 {{category.category_label}} · {{category.symbol_count}}종목
 </a>
 {% endfor %}
+</div>
+
+<div class="tabs" style="margin-top:-6px">
+<a class="{{'active' if period_key == 'today' else ''}}"
+href="/performance/member?category={{selected_category}}&period=today">오늘</a>
+<a class="{{'active' if period_key == '7d' else ''}}"
+href="/performance/member?category={{selected_category}}&period=7d">최근 7일</a>
+<a class="{{'active' if period_key == '30d' else ''}}"
+href="/performance/member?category={{selected_category}}&period=30d">최근 30일</a>
+<a class="{{'active' if period_key == 'all' else ''}}"
+href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 
 {% if selected %}
@@ -682,33 +1022,33 @@ href="/performance/member?category={{category.category_key}}">
 <div class="summary">
 <div class="metric">
 <div class="title">평균 수익률</div>
-<div class="value {{'pos' if selected.performance_summary.average_return_pct is not none and selected.performance_summary.average_return_pct >= 0 else 'muted'}}">
-{% if selected.performance_summary.average_return_pct is not none %}
-{{'%.2f'|format(selected.performance_summary.average_return_pct)}}%
+<div class="value {{'pos' if market_stats.average_return_pct is not none and market_stats.average_return_pct >= 0 else 'muted'}}">
+{% if market_stats.average_return_pct is not none %}
+{{'%.2f'|format(market_stats.average_return_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
 </div>
 <div class="metric">
 <div class="title">최고 수익률</div>
-<div class="value {{'pos' if selected.performance_summary.best_return_pct is not none and selected.performance_summary.best_return_pct >= 0 else 'muted'}}">
-{% if selected.performance_summary.best_return_pct is not none %}
-{{'%.2f'|format(selected.performance_summary.best_return_pct)}}%
+<div class="value {{'pos' if market_stats.best_return_pct is not none and market_stats.best_return_pct >= 0 else 'muted'}}">
+{% if market_stats.best_return_pct is not none %}
+{{'%.2f'|format(market_stats.best_return_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
 </div>
 <div class="metric">
 <div class="title">승률</div>
-<div class="value {{'pos' if selected.performance_summary.win_rate_pct is not none and selected.performance_summary.win_rate_pct >= 50 else 'muted'}}">
-{% if selected.performance_summary.win_rate_pct is not none %}
-{{'%.1f'|format(selected.performance_summary.win_rate_pct)}}%
+<div class="value {{'pos' if market_stats.win_rate_pct is not none and market_stats.win_rate_pct >= 50 else 'muted'}}">
+{% if market_stats.win_rate_pct is not none %}
+{{'%.1f'|format(market_stats.win_rate_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
 </div>
 <div class="metric">
 <div class="title">평균 보유시간</div>
 <div class="value">
-{% if selected.performance_summary.average_holding_minutes is not none %}
-{{'%.0f'|format(selected.performance_summary.average_holding_minutes)}}분
+{% if market_stats.average_holding_minutes is not none %}
+{{'%.0f'|format(market_stats.average_holding_minutes)}}분
 {% else %}결과 대기{% endif %}
 </div>
 </div>
@@ -724,7 +1064,7 @@ href="/performance/member?category={{category.category_key}}">
 <div class="rank-row">
 <span class="rank-no">{{loop.index}}</span>
 <span class="rank-symbol">{{s.symbol}}</span>
-<span class="rank-value">{{'%.2f'|format(s.performance_summary.average_return_pct)}}%</span>
+<span class="rank-value">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</span>
 </div>
 {% endfor %}
 </div>
@@ -735,7 +1075,7 @@ href="/performance/member?category={{category.category_key}}">
 <div class="rank-row">
 <span class="rank-no">{{loop.index}}</span>
 <span class="rank-symbol">{{s.symbol}}</span>
-<span class="rank-value">{{'%.2f'|format(s.performance_summary.best_return_pct)}}%</span>
+<span class="rank-value">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
 </div>
 {% endfor %}
 </div>
@@ -746,7 +1086,7 @@ href="/performance/member?category={{category.category_key}}">
 <div class="rank-row">
 <span class="rank-no">{{loop.index}}</span>
 <span class="rank-symbol">{{s.symbol}}</span>
-<span class="rank-value">{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%</span>
+<span class="rank-value">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</span>
 </div>
 {% endfor %}
 </div>
@@ -755,7 +1095,7 @@ href="/performance/member?category={{category.category_key}}">
 <div class="chart-section">
 <h3>종목별 평균수익률 비교</h3>
 {% for s in ranked_symbols|sort(attribute='symbol') %}
-{% set avg = s.performance_summary.average_return_pct %}
+{% set avg = s.member_stats.average_return_pct %}
 <div class="bar-row">
 <div class="bar-name">{{s.symbol}}</div>
 <div class="bar-track">
@@ -766,6 +1106,91 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 </div>
 {% endfor %}
 </div>
+
+<details class="chart-section">
+<summary style="cursor:pointer;font-size:20px;font-weight:bold;color:var(--blue)">
+진입 시간봉별 수익률 전체 보기
+</summary>
+<div style="margin-top:14px">
+{% for s in ranked_symbols|sort(attribute='symbol') %}
+{% if s.member_stats.entry_timeframes %}
+<details style="margin-bottom:9px;background:#141416;border-radius:10px;padding:11px">
+<summary style="cursor:pointer;font-weight:bold">{{s.symbol}}</summary>
+<div style="overflow-x:auto">
+<table style="width:100%;border-collapse:collapse;margin-top:10px;min-width:760px">
+<tr>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">진입 시간봉</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">결과 수</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">승률</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">평균수익</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">최고수익</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">최저수익</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">평균 보유</th>
+</tr>
+{% for stat in s.member_stats.entry_timeframes %}
+<tr>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{stat.timeframe}}</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{stat.result_count}}</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{'%.1f'|format(stat.win_rate_pct)}}%</td>
+<td class="{{'pos' if stat.average_return_pct >= 0 else ''}}" style="padding:8px;border-bottom:1px solid #29292d">{{'%.3f'|format(stat.average_return_pct)}}%</td>
+<td class="{{'pos' if stat.best_return_pct >= 0 else ''}}" style="padding:8px;border-bottom:1px solid #29292d">{{'%.3f'|format(stat.best_return_pct)}}%</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">
+{% if stat.average_holding_minutes is not none %}{{'%.0f'|format(stat.average_holding_minutes)}}분{% else %}-{% endif %}
+</td>
+</tr>
+{% endfor %}
+</table>
+</div>
+</details>
+{% endif %}
+{% endfor %}
+</div>
+</details>
+
+<details class="chart-section">
+<summary style="cursor:pointer;font-size:20px;font-weight:bold;color:var(--blue)">
+1시간봉 이상 진입 성과만 보기
+</summary>
+<div style="margin-top:14px">
+{% set ns = namespace(has_any=false) %}
+{% for s in ranked_symbols|sort(attribute='symbol') %}
+{% if s.member_stats.entry_timeframes_1h_plus %}
+{% set ns.has_any = true %}
+<details style="margin-bottom:9px;background:#141416;border-radius:10px;padding:11px">
+<summary style="cursor:pointer;font-weight:bold">{{s.symbol}}</summary>
+<div style="overflow-x:auto">
+<table style="width:100%;border-collapse:collapse;margin-top:10px;min-width:680px">
+<tr>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">진입 시간봉</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">결과 수</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">승률</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">평균수익</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">최고수익</th>
+<th style="text-align:left;padding:8px;border-bottom:1px solid #333">평균 보유</th>
+</tr>
+{% for stat in s.member_stats.entry_timeframes_1h_plus %}
+<tr>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{stat.timeframe}}</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{stat.result_count}}</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">{{'%.1f'|format(stat.win_rate_pct)}}%</td>
+<td class="{{'pos' if stat.average_return_pct >= 0 else ''}}" style="padding:8px;border-bottom:1px solid #29292d">{{'%.3f'|format(stat.average_return_pct)}}%</td>
+<td class="{{'pos' if stat.best_return_pct >= 0 else ''}}" style="padding:8px;border-bottom:1px solid #29292d">{{'%.3f'|format(stat.best_return_pct)}}%</td>
+<td style="padding:8px;border-bottom:1px solid #29292d">
+{% if stat.average_holding_minutes is not none %}{{'%.0f'|format(stat.average_holding_minutes)}}분{% else %}-{% endif %}
+</td>
+</tr>
+{% endfor %}
+</table>
+</div>
+</details>
+{% endif %}
+{% endfor %}
+{% if not ns.has_any %}
+<div class="notice">선택 기간에는 1시간봉 이상 진입 성과가 아직 없습니다.</div>
+{% endif %}
+</div>
+</details>
 {% endif %}
 
 <div class="symbols">
@@ -773,17 +1198,17 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 <div class="symbol">
 <h3>{{s.symbol}}</h3>
 <div class="values">
-<div class="mini"><span>최고수익</span><b class="{{'pos' if s.performance_summary.best_return_pct is not none and s.performance_summary.best_return_pct >= 0 else 'muted'}}">
-{% if s.performance_summary.best_return_pct is not none %}{{'%.2f'|format(s.performance_summary.best_return_pct)}}%{% else %}대기{% endif %}
+<div class="mini"><span>최고수익</span><b class="{{'pos' if s.member_stats.best_return_pct is not none and s.member_stats.best_return_pct >= 0 else 'muted'}}">
+{% if s.member_stats.best_return_pct is not none %}{{'%.2f'|format(s.member_stats.best_return_pct)}}%{% else %}대기{% endif %}
 </b></div>
-<div class="mini"><span>평균수익</span><b class="{{'pos' if s.performance_summary.average_return_pct is not none and s.performance_summary.average_return_pct >= 0 else 'muted'}}">
-{% if s.performance_summary.average_return_pct is not none %}{{'%.2f'|format(s.performance_summary.average_return_pct)}}%{% else %}대기{% endif %}
+<div class="mini"><span>평균수익</span><b class="{{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'muted'}}">
+{% if s.member_stats.average_return_pct is not none %}{{'%.2f'|format(s.member_stats.average_return_pct)}}%{% else %}대기{% endif %}
 </b></div>
 <div class="mini"><span>승률</span><b>
-{% if s.performance_summary.win_rate_pct is not none %}{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%{% else %}대기{% endif %}
+{% if s.member_stats.win_rate_pct is not none %}{{'%.1f'|format(s.member_stats.win_rate_pct)}}%{% else %}대기{% endif %}
 </b></div>
 <div class="mini"><span>평균 보유</span><b>
-{% if s.performance_summary.average_holding_minutes is not none %}{{'%.0f'|format(s.performance_summary.average_holding_minutes)}}분{% else %}대기{% endif %}
+{% if s.member_stats.average_holding_minutes is not none %}{{'%.0f'|format(s.member_stats.average_holding_minutes)}}분{% else %}대기{% endif %}
 </b></div>
 </div>
 </div>
@@ -809,10 +1234,102 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
             best_ranking=best_ranking,
             win_rate_ranking=win_rate_ranking,
             chart_scale=chart_scale,
+            period_key=period_key,
+            market_stats=market_stats,
         ), 200
 
     except Exception as exc:
         log.exception("Member performance dashboard failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+
+@app.get("/performance/export.csv")
+@admin_required
+def performance_export_csv():
+    try:
+        period_key = request.args.get("period", "all").strip().lower()
+        if period_key not in {"today", "7d", "30d", "all"}:
+            period_key = "all"
+
+        category_key = request.args.get("category", "COIN").strip().upper()
+        if category_key not in {"COIN", "KOREA_1Q", "US_1Q"}:
+            category_key = "COIN"
+
+        data = visual_cycle_data(1000)
+        category = next(
+            (
+                item for item in data["categories"]
+                if item["category_key"] == category_key
+            ),
+            None,
+        )
+
+        output = io.StringIO()
+        output.write("\ufeff")
+        writer = csv.writer(output)
+        writer.writerow(
+            [
+                "카테고리",
+                "종목",
+                "기간",
+                "진입 시간봉",
+                "결과 수",
+                "승률(%)",
+                "평균수익률(%)",
+                "최고수익률(%)",
+                "최저수익률(%)",
+                "평균보유시간(분)",
+            ]
+        )
+
+        if category:
+            for symbol in category["symbols"]:
+                stats = _member_symbol_statistics(symbol, period_key)
+                for row in stats["entry_timeframes"]:
+                    writer.writerow(
+                        [
+                            category["category_label"],
+                            symbol["symbol"],
+                            period_key,
+                            row["timeframe"],
+                            row["result_count"],
+                            (
+                                round(row["win_rate_pct"], 4)
+                                if row["win_rate_pct"] is not None else ""
+                            ),
+                            (
+                                round(row["average_return_pct"], 6)
+                                if row["average_return_pct"] is not None else ""
+                            ),
+                            (
+                                round(row["best_return_pct"], 6)
+                                if row["best_return_pct"] is not None else ""
+                            ),
+                            (
+                                round(row["worst_return_pct"], 6)
+                                if row["worst_return_pct"] is not None else ""
+                            ),
+                            (
+                                round(row["average_holding_minutes"], 2)
+                                if row["average_holding_minutes"] is not None else ""
+                            ),
+                        ]
+                    )
+
+        filename = (
+            f"performance_{category_key}_{period_key}_"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            },
+        )
+    except Exception as exc:
+        log.exception("Performance CSV export failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
@@ -919,6 +1436,7 @@ summary{cursor:pointer;font-weight:bold}
 <a href="/performance/analyze">분석 실행</a> ·
 <a href="/performance/cycles">사이클 JSON</a> ·
 <a href="/performance/member">회원 화면 미리보기</a> ·
+<a href="/performance/export.csv?category={{selected_category}}&period=all">CSV 다운로드</a> ·
 <a href="/performance/logout">로그아웃</a>
 <span style="margin-left:10px;color:#ffbf69;font-weight:bold">관리자 전용</span>
 </div>
@@ -948,33 +1466,33 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="market-performance">
 <div class="metric">
 <div class="title">시장 평균수익</div>
-<div class="value {{'pos' if selected.performance_summary.average_return_pct is not none and selected.performance_summary.average_return_pct >= 0 else 'muted'}}">
-{% if selected.performance_summary.average_return_pct is not none %}
-{{'%.2f'|format(selected.performance_summary.average_return_pct)}}%
+<div class="value {{'pos' if market_stats.average_return_pct is not none and market_stats.average_return_pct >= 0 else 'muted'}}">
+{% if market_stats.average_return_pct is not none %}
+{{'%.2f'|format(market_stats.average_return_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
 </div>
 <div class="metric">
 <div class="title">시장 최고수익</div>
-<div class="value {{'pos' if selected.performance_summary.best_return_pct is not none and selected.performance_summary.best_return_pct >= 0 else 'muted'}}">
-{% if selected.performance_summary.best_return_pct is not none %}
-{{'%.2f'|format(selected.performance_summary.best_return_pct)}}%
+<div class="value {{'pos' if market_stats.best_return_pct is not none and market_stats.best_return_pct >= 0 else 'muted'}}">
+{% if market_stats.best_return_pct is not none %}
+{{'%.2f'|format(market_stats.best_return_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
 </div>
 <div class="metric">
 <div class="title">평균 보유시간</div>
 <div class="value">
-{% if selected.performance_summary.average_holding_minutes is not none %}
-{{'%.0f'|format(selected.performance_summary.average_holding_minutes)}}분
+{% if market_stats.average_holding_minutes is not none %}
+{{'%.0f'|format(market_stats.average_holding_minutes)}}분
 {% else %}결과 대기{% endif %}
 </div>
 </div>
 <div class="metric">
 <div class="title">시장 승률</div>
-<div class="value {{'pos' if selected.performance_summary.win_rate_pct is not none and selected.performance_summary.win_rate_pct >= 50 else 'neg'}}">
-{% if selected.performance_summary.win_rate_pct is not none %}
-{{'%.1f'|format(selected.performance_summary.win_rate_pct)}}%
+<div class="value {{'pos' if market_stats.win_rate_pct is not none and market_stats.win_rate_pct >= 50 else 'neg'}}">
+{% if market_stats.win_rate_pct is not none %}
+{{'%.1f'|format(market_stats.win_rate_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
 </div>
@@ -999,33 +1517,33 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="symbol-result-grid">
 <div class="symbol-result">
 <div class="label">최고수익</div>
-<div class="number {{'pos' if s.performance_summary.best_return_pct is not none and s.performance_summary.best_return_pct >= 0 else 'muted'}}">
-{% if s.performance_summary.best_return_pct is not none %}
-{{'%.2f'|format(s.performance_summary.best_return_pct)}}%
+<div class="number {{'pos' if s.member_stats.best_return_pct is not none and s.member_stats.best_return_pct >= 0 else 'muted'}}">
+{% if s.member_stats.best_return_pct is not none %}
+{{'%.2f'|format(s.member_stats.best_return_pct)}}%
 {% else %}대기{% endif %}
 </div>
 </div>
 <div class="symbol-result">
 <div class="label">평균수익</div>
-<div class="number {{'pos' if s.performance_summary.average_return_pct is not none and s.performance_summary.average_return_pct >= 0 else 'muted'}}">
-{% if s.performance_summary.average_return_pct is not none %}
-{{'%.2f'|format(s.performance_summary.average_return_pct)}}%
+<div class="number {{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'muted'}}">
+{% if s.member_stats.average_return_pct is not none %}
+{{'%.2f'|format(s.member_stats.average_return_pct)}}%
 {% else %}대기{% endif %}
 </div>
 </div>
 <div class="symbol-result">
 <div class="label">평균 보유</div>
 <div class="number">
-{% if s.performance_summary.average_holding_minutes is not none %}
-{{'%.0f'|format(s.performance_summary.average_holding_minutes)}}분
+{% if s.member_stats.average_holding_minutes is not none %}
+{{'%.0f'|format(s.member_stats.average_holding_minutes)}}분
 {% else %}대기{% endif %}
 </div>
 </div>
 <div class="symbol-result">
 <div class="label">승률</div>
-<div class="number {{'pos' if s.performance_summary.win_rate_pct is not none and s.performance_summary.win_rate_pct >= 50 else 'neg'}}">
-{% if s.performance_summary.win_rate_pct is not none %}
-{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%
+<div class="number {{'pos' if s.member_stats.win_rate_pct is not none and s.member_stats.win_rate_pct >= 50 else 'neg'}}">
+{% if s.member_stats.win_rate_pct is not none %}
+{{'%.1f'|format(s.member_stats.win_rate_pct)}}%
 {% else %}대기{% endif %}
 </div>
 </div>
@@ -1056,15 +1574,15 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="grid">
 <div class="metric">
 <div class="title">종목 승률</div>
-<div class="value {{'pos' if s.performance_summary.win_rate_pct >= 50 else 'neg'}}">
-{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%
+<div class="value {{'pos' if s.member_stats.win_rate_pct >= 50 else 'neg'}}">
+{{'%.1f'|format(s.member_stats.win_rate_pct)}}%
 </div>
 <div class="small">승 {{s.performance_summary.win_count}} · 패 {{s.performance_summary.loss_count}}</div>
 </div>
 <div class="metric">
 <div class="title">최고 / 최저 수익</div>
 <div class="value">
-<span class="pos">{{'%.2f'|format(s.performance_summary.best_return_pct)}}%</span>
+<span class="pos">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
 <span class="small"> / </span>
 <span class="{{'pos' if s.performance_summary.worst_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.performance_summary.worst_return_pct)}}%</span>
 </div>
