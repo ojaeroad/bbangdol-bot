@@ -271,7 +271,7 @@ def performance_latest():
 
 
 # --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 청산 ---
-@app.post("/performance/analyze")
+@app.route("/performance/analyze", methods=["GET", "POST"])
 def performance_analyze():
     try:
         return jsonify(rebuild_individual_pairs()), 200
