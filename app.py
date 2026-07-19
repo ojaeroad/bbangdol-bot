@@ -8,6 +8,7 @@ import requests
 
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import queue_signal_save, health_summary, latest_signals
+from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -252,19 +253,52 @@ def performance_health():
         log.exception("Performance health check failed")
         return jsonify({"ok": False, "database": "error", "error": str(e)}), 503
 
+
+
+# --- 최근 저장 신호 확인 ---
 @app.get("/performance/latest")
 def performance_latest():
     try:
-        limit_raw = request.args.get("limit", "20")
         try:
-            limit = int(limit_raw)
+            limit = int(request.args.get("limit", "20"))
         except ValueError:
             limit = 20
         rows = latest_signals(limit)
         return jsonify({"ok": True, "count": len(rows), "signals": rows}), 200
     except Exception as e:
-        log.exception("Performance latest query failed")
-        return jsonify({"ok": False, "error": str(e)}), 503
+        log.exception("Performance latest signals failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 청산 ---
+@app.post("/performance/analyze")
+def performance_analyze():
+    try:
+        return jsonify(rebuild_individual_pairs()), 200
+    except Exception as e:
+        log.exception("Performance analysis failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/performance/analysis/summary")
+def performance_analysis_summary():
+    try:
+        return jsonify(analysis_summary()), 200
+    except Exception as e:
+        log.exception("Performance analysis summary failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/performance/analysis/latest")
+def performance_analysis_latest():
+    try:
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        rows = latest_analysis_pairs(limit)
+        return jsonify({"ok": True, "count": len(rows), "pairs": rows}), 200
+    except Exception as e:
+        log.exception("Performance latest analysis failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
