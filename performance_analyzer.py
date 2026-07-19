@@ -245,8 +245,11 @@ def _scenario_entries(cycle: dict[str, Any]) -> list[dict[str, Any]]:
     valid_tf = [e for e in entries if e["timeframe_minutes"] is not None]
     if valid_tf:
         max_minutes = max(e["timeframe_minutes"] for e in valid_tf)
-        max_entries = [e for e in valid_tf if e["timeframe_minutes"] == max_minutes]
-        chosen = max_entries[0]
+        max_entries = [
+            e for e in valid_tf
+            if e["timeframe_minutes"] == max_minutes
+        ]
+        chosen = max_entries[-1]
 
         scenarios.append(
             {
@@ -620,10 +623,14 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             return None
 
         valid_tf = [e for e in entries if e["timeframe_minutes"] is not None]
-        max_entry = (
-            max(valid_tf, key=lambda e: e["timeframe_minutes"])
-            if valid_tf else entries[-1]
-        )
+        if valid_tf:
+            max_minutes = max(e["timeframe_minutes"] for e in valid_tf)
+            max_entry = [
+                e for e in valid_tf
+                if e["timeframe_minutes"] == max_minutes
+            ][-1]
+        else:
+            max_entry = entries[-1]
         all_split_price = _weighted_average([e["price"] for e in entries])
 
         by_tf: dict[tuple[str, int | None], list[dict[str, Any]]] = defaultdict(list)
@@ -710,10 +717,21 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             preview = entry_preview(cycle_entries)
             assert preview is not None
 
-            max_entry = max(
-                cycle_entries,
-                key=lambda e: e["timeframe_minutes"] or -1,
-            )
+            valid_cycle_entries = [
+                e for e in cycle_entries
+                if e["timeframe_minutes"] is not None
+            ]
+            if valid_cycle_entries:
+                max_minutes = max(
+                    e["timeframe_minutes"]
+                    for e in valid_cycle_entries
+                )
+                max_entry = [
+                    e for e in valid_cycle_entries
+                    if e["timeframe_minutes"] == max_minutes
+                ][-1]
+            else:
+                max_entry = cycle_entries[-1]
             all_split_price = _weighted_average(
                 [e["price"] for e in cycle_entries]
             )
@@ -874,7 +892,9 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             item for item in limited_symbols
             if item["category_key"] == category_key
         ]
-        if not category_symbols:
+
+        # 코인·국장·미장은 데이터가 0건이어도 항상 표시한다.
+        if category_key == "OTHER" and not category_symbols:
             continue
 
         categories.append(

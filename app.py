@@ -376,6 +376,15 @@ summary{cursor:pointer;font-weight:bold}
 </div>
 </div>
 
+{% if category.symbol_count == 0 %}
+<div class="card">
+<div class="empty-note">
+현재 저장된 {{category.category_label}} 신호가 없습니다.<br>
+해당 1Q TradingView 알람이 웹훅으로 들어오면 종목과 성과가 자동 표시됩니다.
+</div>
+</div>
+{% endif %}
+
 {% for s in category.symbols %}
 <div class="card">
 <h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
@@ -408,7 +417,7 @@ summary{cursor:pointer;font-weight:bold}
 </div>
 </div>
 
-<details open>
+<details>
 <summary>시간봉별 분할진입 평균가</summary>
 <table>
 <tr><th>시간봉</th><th>진입 횟수</th><th>평균 진입가</th><th>마지막 진입 시각</th></tr>
