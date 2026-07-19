@@ -2,8 +2,9 @@
 import os, json, logging, time, re, hmac, hashlib, math, threading
 from time import time as now
 from typing import Dict, Any, Optional, Tuple
+from functools import wraps
 from urllib.parse import urlencode
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort
 import requests
 
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
@@ -11,6 +12,19 @@ from performance_store import queue_signal_save, health_summary, latest_signals
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 
 app = Flask(__name__)
+app.secret_key = os.getenv("PERFORMANCE_SESSION_SECRET", "").strip()
+if not app.secret_key:
+    # Render 환경변수가 아직 없을 때 서버가 죽지는 않게 하되,
+    # 반드시 PERFORMANCE_SESSION_SECRET을 등록해야 한다.
+    app.secret_key = "CHANGE-ME-PERFORMANCE-SESSION-SECRET"
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
+)
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
 
@@ -244,7 +258,205 @@ def routes_dump():
     return jsonify({"routes": ROUTE_TO_CHAT})
 
 # --- 회원 운영용 성과 분석 DB 상태 (민감정보는 노출하지 않음) ---
+
+# =========================================================
+# 회원용 / 관리자용 성과 화면 접근 제어
+# =========================================================
+PERFORMANCE_ADMIN_USERNAME = os.getenv(
+    "PERFORMANCE_ADMIN_USERNAME", "admin"
+).strip()
+PERFORMANCE_ADMIN_PASSWORD = os.getenv(
+    "PERFORMANCE_ADMIN_PASSWORD", ""
+).strip()
+PERFORMANCE_MEMBER_PASSWORD = os.getenv(
+    "PERFORMANCE_MEMBER_PASSWORD", ""
+).strip()
+
+
+def _safe_equals(left: str, right: str) -> bool:
+    return hmac.compare_digest(
+        str(left or "").encode("utf-8"),
+        str(right or "").encode("utf-8"),
+    )
+
+
+def _performance_role() -> str | None:
+    role = session.get("performance_role")
+    return role if role in {"admin", "member"} else None
+
+
+def admin_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if _performance_role() != "admin":
+            return redirect(
+                url_for(
+                    "performance_login",
+                    role="admin",
+                    next=request.full_path.rstrip("?"),
+                )
+            )
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+def member_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if _performance_role() not in {"admin", "member"}:
+            return redirect(
+                url_for(
+                    "performance_login",
+                    role="member",
+                    next=request.full_path.rstrip("?"),
+                )
+            )
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+def _safe_next_url(value: str | None, fallback: str) -> str:
+    value = (value or "").strip()
+    if value.startswith("/performance/") and not value.startswith("//"):
+        return value
+    return fallback
+
+
+@app.route("/performance/login", methods=["GET", "POST"])
+def performance_login():
+    requested_role = request.args.get("role", "member").strip().lower()
+    if requested_role not in {"member", "admin"}:
+        requested_role = "member"
+
+    error = ""
+    if request.method == "POST":
+        requested_role = request.form.get("role", requested_role).strip().lower()
+        password = request.form.get("password", "")
+        username = request.form.get("username", "").strip()
+
+        if requested_role == "admin":
+            configured = bool(
+                PERFORMANCE_ADMIN_USERNAME
+                and PERFORMANCE_ADMIN_PASSWORD
+            )
+            valid = (
+                configured
+                and _safe_equals(username, PERFORMANCE_ADMIN_USERNAME)
+                and _safe_equals(password, PERFORMANCE_ADMIN_PASSWORD)
+            )
+        else:
+            configured = bool(PERFORMANCE_MEMBER_PASSWORD)
+            valid = (
+                configured
+                and _safe_equals(password, PERFORMANCE_MEMBER_PASSWORD)
+            )
+
+        if valid:
+            session.clear()
+            session.permanent = True
+            session["performance_role"] = requested_role
+            target = _safe_next_url(
+                request.form.get("next"),
+                (
+                    "/performance/dashboard"
+                    if requested_role == "admin"
+                    else "/performance/member"
+                ),
+            )
+            return redirect(target)
+
+        error = (
+            "로그인 정보가 올바르지 않습니다."
+            if configured
+            else "Render 환경변수에 비밀번호가 아직 등록되지 않았습니다."
+        )
+
+    next_url = _safe_next_url(
+        request.args.get("next"),
+        (
+            "/performance/dashboard"
+            if requested_role == "admin"
+            else "/performance/member"
+        ),
+    )
+
+    return render_template_string(
+        """
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{"관리자" if role == "admin" else "회원"}} 로그인</title>
+<style>
+body{margin:0;background:#0d0d0f;color:#f4f4f4;font-family:Arial,"Noto Sans KR",sans-serif}
+.wrap{max-width:430px;margin:9vh auto;padding:22px}
+.box{background:#1b1b1e;border:1px solid #38383c;border-radius:18px;padding:26px}
+h1{font-size:28px;margin:0 0 8px}
+p{color:#aaa;margin:0 0 22px}
+label{display:block;color:#8bd0ff;font-weight:bold;margin:15px 0 7px}
+input{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;border:1px solid #444;background:#111;color:#fff;font-size:16px}
+button{width:100%;margin-top:20px;padding:13px;border:0;border-radius:10px;background:#2c91c9;color:#fff;font-size:17px;font-weight:bold;cursor:pointer}
+.error{background:#431f25;color:#ffb4bd;border-radius:9px;padding:11px;margin-bottom:12px}
+.switch{text-align:center;margin-top:18px}.switch a{color:#70cfff}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="box">
+<h1>{{"관리자 전용 로그인" if role == "admin" else "회원 전용 로그인"}}</h1>
+<p>
+{% if role == "admin" %}
+분석 실행, 원본 신호, 사이클 및 관리자 상세 자료에 접근합니다.
+{% else %}
+회원에게 공개된 성과 요약 화면에 접근합니다.
+{% endif %}
+</p>
+{% if error %}<div class="error">{{error}}</div>{% endif %}
+<form method="post">
+<input type="hidden" name="role" value="{{role}}">
+<input type="hidden" name="next" value="{{next_url}}">
+{% if role == "admin" %}
+<label>관리자 아이디</label>
+<input name="username" autocomplete="username" required>
+{% endif %}
+<label>비밀번호</label>
+<input type="password" name="password" autocomplete="current-password" required>
+<button type="submit">로그인</button>
+</form>
+<div class="switch">
+{% if role == "admin" %}
+<a href="/performance/login?role=member">회원 로그인으로</a>
+{% else %}
+<a href="/performance/login?role=admin">관리자 로그인으로</a>
+{% endif %}
+</div>
+</div></div>
+</body>
+</html>
+        """,
+        role=requested_role,
+        next_url=next_url,
+        error=error,
+    )
+
+
+@app.get("/performance/logout")
+def performance_logout():
+    session.clear()
+    return redirect(url_for("performance_login", role="member"))
+
+
+@app.get("/performance")
+def performance_home():
+    if _performance_role() == "admin":
+        return redirect("/performance/dashboard")
+    if _performance_role() == "member":
+        return redirect("/performance/member")
+    return redirect("/performance/login?role=member")
+
+
 @app.get("/performance/health")
+@admin_required
 def performance_health():
     try:
         result = health_summary()
@@ -257,6 +469,7 @@ def performance_health():
 
 # --- 최근 저장 신호 확인 ---
 @app.get("/performance/latest")
+@admin_required
 def performance_latest():
     try:
         try:
@@ -272,6 +485,7 @@ def performance_latest():
 
 # --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 청산 ---
 @app.route("/performance/analyze", methods=["GET", "POST"])
+@admin_required
 def performance_analyze():
     try:
         return jsonify(rebuild_individual_pairs()), 200
@@ -301,7 +515,182 @@ def performance_analysis_latest():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+
+@app.get("/performance/member")
+@member_required
+def performance_member():
+    try:
+        try:
+            limit = int(request.args.get("limit", "100"))
+        except ValueError:
+            limit = 100
+
+        selected_category = (
+            request.args.get("category", "COIN")
+            .strip()
+            .upper()
+        )
+        allowed_categories = {"COIN", "KOREA_1Q", "US_1Q"}
+        if selected_category not in allowed_categories:
+            selected_category = "COIN"
+
+        data = visual_cycle_data(limit)
+        selected = next(
+            (
+                category
+                for category in data["categories"]
+                if category["category_key"] == selected_category
+            ),
+            None,
+        )
+
+        return render_template_string(
+            """
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>회원 성과 리포트</title>
+<style>
+:root{--bg:#0e0e0f;--card:#1b1b1d;--line:#353539;--blue:#7ed2ff;--green:#55e69a;--yellow:#ffc857;--red:#ff7878}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:#f5f5f5;font-family:Arial,"Noto Sans KR",sans-serif;padding:20px}
+.header{display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap;margin-bottom:18px}
+h1{margin:0;font-size:32px}.logout{color:#aaa}
+.tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}
+.tabs a{padding:10px 15px;border:1px solid #404045;background:#242427;color:#75ceff;border-radius:999px;text-decoration:none}
+.tabs a.active{background:#14405b;border-color:#67c8ff;color:#fff;font-weight:bold}
+.market{background:#171719;border:1px solid #303034;border-left:5px solid var(--blue);border-radius:14px;padding:18px;margin-bottom:14px}
+.market-head{display:flex;justify-content:space-between;gap:15px;align-items:center;flex-wrap:wrap}
+.market h2{font-size:27px;margin:0}.badges{display:flex;gap:8px;flex-wrap:wrap}
+.badge{background:#29292c;border-radius:999px;padding:8px 12px}
+.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0 20px}
+.metric,.symbol{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.title{color:var(--blue);font-weight:bold;margin-bottom:8px}.value{font-size:25px;font-weight:bold}
+.pos{color:var(--green)}.warn{color:var(--yellow)}.muted{color:#aaa}
+.symbols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:13px}
+.symbol h3{font-size:24px;margin:0 0 13px}
+.values{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+.mini{background:#121214;border-radius:9px;padding:10px}
+.mini span{display:block;color:#aaa;font-size:12px;margin-bottom:5px}.mini b{font-size:18px}
+.notice{background:#1b1b1d;border:1px solid var(--line);border-radius:14px;padding:22px;color:#aaa}
+.disclaimer{margin-top:22px;color:#777;font-size:13px;line-height:1.5}
+@media(max-width:950px){.summary{grid-template-columns:repeat(2,1fr)}.values{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}}
+</style>
+</head>
+<body>
+<div class="header">
+<div>
+<h1>회원용 성과 리포트</h1>
+<div class="muted">공개용 요약 화면</div>
+</div>
+<a class="logout" href="/performance/logout">로그아웃</a>
+</div>
+
+<div class="tabs">
+{% for category in data.categories %}
+<a class="{{'active' if category.category_key == selected_category else ''}}"
+href="/performance/member?category={{category.category_key}}">
+{{category.category_label}} · {{category.symbol_count}}종목
+</a>
+{% endfor %}
+</div>
+
+{% if selected %}
+<div class="market">
+<div class="market-head">
+<h2>{{selected.category_label}}</h2>
+<div class="badges">
+<span class="badge">종목 {{selected.symbol_count}}</span>
+<span class="badge pos">완료 {{selected.completed_cycle_count}}</span>
+<span class="badge warn">청산 대기 {{selected.open_low_count}}</span>
+</div>
+</div>
+</div>
+
+<div class="summary">
+<div class="metric">
+<div class="title">평균 수익률</div>
+<div class="value {{'pos' if selected.performance_summary.average_return_pct is not none and selected.performance_summary.average_return_pct >= 0 else 'muted'}}">
+{% if selected.performance_summary.average_return_pct is not none %}
+{{'%.2f'|format(selected.performance_summary.average_return_pct)}}%
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+<div class="metric">
+<div class="title">최고 수익률</div>
+<div class="value {{'pos' if selected.performance_summary.best_return_pct is not none and selected.performance_summary.best_return_pct >= 0 else 'muted'}}">
+{% if selected.performance_summary.best_return_pct is not none %}
+{{'%.2f'|format(selected.performance_summary.best_return_pct)}}%
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+<div class="metric">
+<div class="title">승률</div>
+<div class="value {{'pos' if selected.performance_summary.win_rate_pct is not none and selected.performance_summary.win_rate_pct >= 50 else 'muted'}}">
+{% if selected.performance_summary.win_rate_pct is not none %}
+{{'%.1f'|format(selected.performance_summary.win_rate_pct)}}%
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+<div class="metric">
+<div class="title">평균 보유시간</div>
+<div class="value">
+{% if selected.performance_summary.average_holding_minutes is not none %}
+{{'%.0f'|format(selected.performance_summary.average_holding_minutes)}}분
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+</div>
+
+{% if selected.symbol_count %}
+<div class="symbols">
+{% for s in selected.symbols %}
+<div class="symbol">
+<h3>{{s.symbol}}</h3>
+<div class="values">
+<div class="mini"><span>최고수익</span><b class="{{'pos' if s.performance_summary.best_return_pct is not none and s.performance_summary.best_return_pct >= 0 else 'muted'}}">
+{% if s.performance_summary.best_return_pct is not none %}{{'%.2f'|format(s.performance_summary.best_return_pct)}}%{% else %}대기{% endif %}
+</b></div>
+<div class="mini"><span>평균수익</span><b class="{{'pos' if s.performance_summary.average_return_pct is not none and s.performance_summary.average_return_pct >= 0 else 'muted'}}">
+{% if s.performance_summary.average_return_pct is not none %}{{'%.2f'|format(s.performance_summary.average_return_pct)}}%{% else %}대기{% endif %}
+</b></div>
+<div class="mini"><span>승률</span><b>
+{% if s.performance_summary.win_rate_pct is not none %}{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%{% else %}대기{% endif %}
+</b></div>
+<div class="mini"><span>평균 보유</span><b>
+{% if s.performance_summary.average_holding_minutes is not none %}{{'%.0f'|format(s.performance_summary.average_holding_minutes)}}분{% else %}대기{% endif %}
+</b></div>
+</div>
+</div>
+{% endfor %}
+</div>
+{% else %}
+<div class="notice">현재 수집된 해당 시장 신호가 없습니다.</div>
+{% endif %}
+{% endif %}
+
+<div class="disclaimer">
+표시 수익률은 저장된 알람 신호를 가정 진입·청산 방식으로 계산한 통계이며,
+실제 체결가격·수수료·슬리피지·세금은 반영되지 않을 수 있습니다.
+</div>
+</body>
+</html>
+            """,
+            data=data,
+            selected=selected,
+            selected_category=selected_category,
+        ), 200
+
+    except Exception as exc:
+        log.exception("Member performance dashboard failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.get("/performance/dashboard")
+@admin_required
 def performance_dashboard():
     try:
         try:
@@ -401,7 +790,10 @@ summary{cursor:pointer;font-weight:bold}
 <a href="/performance/health">DB 상태</a> ·
 <a href="/performance/latest">최근 신호</a> ·
 <a href="/performance/analyze">분석 실행</a> ·
-<a href="/performance/cycles">사이클 JSON</a>
+<a href="/performance/cycles">사이클 JSON</a> ·
+<a href="/performance/member">회원 화면 미리보기</a> ·
+<a href="/performance/logout">로그아웃</a>
+<span style="margin-left:10px;color:#ffbf69;font-weight:bold">관리자 전용</span>
 </div>
 
 <div class="category-nav">
@@ -789,6 +1181,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 @app.get("/performance/cycles")
+@admin_required
 def performance_cycles_json():
     try:
         try:
