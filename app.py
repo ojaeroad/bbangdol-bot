@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 import requests
 
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
-from performance_store import queue_signal_save, health_summary
+from performance_store import queue_signal_save, health_summary, latest_signals
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -251,6 +251,20 @@ def performance_health():
     except Exception as e:
         log.exception("Performance health check failed")
         return jsonify({"ok": False, "database": "error", "error": str(e)}), 503
+
+@app.get("/performance/latest")
+def performance_latest():
+    try:
+        limit_raw = request.args.get("limit", "20")
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            limit = 20
+        rows = latest_signals(limit)
+        return jsonify({"ok": True, "count": len(rows), "signals": rows}), 200
+    except Exception as e:
+        log.exception("Performance latest query failed")
+        return jsonify({"ok": False, "error": str(e)}), 503
 
 # --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
