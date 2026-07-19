@@ -328,6 +328,22 @@ def performance_dashboard():
             None,
         )
 
+        selected_symbol_name = (
+            request.args.get("symbol", "")
+            .strip()
+            .upper()
+        )
+        selected_symbol = None
+        if selected and selected_symbol_name:
+            selected_symbol = next(
+                (
+                    item
+                    for item in selected["symbols"]
+                    if item["symbol"].upper() == selected_symbol_name
+                ),
+                None,
+            )
+
         return render_template_string("""
 <!doctype html>
 <html lang="ko">
@@ -362,6 +378,19 @@ summary{cursor:pointer;font-weight:bold}
 .category-head h2{margin:0}
 .category-summary{display:flex;gap:9px;flex-wrap:wrap}
 .empty-note{color:#999;padding:14px 0}
+.market-performance{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0 20px}
+.symbol-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}
+.symbol-card{display:block;background:#1b1b1d;border:1px solid #343438;border-radius:14px;padding:16px;text-decoration:none;color:#f4f4f4}
+.symbol-card:hover{border-color:#69c9ff;transform:translateY(-1px)}
+.symbol-card-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.symbol-name{font-size:24px;font-weight:bold}
+.symbol-result-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.symbol-result{background:#131315;border-radius:9px;padding:10px}
+.symbol-result .label{font-size:12px;color:#aaa;margin-bottom:5px}
+.symbol-result .number{font-size:18px;font-weight:bold}
+.back-link{display:inline-block;margin:4px 0 14px;padding:8px 12px;border-radius:999px;background:#242427;text-decoration:none}
+@media(max-width:900px){.market-performance{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:650px){.market-performance,.symbol-result-grid{grid-template-columns:1fr}}
 @media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:10px}h1{font-size:27px}}
 </style>
 </head>
@@ -391,22 +420,91 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <h2>{{selected.category_label}}</h2>
 <div class="category-summary">
 <span class="badge">종목 {{selected.symbol_count}}</span>
-<span class="badge">신호 {{selected.signal_count}}</span>
 <span class="badge ok">완료 Cycle {{selected.completed_cycle_count}}</span>
 <span class="badge warn">청산 대기 {{selected.open_low_count}}</span>
 </div>
 </div>
 
-{% if selected.symbol_count == 0 %}
-<div class="card">
-<div class="empty-note">
-현재 저장된 {{selected.category_label}} 신호가 없습니다.<br>
-해당 1Q TradingView 알람이 웹훅으로 들어오면 종목과 성과가 자동 표시됩니다.
+<div class="market-performance">
+<div class="metric">
+<div class="title">시장 평균수익</div>
+<div class="value {{'pos' if selected.performance_summary.average_return_pct is not none and selected.performance_summary.average_return_pct >= 0 else 'muted'}}">
+{% if selected.performance_summary.average_return_pct is not none %}
+{{'%.2f'|format(selected.performance_summary.average_return_pct)}}%
+{% else %}결과 대기{% endif %}
 </div>
 </div>
-{% endif %}
+<div class="metric">
+<div class="title">시장 최고수익</div>
+<div class="value {{'pos' if selected.performance_summary.best_return_pct is not none and selected.performance_summary.best_return_pct >= 0 else 'muted'}}">
+{% if selected.performance_summary.best_return_pct is not none %}
+{{'%.2f'|format(selected.performance_summary.best_return_pct)}}%
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+<div class="metric">
+<div class="title">평균 보유시간</div>
+<div class="value">
+{% if selected.performance_summary.average_holding_minutes is not none %}
+{{'%.0f'|format(selected.performance_summary.average_holding_minutes)}}분
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+<div class="metric">
+<div class="title">성과 발생 종목</div>
+<div class="value">{{selected.performance_summary.result_symbol_count}} / {{selected.symbol_count}}</div>
+</div>
+</div>
 
+{% if selected.symbol_count == 0 %}
+<div class="card"><div class="empty-note">
+현재 저장된 {{selected.category_label}} 신호가 없습니다.
+</div></div>
+{% elif not selected_symbol %}
+<div class="symbol-list">
 {% for s in selected.symbols %}
+<a class="symbol-card" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}">
+<div class="symbol-card-head">
+<div class="symbol-name">{{s.symbol}}</div>
+<div class="small">{{s.strategy}} / {{s.exchange}}</div>
+</div>
+<div class="symbol-result-grid">
+<div class="symbol-result">
+<div class="label">최고수익</div>
+<div class="number {{'pos' if s.performance_summary.best_return_pct is not none and s.performance_summary.best_return_pct >= 0 else 'muted'}}">
+{% if s.performance_summary.best_return_pct is not none %}
+{{'%.2f'|format(s.performance_summary.best_return_pct)}}%
+{% else %}대기{% endif %}
+</div>
+</div>
+<div class="symbol-result">
+<div class="label">평균수익</div>
+<div class="number {{'pos' if s.performance_summary.average_return_pct is not none and s.performance_summary.average_return_pct >= 0 else 'muted'}}">
+{% if s.performance_summary.average_return_pct is not none %}
+{{'%.2f'|format(s.performance_summary.average_return_pct)}}%
+{% else %}대기{% endif %}
+</div>
+</div>
+<div class="symbol-result">
+<div class="label">평균 보유</div>
+<div class="number">
+{% if s.performance_summary.average_holding_minutes is not none %}
+{{'%.0f'|format(s.performance_summary.average_holding_minutes)}}분
+{% else %}대기{% endif %}
+</div>
+</div>
+</div>
+<div class="summary" style="margin-top:12px;margin-bottom:0">
+<span class="badge ok">완료 {{s.completed_cycle_count}}</span>
+<span class="badge warn">청산대기 {{s.open_low_count}}</span>
+</div>
+</a>
+{% endfor %}
+</div>
+{% else %}
+<a class="back-link" href="/performance/dashboard?category={{selected_category}}">← 종목 목록으로</a>
+{% set s = selected_symbol %}
+
 <div class="card">
 <h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
 
@@ -597,7 +695,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </details>
 {% endif %}
 </div>
-{% endfor %}
+{% endif %}
 </section>
 {% endif %}
 </body>
@@ -606,6 +704,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
         data=data,
         selected=selected,
         selected_category=selected_category,
+        selected_symbol=selected_symbol,
+        selected_symbol_name=selected_symbol_name,
         ), 200
 
     except Exception as exc:

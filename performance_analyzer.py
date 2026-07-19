@@ -878,6 +878,65 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             symbol,
         )
 
+        # 종목 성과 요약
+        max_tf_returns = []
+        split_returns = []
+        all_returns = []
+        holding_minutes = []
+        best_exit = None
+
+        for completed_cycle in completed_cycles:
+            for exit_result in completed_cycle["exit_results"]:
+                max_tf_value = exit_result["max_timeframe_return_pct"]
+                split_value = exit_result["all_split_return_pct"]
+
+                max_tf_returns.append(max_tf_value)
+                split_returns.append(split_value)
+                all_returns.extend([max_tf_value, split_value])
+                holding_minutes.append(
+                    exit_result["max_timeframe_holding_minutes"]
+                )
+
+                for tf_result in exit_result["timeframe_split_results"]:
+                    all_returns.append(tf_result["return_pct"])
+
+                for individual_result in exit_result["individual_results"]:
+                    all_returns.append(individual_result["return_pct"])
+
+                candidate = {
+                    "return_pct": max(max_tf_value, split_value),
+                    "exit_timeframe": exit_result["exit"]["timeframe"],
+                    "exit_price": exit_result["exit"]["price"],
+                }
+                if (
+                    best_exit is None
+                    or candidate["return_pct"] > best_exit["return_pct"]
+                ):
+                    best_exit = candidate
+
+        performance_summary = {
+            "has_results": bool(all_returns),
+            "best_return_pct": max(all_returns) if all_returns else None,
+            "average_return_pct": (
+                sum(all_returns) / len(all_returns)
+                if all_returns else None
+            ),
+            "max_tf_average_return_pct": (
+                sum(max_tf_returns) / len(max_tf_returns)
+                if max_tf_returns else None
+            ),
+            "all_split_average_return_pct": (
+                sum(split_returns) / len(split_returns)
+                if split_returns else None
+            ),
+            "average_holding_minutes": (
+                sum(holding_minutes) / len(holding_minutes)
+                if holding_minutes else None
+            ),
+            "result_count": len(all_returns),
+            "best_exit": best_exit,
+        }
+
         symbols.append(
             {
                 "category_key": category_key,
@@ -891,6 +950,7 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                 "open_low_count": len(open_entries),
                 "high_only_count": len(high_only),
                 "completed_cycles": completed_cycles,
+                "performance_summary": performance_summary,
                 "open_cycle_preview": entry_preview(open_entries),
                 "open_lows": [slim(r) for r in open_entries[-100:]],
                 "high_only": [slim(r) for r in high_only[-100:]],
@@ -926,6 +986,41 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
         if category_key == "OTHER" and not category_symbols:
             continue
 
+        category_result_symbols = [
+            item for item in category_symbols
+            if item["performance_summary"]["has_results"]
+        ]
+        category_best_values = [
+            item["performance_summary"]["best_return_pct"]
+            for item in category_result_symbols
+        ]
+        category_average_values = [
+            item["performance_summary"]["average_return_pct"]
+            for item in category_result_symbols
+        ]
+        category_holding_values = [
+            item["performance_summary"]["average_holding_minutes"]
+            for item in category_result_symbols
+            if item["performance_summary"]["average_holding_minutes"] is not None
+        ]
+
+        category_performance = {
+            "has_results": bool(category_result_symbols),
+            "best_return_pct": (
+                max(category_best_values)
+                if category_best_values else None
+            ),
+            "average_return_pct": (
+                sum(category_average_values) / len(category_average_values)
+                if category_average_values else None
+            ),
+            "average_holding_minutes": (
+                sum(category_holding_values) / len(category_holding_values)
+                if category_holding_values else None
+            ),
+            "result_symbol_count": len(category_result_symbols),
+        }
+
         categories.append(
             {
                 "category_key": category_key,
@@ -944,6 +1039,7 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                     item["low_count"] + item["high_count"]
                     for item in category_symbols
                 ),
+                "performance_summary": category_performance,
                 "symbols": category_symbols,
             }
         )
