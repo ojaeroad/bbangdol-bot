@@ -867,13 +867,12 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             }
         )
 
+    # 종목명 오름차순 정렬
     symbols.sort(
         key=lambda item: (
-            item["completed_cycle_count"],
-            item["open_low_count"],
-            item["low_count"] + item["high_count"],
-        ),
-        reverse=True,
+            item["category_key"],
+            item["symbol"].upper(),
+        )
     )
 
     category_order = ["COIN", "KOREA_1Q", "US_1Q", "OTHER"]

@@ -305,11 +305,28 @@ def performance_analysis_latest():
 def performance_dashboard():
     try:
         try:
-            limit = int(request.args.get("limit", "30"))
+            limit = int(request.args.get("limit", "100"))
         except ValueError:
-            limit = 30
+            limit = 100
+
+        selected_category = (
+            request.args.get("category", "COIN")
+            .strip()
+            .upper()
+        )
+        allowed_categories = {"COIN", "KOREA_1Q", "US_1Q"}
+        if selected_category not in allowed_categories:
+            selected_category = "COIN"
 
         data = visual_cycle_data(limit)
+        selected = next(
+            (
+                category
+                for category in data["categories"]
+                if category["category_key"] == selected_category
+            ),
+            None,
+        )
 
         return render_template_string("""
 <!doctype html>
@@ -340,6 +357,7 @@ summary{cursor:pointer;font-weight:bold}
 .mode-title{font-size:18px;color:var(--blue);margin:14px 0 4px}
 .category-nav{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 22px}
 .category-nav a{background:#242427;border:1px solid #3a3a3d;border-radius:999px;padding:9px 14px;text-decoration:none}
+.category-nav a.active-category{background:#14405b;border-color:#67c8ff;color:#fff;font-weight:bold}
 .category-head{display:flex;justify-content:space-between;gap:15px;align-items:center;margin:32px 0 10px;padding:14px 16px;background:#171719;border-left:5px solid var(--blue);border-radius:10px}
 .category-head h2{margin:0}
 .category-summary{display:flex;gap:9px;flex-wrap:wrap}
@@ -358,34 +376,37 @@ summary{cursor:pointer;font-weight:bold}
 
 <div class="category-nav">
 {% for category in data.categories %}
-<a href="#{{category.anchor}}">
+<a
+href="/performance/dashboard?category={{category.category_key}}"
+class="{{'active-category' if category.category_key == selected_category else ''}}"
+>
 {{category.category_label}} · 종목 {{category.symbol_count}}
 </a>
 {% endfor %}
 </div>
 
-{% for category in data.categories %}
-<section id="{{category.anchor}}">
+{% if selected %}
+<section id="{{selected.anchor}}">
 <div class="category-head">
-<h2>{{category.category_label}}</h2>
+<h2>{{selected.category_label}}</h2>
 <div class="category-summary">
-<span class="badge">종목 {{category.symbol_count}}</span>
-<span class="badge">신호 {{category.signal_count}}</span>
-<span class="badge ok">완료 Cycle {{category.completed_cycle_count}}</span>
-<span class="badge warn">청산 대기 {{category.open_low_count}}</span>
+<span class="badge">종목 {{selected.symbol_count}}</span>
+<span class="badge">신호 {{selected.signal_count}}</span>
+<span class="badge ok">완료 Cycle {{selected.completed_cycle_count}}</span>
+<span class="badge warn">청산 대기 {{selected.open_low_count}}</span>
 </div>
 </div>
 
-{% if category.symbol_count == 0 %}
+{% if selected.symbol_count == 0 %}
 <div class="card">
 <div class="empty-note">
-현재 저장된 {{category.category_label}} 신호가 없습니다.<br>
+현재 저장된 {{selected.category_label}} 신호가 없습니다.<br>
 해당 1Q TradingView 알람이 웹훅으로 들어오면 종목과 성과가 자동 표시됩니다.
 </div>
 </div>
 {% endif %}
 
-{% for s in category.symbols %}
+{% for s in selected.symbols %}
 <div class="card">
 <h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
 
@@ -527,10 +548,14 @@ summary{cursor:pointer;font-weight:bold}
 </div>
 {% endfor %}
 </section>
-{% endfor %}
+{% endif %}
 </body>
 </html>
-        """, data=data), 200
+        """,
+        data=data,
+        selected=selected,
+        selected_category=selected_category,
+        ), 200
 
     except Exception as exc:
         log.exception("Performance dashboard failed")
