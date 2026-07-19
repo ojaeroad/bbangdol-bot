@@ -334,6 +334,27 @@ details{margin:10px 0;background:#171717;border-radius:10px;padding:10px}summary
 <span class="badge warn">청산 대기 저점 {{s.open_low_count}}</span>
 <span class="badge">진입 전 고점 {{s.high_only_count}}</span>
 </div>
+
+<table>
+<tr>
+<th>최대시간봉 진입 수익률</th>
+<th>전체 분할진입 수익률</th>
+<th>보유시간</th>
+</tr>
+{% if s.completed_cycle_count == 0 %}
+<tr>
+<td class="warn">청산 고점 대기</td>
+<td class="warn">청산 고점 대기</td>
+<td class="warn">청산 고점 대기</td>
+</tr>
+{% else %}
+<tr>
+<td class="ok">아래 완료 Cycle에서 확인</td>
+<td class="ok">아래 완료 Cycle에서 확인</td>
+<td class="ok">아래 완료 Cycle에서 확인</td>
+</tr>
+{% endif %}
+</table>
 {% for c in s.completed_cycles %}
 <details open><summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 청산후보 {{c.exit_count}}회</summary>
 <table><tr><th>진입 신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
