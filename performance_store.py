@@ -78,6 +78,18 @@ CREATE INDEX IF NOT EXISTS idx_performance_signals_side_tf
     ON performance_signals(side, timeframe_minutes);
 """
 
+_MIGRATE_SIGNAL_NO_SQL = """
+ALTER TABLE performance_signals
+    ADD COLUMN IF NOT EXISTS signal_no VARCHAR(24);
+
+UPDATE performance_signals
+SET signal_no = 'PF-' || LPAD(id::text, 10, '0')
+WHERE signal_no IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_performance_signals_signal_no
+    ON performance_signals(signal_no);
+"""
+
 
 def _connect() -> psycopg.Connection:
     if not PERFORMANCE_DATABASE_URL:
@@ -100,6 +112,7 @@ def ensure_schema() -> None:
             return
         with _connect() as conn:
             conn.execute(_CREATE_TABLE_SQL)
+            conn.execute(_MIGRATE_SIGNAL_NO_SQL)
         _SCHEMA_READY = True
         log.info("Performance database schema is ready")
 
@@ -201,9 +214,16 @@ def save_signal(payload: dict[str, Any]) -> bool:
     with _connect() as conn:
         inserted = conn.execute(sql, params).fetchone()
     if inserted:
+        inserted_id = int(inserted[0])
+        signal_no = f"PF-{inserted_id:010d}"
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE performance_signals SET signal_no = %s WHERE id = %s",
+                (signal_no, inserted_id),
+            )
         log.info(
-            "Performance signal saved id=%s strategy=%s route=%s symbol=%s tf=%s price=%s",
-            inserted[0], row["strategy"], route, symbol, timeframe, price,
+            "Performance signal saved id=%s signal_no=%s strategy=%s route=%s symbol=%s tf=%s price=%s",
+            inserted_id, signal_no, row["strategy"], route, symbol, timeframe, price,
         )
         return True
     log.info("Performance duplicate ignored route=%s symbol=%s", route, symbol)
@@ -246,3 +266,35 @@ def health_summary() -> dict[str, Any]:
         "signal_count": int(row[0]),
         "latest_signal_at": row[1].isoformat() if row[1] else None,
     }
+
+
+def latest_signals(limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent stored signals without raw payload or secrets."""
+    ensure_schema()
+    safe_limit = max(1, min(int(limit), 100))
+    sql = """
+        SELECT signal_no, strategy, route, exchange, symbol, side, signal_type,
+               timeframe, timeframe_minutes, signal_price, received_at, raw_message
+        FROM performance_signals
+        ORDER BY id DESC
+        LIMIT %s
+    """
+    with _connect() as conn:
+        rows = conn.execute(sql, (safe_limit,)).fetchall()
+    result: list[dict[str, Any]] = []
+    for r in rows:
+        result.append({
+            "signal_no": r[0],
+            "strategy": r[1],
+            "route": r[2],
+            "exchange": r[3],
+            "symbol": r[4],
+            "side": r[5],
+            "signal_type": r[6],
+            "timeframe": r[7],
+            "timeframe_minutes": r[8],
+            "signal_price": str(r[9]) if r[9] is not None else None,
+            "received_at": r[10].isoformat() if r[10] else None,
+            "raw_message": r[11],
+        })
+    return result
