@@ -6,6 +6,9 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 import requests
 
+# 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
+from performance_store import queue_signal_save, health_summary
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
@@ -239,6 +242,16 @@ def health():
 def routes_dump():
     return jsonify({"routes": ROUTE_TO_CHAT})
 
+# --- 회원 운영용 성과 분석 DB 상태 (민감정보는 노출하지 않음) ---
+@app.get("/performance/health")
+def performance_health():
+    try:
+        result = health_summary()
+        return jsonify(result), (200 if result.get("ok") else 503)
+    except Exception as e:
+        log.exception("Performance health check failed")
+        return jsonify({"ok": False, "database": "error", "error": str(e)}), 503
+
 # --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
@@ -279,6 +292,8 @@ def tv_webhook_legacy():
     data = request.get_json(silent=True, force=True) or {}
     bad = _require_webhook_secret(data)
     if bad: return bad
+    # 통계 저장은 별도 스레드에서 실행. 실패해도 기존 텔레그램 전송에는 영향 없음.
+    queue_signal_save(data)
     route  = str(data.get("route", "")).strip()
     msg    = str(data.get("msg", "")).strip()
     symbol = str(data.get("symbol", "")).strip()
@@ -290,6 +305,8 @@ def tv_webhook_new():
     data = request.get_json(silent=True, force=True) or {}
     bad = _require_webhook_secret(data)
     if bad: return bad
+    # /webhook 경로도 동일하게 원본 신호를 저장한다.
+    queue_signal_save(data)
     route  = str(data.get("type", data.get("route", ""))).strip()
     msg    = str(data.get("message", data.get("msg", ""))).strip()
     symbol = str(data.get("symbol", "")).strip()
