@@ -544,6 +544,56 @@ def performance_member():
             None,
         )
 
+        ranked_symbols = []
+        average_ranking = []
+        best_ranking = []
+        win_rate_ranking = []
+        chart_scale = 1.0
+
+        if selected:
+            ranked_symbols = [
+                item for item in selected["symbols"]
+                if item["performance_summary"]["has_results"]
+            ]
+
+            average_ranking = sorted(
+                ranked_symbols,
+                key=lambda item: (
+                    item["performance_summary"]["average_return_pct"]
+                    if item["performance_summary"]["average_return_pct"] is not None
+                    else float("-inf")
+                ),
+                reverse=True,
+            )[:5]
+
+            best_ranking = sorted(
+                ranked_symbols,
+                key=lambda item: (
+                    item["performance_summary"]["best_return_pct"]
+                    if item["performance_summary"]["best_return_pct"] is not None
+                    else float("-inf")
+                ),
+                reverse=True,
+            )[:5]
+
+            win_rate_ranking = sorted(
+                ranked_symbols,
+                key=lambda item: (
+                    item["performance_summary"]["win_rate_pct"]
+                    if item["performance_summary"]["win_rate_pct"] is not None
+                    else float("-inf"),
+                    item["performance_summary"]["result_count"],
+                ),
+                reverse=True,
+            )[:5]
+
+            chart_values = [
+                abs(item["performance_summary"]["average_return_pct"])
+                for item in ranked_symbols
+                if item["performance_summary"]["average_return_pct"] is not None
+            ]
+            chart_scale = max(chart_values) if chart_values else 1.0
+
         return render_template_string(
             """
 <!doctype html>
@@ -569,15 +619,34 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 .metric,.symbol{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
 .title{color:var(--blue);font-weight:bold;margin-bottom:8px}.value{font-size:25px;font-weight:bold}
 .pos{color:var(--green)}.warn{color:var(--yellow)}.muted{color:#aaa}
-.symbols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:13px}
-.symbol h3{font-size:24px;margin:0 0 13px}
-.values{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
-.mini{background:#121214;border-radius:9px;padding:10px}
-.mini span{display:block;color:#aaa;font-size:12px;margin-bottom:5px}.mini b{font-size:18px}
+.ranking-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px;margin:0 0 20px}
+.ranking{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px;min-width:0}
+.ranking h3{margin:0 0 12px;color:var(--blue);font-size:18px}
+.rank-row{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 0;border-bottom:1px solid #2c2c30}
+.rank-row:last-child{border-bottom:0}
+.rank-no{width:25px;height:25px;border-radius:50%;background:#2b2b2f;display:flex;align-items:center;justify-content:center;font-size:12px}
+.rank-symbol{font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rank-value{font-weight:bold;color:var(--green);white-space:nowrap}
+.chart-section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:20px}
+.chart-section h3{margin:0 0 14px;color:var(--blue)}
+.bar-row{display:grid;grid-template-columns:110px minmax(100px,1fr) 75px;gap:10px;align-items:center;margin:11px 0}
+.bar-name{font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-track{height:18px;border-radius:999px;background:#101012;overflow:hidden;border:1px solid #2d2d31}
+.bar-fill{height:100%;min-width:3px;border-radius:999px;background:linear-gradient(90deg,#2495c7,#55e69a)}
+.bar-fill.negbar{background:linear-gradient(90deg,#a63b4a,#ff7878)}
+.bar-value{text-align:right;font-weight:bold;white-space:nowrap}
+.symbols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:13px}
+.symbol{min-width:0}
+.symbol h3{font-size:24px;margin:0 0 13px;overflow-wrap:anywhere}
+.values{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+.mini{background:#121214;border-radius:9px;padding:10px;min-width:0;overflow:hidden}
+.mini span{display:block;color:#aaa;font-size:12px;margin-bottom:5px;overflow-wrap:anywhere}
+.mini b{font-size:18px;display:block;overflow-wrap:anywhere}
 .notice{background:#1b1b1d;border:1px solid var(--line);border-radius:14px;padding:22px;color:#aaa}
 .disclaimer{margin-top:22px;color:#777;font-size:13px;line-height:1.5}
-@media(max-width:950px){.summary{grid-template-columns:repeat(2,1fr)}.values{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}}
+@media(max-width:1100px){.ranking-wrap{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:760px){.values{grid-template-columns:repeat(2,minmax(0,1fr))}.bar-row{grid-template-columns:85px minmax(80px,1fr) 65px}}
+@media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}.symbols{grid-template-columns:1fr}.bar-row{grid-template-columns:72px minmax(60px,1fr) 58px;font-size:13px}}
 </style>
 </head>
 <body>
@@ -646,6 +715,59 @@ href="/performance/member?category={{category.category_key}}">
 </div>
 
 {% if selected.symbol_count %}
+
+{% if ranked_symbols %}
+<div class="ranking-wrap">
+<div class="ranking">
+<h3>평균수익률 TOP 5</h3>
+{% for s in average_ranking %}
+<div class="rank-row">
+<span class="rank-no">{{loop.index}}</span>
+<span class="rank-symbol">{{s.symbol}}</span>
+<span class="rank-value">{{'%.2f'|format(s.performance_summary.average_return_pct)}}%</span>
+</div>
+{% endfor %}
+</div>
+
+<div class="ranking">
+<h3>최고수익률 TOP 5</h3>
+{% for s in best_ranking %}
+<div class="rank-row">
+<span class="rank-no">{{loop.index}}</span>
+<span class="rank-symbol">{{s.symbol}}</span>
+<span class="rank-value">{{'%.2f'|format(s.performance_summary.best_return_pct)}}%</span>
+</div>
+{% endfor %}
+</div>
+
+<div class="ranking">
+<h3>승률 TOP 5</h3>
+{% for s in win_rate_ranking %}
+<div class="rank-row">
+<span class="rank-no">{{loop.index}}</span>
+<span class="rank-symbol">{{s.symbol}}</span>
+<span class="rank-value">{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%</span>
+</div>
+{% endfor %}
+</div>
+</div>
+
+<div class="chart-section">
+<h3>종목별 평균수익률 비교</h3>
+{% for s in ranked_symbols|sort(attribute='symbol') %}
+{% set avg = s.performance_summary.average_return_pct %}
+<div class="bar-row">
+<div class="bar-name">{{s.symbol}}</div>
+<div class="bar-track">
+<div class="bar-fill {{'negbar' if avg < 0 else ''}}"
+style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
+</div>
+<div class="bar-value {{'pos' if avg >= 0 else ''}}">{{'%.2f'|format(avg)}}%</div>
+</div>
+{% endfor %}
+</div>
+{% endif %}
+
 <div class="symbols">
 {% for s in selected.symbols %}
 <div class="symbol">
@@ -682,6 +804,11 @@ href="/performance/member?category={{category.category_key}}">
             data=data,
             selected=selected,
             selected_category=selected_category,
+            ranked_symbols=ranked_symbols,
+            average_ranking=average_ranking,
+            best_ranking=best_ranking,
+            win_rate_ranking=win_rate_ranking,
+            chart_scale=chart_scale,
         ), 200
 
     except Exception as exc:
