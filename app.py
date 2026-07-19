@@ -271,7 +271,7 @@ def performance_latest():
 
 
 # --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 청산 ---
-@app.post("/performance/analyze")
+@app.route("/performance/analyze", methods=["GET", "POST"])
 def performance_analyze():
     try:
         return jsonify(rebuild_individual_pairs()), 200
@@ -308,81 +308,196 @@ def performance_dashboard():
             limit = int(request.args.get("limit", "30"))
         except ValueError:
             limit = 30
+
         data = visual_cycle_data(limit)
+
         return render_template_string("""
-<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>빵돌이 성과 분석</title>
+<title>회원 운영용 성과 분석</title>
 <style>
-body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px}
-.card{background:#1d1d1d;border:1px solid #333;border-radius:14px;padding:16px;margin:14px 0}
-.summary{display:flex;gap:10px;flex-wrap:wrap}.badge{background:#2a2a2a;border-radius:999px;padding:7px 12px}
-.ok{color:#57d38c}.warn{color:#ffcc66}.small{font-size:12px;color:#aaa}
+:root{--bg:#0e0e0f;--card:#1b1b1d;--line:#333;--blue:#8bd0ff;--green:#5ee39a;--yellow:#ffc857;--red:#ff7676}
+*{box-sizing:border-box}
+body{font-family:Arial,"Noto Sans KR",sans-serif;background:var(--bg);color:#f4f4f4;margin:0;padding:20px}
+h1{margin:4px 0 10px;font-size:34px}h2{margin:0 0 12px;font-size:28px}
+a{color:#73c9ff}.toplinks{margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin:16px 0}
+.summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.badge{background:#29292c;border-radius:999px;padding:8px 13px}
+.ok{color:var(--green)}.warn{color:var(--yellow)}.neg{color:var(--red)}.muted{color:#aaa}.blue{color:var(--blue)}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:12px 0}
+.metric{background:#151517;border:1px solid #303033;border-radius:12px;padding:14px}
+.metric .title{color:var(--blue);font-weight:bold;margin-bottom:8px}.metric .value{font-size:20px;font-weight:bold}
 table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}
-th,td{border-bottom:1px solid #333;padding:9px;text-align:left;vertical-align:top}th{color:#9fd3ff}
-details{margin:10px 0;background:#171717;border-radius:10px;padding:10px}summary{cursor:pointer;font-weight:bold}
-.pos{color:#57d38c;font-weight:bold}.neg{color:#ff7070;font-weight:bold}a{color:#83c5ff}
-</style></head><body>
+th,td{border-bottom:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}
+th{color:var(--blue)}
+details{margin:10px 0;background:#141416;border-radius:10px;padding:11px}
+summary{cursor:pointer;font-weight:bold}
+.small{font-size:12px;color:#aaa}.pos{color:var(--green);font-weight:bold}
+.mode-title{font-size:18px;color:var(--blue);margin:14px 0 4px}
+@media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:10px}h1{font-size:27px}}
+</style>
+</head>
+<body>
 <h1>회원 운영용 성과 분석</h1>
-<div class="small"><a href="/performance/health">DB 상태</a> · <a href="/performance/latest">최근 신호</a> · <a href="/performance/analyze">분석 실행</a></div>
+<div class="toplinks">
+<a href="/performance/health">DB 상태</a> ·
+<a href="/performance/latest">최근 신호</a> ·
+<a href="/performance/analyze">분석 실행</a> ·
+<a href="/performance/cycles">사이클 JSON</a>
+</div>
+
 {% for s in data.symbols %}
 <div class="card">
 <h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
+
 <div class="summary">
-<span class="badge">저점 {{s.low_count}}</span><span class="badge">고점 {{s.high_count}}</span>
+<span class="badge">저점 {{s.low_count}}</span>
+<span class="badge">고점 {{s.high_count}}</span>
 <span class="badge ok">완료 사이클 {{s.completed_cycle_count}}</span>
 <span class="badge warn">청산 대기 저점 {{s.open_low_count}}</span>
 <span class="badge">진입 전 고점 {{s.high_only_count}}</span>
 </div>
 
+{% if s.open_cycle_preview %}
+<div class="mode-title">현재 진행 중인 진입 구간</div>
+<div class="grid">
+<div class="metric">
+<div class="title">최대시간봉 진입 후보</div>
+<div class="value">{{s.open_cycle_preview.max_timeframe_entry.timeframe}} · {{s.open_cycle_preview.max_timeframe_entry.price}}</div>
+<div class="small">{{s.open_cycle_preview.max_timeframe_entry.signal_no}}</div>
+</div>
+<div class="metric">
+<div class="title">전체 분할진입 평균가</div>
+<div class="value">{{s.open_cycle_preview.all_split_average_price}}</div>
+<div class="small">총 {{s.open_cycle_preview.entry_count}}회 분할</div>
+</div>
+<div class="metric">
+<div class="title">수익률 · 보유시간</div>
+<div class="value warn">청산 고점 대기</div>
+<div class="small">고점 신호가 발생하면 자동 계산</div>
+</div>
+</div>
+
+<details open>
+<summary>시간봉별 분할진입 평균가</summary>
 <table>
+<tr><th>시간봉</th><th>진입 횟수</th><th>평균 진입가</th><th>마지막 진입 시각</th></tr>
+{% for tf in s.open_cycle_preview.timeframe_splits %}
 <tr>
-<th>최대시간봉 진입 수익률</th>
-<th>전체 분할진입 수익률</th>
-<th>보유시간</th>
+<td>{{tf.timeframe}}</td>
+<td>{{tf.entry_count}}</td>
+<td>{{tf.average_entry_price}}</td>
+<td>{{tf.last_entry_time}}</td>
 </tr>
-{% if s.completed_cycle_count == 0 %}
-<tr>
-<td class="warn">청산 고점 대기</td>
-<td class="warn">청산 고점 대기</td>
-<td class="warn">청산 고점 대기</td>
-</tr>
-{% else %}
-<tr>
-<td class="ok">아래 완료 Cycle에서 확인</td>
-<td class="ok">아래 완료 Cycle에서 확인</td>
-<td class="ok">아래 완료 Cycle에서 확인</td>
-</tr>
+{% endfor %}
+</table>
+</details>
+
+<details>
+<summary>개별 진입 {{s.open_cycle_preview.entry_count}}건</summary>
+<table>
+<tr><th>신호번호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
+{% for e in s.open_cycle_preview.individual_entries %}
+<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>
+{% endfor %}
+</table>
+</details>
 {% endif %}
-</table>
+
 {% for c in s.completed_cycles %}
-<details open><summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 청산후보 {{c.exit_count}}회</summary>
-<table><tr><th>진입 신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
-{% for e in c.entries %}<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>{% endfor %}
-</table>
-<table><tr><th>청산</th><th>관계</th><th>청산가</th><th>최대TF 진입</th><th>전체분할</th><th>보유시간</th></tr>
+<details open>
+<summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 청산후보 {{c.exit_count}}회</summary>
+
+<div class="grid">
+<div class="metric">
+<div class="title">최대시간봉 진입</div>
+<div class="value">{{c.entry_preview.max_timeframe_entry.timeframe}} · {{c.entry_preview.max_timeframe_entry.price}}</div>
+</div>
+<div class="metric">
+<div class="title">전체 분할진입 평균가</div>
+<div class="value">{{c.entry_preview.all_split_average_price}}</div>
+<div class="small">{{c.entry_preview.entry_count}}회 분할</div>
+</div>
+<div class="metric">
+<div class="title">청산 후보</div>
+<div class="value">{{c.exit_count}}건</div>
+</div>
+</div>
+
 {% for r in c.exit_results %}
-<tr><td>{{r.exit.signal_no}} / {{r.exit.timeframe}}</td><td>{{r.relation_to_max_entry}}</td><td>{{r.exit.price}}</td>
+<details>
+<summary>
+청산 {{r.exit.timeframe}} · {{r.exit.price}} ·
+최대TF <span class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</span> ·
+전체분할 <span class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%</span>
+</summary>
+
+<table>
+<tr><th>청산 신호</th><th>청산 관계</th><th>최대TF 수익률</th><th>최대TF 보유</th><th>전체분할 수익률</th><th>전체분할 보유</th></tr>
+<tr>
+<td>{{r.exit.signal_no}} / {{r.exit.timeframe}} / {{r.exit.price}}</td>
+<td>{{r.relation_to_max_entry}}</td>
 <td class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</td>
-<td class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%<br><span class="small">평균가 {{r.all_split_entry_price}}</span></td>
-<td>{{r.holding_minutes_from_max_entry}}분</td></tr>{% endfor %}
-</table></details>{% endfor %}
-{% if s.open_lows %}
-<details><summary>아직 고점이 오지 않은 저점 신호 {{s.open_low_count}}건</summary>
-<table><tr><th>신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
-{% for e in s.open_lows %}<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>{% endfor %}
-</table></details>{% endif %}
+<td>{{r.max_timeframe_holding_minutes}}분</td>
+<td class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%</td>
+<td>{{r.all_split_holding_minutes}}분</td>
+</tr>
+</table>
+
+<div class="mode-title">시간봉별 분할진입 결과</div>
+<table>
+<tr><th>시간봉</th><th>진입 횟수</th><th>평균가</th><th>수익률</th><th>보유시간</th></tr>
+{% for tf in r.timeframe_split_results %}
+<tr>
+<td>{{tf.timeframe}}</td><td>{{tf.entry_count}}</td><td>{{tf.average_entry_price}}</td>
+<td class="{{'pos' if tf.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(tf.return_pct)}}%</td>
+<td>{{tf.holding_minutes}}분</td>
+</tr>
+{% endfor %}
+</table>
+
+<details>
+<summary>각 개별 진입 결과 {{r.individual_results|length}}건</summary>
+<table>
+<tr><th>진입 신호</th><th>시간봉</th><th>진입가</th><th>수익률</th><th>보유시간</th></tr>
+{% for item in r.individual_results %}
+<tr>
+<td>{{item.entry.signal_no}}</td><td>{{item.entry.timeframe}}</td><td>{{item.entry.price}}</td>
+<td class="{{'pos' if item.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(item.return_pct)}}%</td>
+<td>{{item.holding_minutes}}분</td>
+</tr>
+{% endfor %}
+</table>
+</details>
+</details>
+{% endfor %}
+</details>
+{% endfor %}
+
 {% if s.high_only %}
-<details><summary>진입 저점보다 먼저 발생한 고점 {{s.high_only_count}}건</summary>
-<table><tr><th>신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
-{% for e in s.high_only %}<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>{% endfor %}
-</table></details>{% endif %}
-</div>{% endfor %}
-</body></html>
+<details>
+<summary>진입 저점 전에 발생한 고점 {{s.high_only_count}}건</summary>
+<table>
+<tr><th>신호번호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
+{% for e in s.high_only %}
+<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>
+{% endfor %}
+</table>
+</details>
+{% endif %}
+</div>
+{% endfor %}
+</body>
+</html>
         """, data=data), 200
-    except Exception as e:
+
+    except Exception as exc:
         log.exception("Performance dashboard failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 @app.get("/performance/cycles")
 def performance_cycles_json():

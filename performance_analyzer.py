@@ -534,7 +534,16 @@ def latest_analysis_pairs(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
-    """브라우저 시각화용 원본 사이클/신호 흐름 데이터."""
+    """회원용 대시보드 데이터.
+
+    완료 사이클:
+      개별 / 최대시간봉 / 전체분할 / 시간봉별분할 결과를
+      모든 청산 고점 후보별로 계산한다.
+
+    미완료 사이클:
+      아직 고점이 없어도 현재 최대시간봉 후보 진입가,
+      전체분할 평균가, 시간봉별 평균가를 미리 표시한다.
+    """
     ensure_analysis_schema()
     safe_limit = max(1, min(int(limit_symbols), 100))
 
@@ -542,109 +551,262 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
         signals = _load_signals(conn)
 
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
-    for s in signals:
-        grouped[(s["strategy"], s["exchange"] or "", s["symbol"])].append(s)
+    for signal in signals:
+        grouped[
+            (
+                signal["strategy"],
+                signal["exchange"] or "",
+                signal["symbol"],
+            )
+        ].append(signal)
+
+    def slim(signal: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "signal_no": signal["signal_no"],
+            "type": signal["signal_type"],
+            "timeframe": signal["timeframe"],
+            "timeframe_minutes": signal["timeframe_minutes"],
+            "price": str(signal["price"]),
+            "time": signal["time"].isoformat(),
+        }
+
+    def entry_preview(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not entries:
+            return None
+
+        valid_tf = [e for e in entries if e["timeframe_minutes"] is not None]
+        max_entry = (
+            max(valid_tf, key=lambda e: e["timeframe_minutes"])
+            if valid_tf else entries[-1]
+        )
+        all_split_price = _weighted_average([e["price"] for e in entries])
+
+        by_tf: dict[tuple[str, int | None], list[dict[str, Any]]] = defaultdict(list)
+        for entry in entries:
+            by_tf[
+                (
+                    entry["timeframe"] or "unknown",
+                    entry["timeframe_minutes"],
+                )
+            ].append(entry)
+
+        timeframe_splits = []
+        for (timeframe, minutes), tf_entries in sorted(
+            by_tf.items(),
+            key=lambda item: item[0][1] if item[0][1] is not None else -1,
+        ):
+            timeframe_splits.append(
+                {
+                    "timeframe": timeframe,
+                    "timeframe_minutes": minutes,
+                    "entry_count": len(tf_entries),
+                    "average_entry_price": str(
+                        _weighted_average([e["price"] for e in tf_entries])
+                    ),
+                    "last_entry_time": tf_entries[-1]["time"].isoformat(),
+                    "signal_nos": [e["signal_no"] for e in tf_entries],
+                }
+            )
+
+        return {
+            "entry_count": len(entries),
+            "max_timeframe_entry": slim(max_entry),
+            "all_split_average_price": str(all_split_price),
+            "all_split_last_entry_time": entries[-1]["time"].isoformat(),
+            "timeframe_splits": timeframe_splits,
+            "individual_entries": [slim(e) for e in entries],
+        }
 
     symbols = []
+
     for (strategy, exchange, symbol), rows in grouped.items():
         lows = [r for r in rows if r["signal_type"] == "LOW"]
         highs = [r for r in rows if r["signal_type"] == "HIGH"]
 
-        completed = []
-        open_lows = []
-        high_only = []
-        entries = []
-        exits = []
+        completed_raw: list[dict[str, Any]] = []
+        open_entries: list[dict[str, Any]] = []
+        high_only: list[dict[str, Any]] = []
 
-        def finalize():
-            nonlocal entries, exits
+        entries: list[dict[str, Any]] = []
+        exits: list[dict[str, Any]] = []
+
+        def finalize_segment() -> None:
+            nonlocal entries, exits, open_entries
             if entries and exits:
-                completed.append({"entries": entries[:], "exits": exits[:]})
+                completed_raw.append(
+                    {
+                        "entries": entries[:],
+                        "exits": exits[:],
+                    }
+                )
             elif entries:
-                open_lows.extend(entries)
+                open_entries = entries[:]
             entries = []
             exits = []
 
-        for r in rows:
-            if r["signal_type"] == "LOW":
+        for row in rows:
+            if row["signal_type"] == "LOW":
                 if exits:
-                    finalize()
-                entries.append(r)
+                    finalize_segment()
+                entries.append(row)
             else:
                 if entries:
-                    exits.append(r)
+                    exits.append(row)
                 else:
-                    high_only.append(r)
-        finalize()
+                    high_only.append(row)
 
-        def slim(r):
-            return {
-                "signal_no": r["signal_no"],
-                "type": r["signal_type"],
-                "timeframe": r["timeframe"],
-                "timeframe_minutes": r["timeframe_minutes"],
-                "price": str(r["price"]),
-                "time": r["time"].isoformat(),
-            }
+        finalize_segment()
 
-        cycle_rows = []
-        for idx, c in enumerate(completed, start=1):
-            entry_prices = [e["price"] for e in c["entries"]]
-            max_tf_entry = max(c["entries"], key=lambda e: e["timeframe_minutes"] or -1)
-            all_split_price = _weighted_average(entry_prices)
+        completed_cycles = []
+
+        for cycle_no, cycle in enumerate(completed_raw, start=1):
+            cycle_entries = cycle["entries"]
+            cycle_exits = cycle["exits"]
+            preview = entry_preview(cycle_entries)
+            assert preview is not None
+
+            max_entry = max(
+                cycle_entries,
+                key=lambda e: e["timeframe_minutes"] or -1,
+            )
+            all_split_price = _weighted_average(
+                [e["price"] for e in cycle_entries]
+            )
+
+            tf_groups: dict[tuple[str, int | None], list[dict[str, Any]]] = defaultdict(list)
+            for entry in cycle_entries:
+                tf_groups[
+                    (
+                        entry["timeframe"] or "unknown",
+                        entry["timeframe_minutes"],
+                    )
+                ].append(entry)
 
             exit_results = []
-            for x in c["exits"]:
-                all_split_return = float(
-                    (x["price"] - all_split_price) / all_split_price * Decimal("100")
-                )
-                max_tf_return = float(
-                    (x["price"] - max_tf_entry["price"])
-                    / max_tf_entry["price"]
-                    * Decimal("100")
-                )
-                exit_results.append({
-                    "exit": slim(x),
-                    "relation_to_max_entry": _relation(
-                        max_tf_entry["timeframe_minutes"], x["timeframe_minutes"]
-                    ),
-                    "all_split_entry_price": str(all_split_price),
-                    "all_split_return_pct": all_split_return,
-                    "max_timeframe_entry": slim(max_tf_entry),
-                    "max_timeframe_return_pct": max_tf_return,
-                    "holding_minutes_from_max_entry": int(
-                        (x["time"] - max_tf_entry["time"]).total_seconds() // 60
-                    ),
-                })
 
-            cycle_rows.append({
-                "cycle_no": idx,
-                "entry_count": len(c["entries"]),
-                "exit_count": len(c["exits"]),
-                "entries": [slim(e) for e in c["entries"]],
-                "exit_results": exit_results,
-            })
+            for exit_signal in cycle_exits:
+                individual_results = []
+                for entry in cycle_entries:
+                    individual_results.append(
+                        {
+                            "entry": slim(entry),
+                            "return_pct": float(
+                                (exit_signal["price"] - entry["price"])
+                                / entry["price"]
+                                * Decimal("100")
+                            ),
+                            "holding_minutes": int(
+                                (
+                                    exit_signal["time"] - entry["time"]
+                                ).total_seconds()
+                                // 60
+                            ),
+                        }
+                    )
 
-        symbols.append({
-            "strategy": strategy,
-            "exchange": exchange,
-            "symbol": symbol,
-            "low_count": len(lows),
-            "high_count": len(highs),
-            "completed_cycle_count": len(cycle_rows),
-            "open_low_count": len(open_lows),
-            "high_only_count": len(high_only),
-            "completed_cycles": cycle_rows,
-            "open_lows": [slim(r) for r in open_lows[-30:]],
-            "high_only": [slim(r) for r in high_only[-30:]],
-        })
+                timeframe_split_results = []
+                for (timeframe, minutes), tf_entries in sorted(
+                    tf_groups.items(),
+                    key=lambda item: item[0][1] if item[0][1] is not None else -1,
+                ):
+                    tf_average = _weighted_average(
+                        [e["price"] for e in tf_entries]
+                    )
+                    timeframe_split_results.append(
+                        {
+                            "timeframe": timeframe,
+                            "entry_count": len(tf_entries),
+                            "average_entry_price": str(tf_average),
+                            "return_pct": float(
+                                (exit_signal["price"] - tf_average)
+                                / tf_average
+                                * Decimal("100")
+                            ),
+                            "holding_minutes": int(
+                                (
+                                    exit_signal["time"] - tf_entries[-1]["time"]
+                                ).total_seconds()
+                                // 60
+                            ),
+                        }
+                    )
+
+                exit_results.append(
+                    {
+                        "exit": slim(exit_signal),
+                        "relation_to_max_entry": _relation(
+                            max_entry["timeframe_minutes"],
+                            exit_signal["timeframe_minutes"],
+                        ),
+                        "max_timeframe_entry": slim(max_entry),
+                        "max_timeframe_return_pct": float(
+                            (exit_signal["price"] - max_entry["price"])
+                            / max_entry["price"]
+                            * Decimal("100")
+                        ),
+                        "max_timeframe_holding_minutes": int(
+                            (
+                                exit_signal["time"] - max_entry["time"]
+                            ).total_seconds()
+                            // 60
+                        ),
+                        "all_split_entry_price": str(all_split_price),
+                        "all_split_return_pct": float(
+                            (exit_signal["price"] - all_split_price)
+                            / all_split_price
+                            * Decimal("100")
+                        ),
+                        "all_split_holding_minutes": int(
+                            (
+                                exit_signal["time"] - cycle_entries[-1]["time"]
+                            ).total_seconds()
+                            // 60
+                        ),
+                        "timeframe_split_results": timeframe_split_results,
+                        "individual_results": individual_results,
+                    }
+                )
+
+            completed_cycles.append(
+                {
+                    "cycle_no": cycle_no,
+                    "entry_count": len(cycle_entries),
+                    "exit_count": len(cycle_exits),
+                    "entry_preview": preview,
+                    "entries": [slim(e) for e in cycle_entries],
+                    "exits": [slim(x) for x in cycle_exits],
+                    "exit_results": exit_results,
+                }
+            )
+
+        symbols.append(
+            {
+                "strategy": strategy,
+                "exchange": exchange,
+                "symbol": symbol,
+                "low_count": len(lows),
+                "high_count": len(highs),
+                "completed_cycle_count": len(completed_cycles),
+                "open_low_count": len(open_entries),
+                "high_only_count": len(high_only),
+                "completed_cycles": completed_cycles,
+                "open_cycle_preview": entry_preview(open_entries),
+                "open_lows": [slim(r) for r in open_entries[-100:]],
+                "high_only": [slim(r) for r in high_only[-100:]],
+            }
+        )
 
     symbols.sort(
-        key=lambda s: (
-            s["completed_cycle_count"],
-            s["open_low_count"],
-            s["high_count"] + s["low_count"],
+        key=lambda item: (
+            item["completed_cycle_count"],
+            item["open_low_count"],
+            item["low_count"] + item["high_count"],
         ),
         reverse=True,
     )
-    return {"ok": True, "symbol_count": len(symbols), "symbols": symbols[:safe_limit]}
+
+    return {
+        "ok": True,
+        "symbol_count": len(symbols),
+        "symbols": symbols[:safe_limit],
+    }
