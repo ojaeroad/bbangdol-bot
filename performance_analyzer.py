@@ -914,11 +914,110 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                 ):
                     best_exit = candidate
 
+        wins = [value for value in all_returns if value > 0]
+        losses = [value for value in all_returns if value <= 0]
+
+        # 청산 시간봉별 통계
+        exit_timeframe_stats_map: dict[str, dict[str, Any]] = {}
+        for completed_cycle in completed_cycles:
+            for exit_result in completed_cycle["exit_results"]:
+                exit_tf = exit_result["exit"]["timeframe"] or "unknown"
+                bucket = exit_timeframe_stats_map.setdefault(
+                    exit_tf,
+                    {
+                        "returns": [],
+                        "holding_minutes": [],
+                        "timeframe_minutes": (
+                            exit_result["exit"]["timeframe_minutes"]
+                            if exit_result["exit"]["timeframe_minutes"] is not None
+                            else -1
+                        ),
+                    },
+                )
+                bucket["returns"].extend(
+                    [
+                        exit_result["max_timeframe_return_pct"],
+                        exit_result["all_split_return_pct"],
+                    ]
+                )
+                bucket["holding_minutes"].append(
+                    exit_result["max_timeframe_holding_minutes"]
+                )
+
+                for tf_result in exit_result["timeframe_split_results"]:
+                    bucket["returns"].append(tf_result["return_pct"])
+
+                for individual_result in exit_result["individual_results"]:
+                    bucket["returns"].append(individual_result["return_pct"])
+
+        exit_timeframe_stats = []
+        for timeframe, bucket in sorted(
+            exit_timeframe_stats_map.items(),
+            key=lambda item: item[1]["timeframe_minutes"],
+        ):
+            values = bucket["returns"]
+            tf_wins = [value for value in values if value > 0]
+            tf_holding = bucket["holding_minutes"]
+
+            exit_timeframe_stats.append(
+                {
+                    "timeframe": timeframe,
+                    "result_count": len(values),
+                    "win_count": len(tf_wins),
+                    "win_rate_pct": (
+                        len(tf_wins) / len(values) * 100
+                        if values else None
+                    ),
+                    "average_return_pct": (
+                        sum(values) / len(values)
+                        if values else None
+                    ),
+                    "best_return_pct": max(values) if values else None,
+                    "worst_return_pct": min(values) if values else None,
+                    "average_holding_minutes": (
+                        sum(tf_holding) / len(tf_holding)
+                        if tf_holding else None
+                    ),
+                }
+            )
+
+        entry_mode_stats = []
+        mode_series = [
+            ("MAX_TIMEFRAME", "최대시간봉", max_tf_returns),
+            ("ALL_SPLIT", "전체 분할", split_returns),
+        ]
+        for mode_key, mode_label, values in mode_series:
+            mode_wins = [value for value in values if value > 0]
+            entry_mode_stats.append(
+                {
+                    "mode": mode_key,
+                    "label": mode_label,
+                    "result_count": len(values),
+                    "win_rate_pct": (
+                        len(mode_wins) / len(values) * 100
+                        if values else None
+                    ),
+                    "average_return_pct": (
+                        sum(values) / len(values)
+                        if values else None
+                    ),
+                    "best_return_pct": max(values) if values else None,
+                    "worst_return_pct": min(values) if values else None,
+                }
+            )
+
         performance_summary = {
             "has_results": bool(all_returns),
             "best_return_pct": max(all_returns) if all_returns else None,
+            "worst_return_pct": min(all_returns) if all_returns else None,
             "average_return_pct": (
                 sum(all_returns) / len(all_returns)
+                if all_returns else None
+            ),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "win_rate_pct": (
+                len(wins) / len(all_returns) * 100
                 if all_returns else None
             ),
             "max_tf_average_return_pct": (
@@ -935,6 +1034,8 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             ),
             "result_count": len(all_returns),
             "best_exit": best_exit,
+            "exit_timeframe_stats": exit_timeframe_stats,
+            "entry_mode_stats": entry_mode_stats,
         }
 
         symbols.append(
@@ -1004,6 +1105,15 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
             if item["performance_summary"]["average_holding_minutes"] is not None
         ]
 
+        category_total_results = sum(
+            item["performance_summary"]["result_count"]
+            for item in category_result_symbols
+        )
+        category_total_wins = sum(
+            item["performance_summary"]["win_count"]
+            for item in category_result_symbols
+        )
+
         category_performance = {
             "has_results": bool(category_result_symbols),
             "best_return_pct": (
@@ -1014,11 +1124,17 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                 sum(category_average_values) / len(category_average_values)
                 if category_average_values else None
             ),
+            "win_rate_pct": (
+                category_total_wins / category_total_results * 100
+                if category_total_results else None
+            ),
             "average_holding_minutes": (
                 sum(category_holding_values) / len(category_holding_values)
                 if category_holding_values else None
             ),
             "result_symbol_count": len(category_result_symbols),
+            "result_count": category_total_results,
+            "win_count": category_total_wins,
         }
 
         categories.append(

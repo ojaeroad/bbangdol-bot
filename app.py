@@ -378,17 +378,18 @@ summary{cursor:pointer;font-weight:bold}
 .category-head h2{margin:0}
 .category-summary{display:flex;gap:9px;flex-wrap:wrap}
 .empty-note{color:#999;padding:14px 0}
-.market-performance{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0 20px}
+.market-performance{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:14px 0 20px}
 .symbol-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}
 .symbol-card{display:block;background:#1b1b1d;border:1px solid #343438;border-radius:14px;padding:16px;text-decoration:none;color:#f4f4f4}
 .symbol-card:hover{border-color:#69c9ff;transform:translateY(-1px)}
 .symbol-card-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .symbol-name{font-size:24px;font-weight:bold}
-.symbol-result-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.symbol-result-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
 .symbol-result{background:#131315;border-radius:9px;padding:10px}
 .symbol-result .label{font-size:12px;color:#aaa;margin-bottom:5px}
 .symbol-result .number{font-size:18px;font-weight:bold}
 .back-link{display:inline-block;margin:4px 0 14px;padding:8px 12px;border-radius:999px;background:#242427;text-decoration:none}
+@media(max-width:1100px){.market-performance{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:900px){.market-performance{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:650px){.market-performance,.symbol-result-grid{grid-template-columns:1fr}}
 @media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:10px}h1{font-size:27px}}
@@ -451,6 +452,14 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 </div>
 <div class="metric">
+<div class="title">시장 승률</div>
+<div class="value {{'pos' if selected.performance_summary.win_rate_pct is not none and selected.performance_summary.win_rate_pct >= 50 else 'neg'}}">
+{% if selected.performance_summary.win_rate_pct is not none %}
+{{'%.1f'|format(selected.performance_summary.win_rate_pct)}}%
+{% else %}결과 대기{% endif %}
+</div>
+</div>
+<div class="metric">
 <div class="title">성과 발생 종목</div>
 <div class="value">{{selected.performance_summary.result_symbol_count}} / {{selected.symbol_count}}</div>
 </div>
@@ -493,6 +502,14 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% else %}대기{% endif %}
 </div>
 </div>
+<div class="symbol-result">
+<div class="label">승률</div>
+<div class="number {{'pos' if s.performance_summary.win_rate_pct is not none and s.performance_summary.win_rate_pct >= 50 else 'neg'}}">
+{% if s.performance_summary.win_rate_pct is not none %}
+{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%
+{% else %}대기{% endif %}
+</div>
+</div>
 </div>
 <div class="summary" style="margin-top:12px;margin-bottom:0">
 <span class="badge ok">완료 {{s.completed_cycle_count}}</span>
@@ -515,6 +532,65 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <span class="badge warn">청산 대기 저점 {{s.open_low_count}}</span>
 <span class="badge">진입 전 고점 {{s.high_only_count}}</span>
 </div>
+
+{% if s.performance_summary.has_results %}
+<div class="grid">
+<div class="metric">
+<div class="title">종목 승률</div>
+<div class="value {{'pos' if s.performance_summary.win_rate_pct >= 50 else 'neg'}}">
+{{'%.1f'|format(s.performance_summary.win_rate_pct)}}%
+</div>
+<div class="small">승 {{s.performance_summary.win_count}} · 패 {{s.performance_summary.loss_count}}</div>
+</div>
+<div class="metric">
+<div class="title">최고 / 최저 수익</div>
+<div class="value">
+<span class="pos">{{'%.2f'|format(s.performance_summary.best_return_pct)}}%</span>
+<span class="small"> / </span>
+<span class="{{'pos' if s.performance_summary.worst_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.performance_summary.worst_return_pct)}}%</span>
+</div>
+</div>
+<div class="metric">
+<div class="title">전체 결과 수</div>
+<div class="value">{{s.performance_summary.result_count}}건</div>
+</div>
+</div>
+
+<details>
+<summary>진입 방식별 통계</summary>
+<table>
+<tr><th>진입 방식</th><th>결과 수</th><th>승률</th><th>평균수익</th><th>최고수익</th><th>최저수익</th></tr>
+{% for stat in s.performance_summary.entry_mode_stats %}
+<tr>
+<td>{{stat.label}}</td>
+<td>{{stat.result_count}}</td>
+<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td>
+<td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
+<td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
+<td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
+</tr>
+{% endfor %}
+</table>
+</details>
+
+<details>
+<summary>청산 시간봉별 통계</summary>
+<table>
+<tr><th>청산 시간봉</th><th>결과 수</th><th>승률</th><th>평균수익</th><th>최고수익</th><th>최저수익</th><th>평균 보유</th></tr>
+{% for stat in s.performance_summary.exit_timeframe_stats %}
+<tr>
+<td>{{stat.timeframe}}</td>
+<td>{{stat.result_count}}</td>
+<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td>
+<td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
+<td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
+<td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
+<td>{{'%.0f'|format(stat.average_holding_minutes)}}분</td>
+</tr>
+{% endfor %}
+</table>
+</details>
+{% endif %}
 
 {% if s.open_cycle_preview %}
 <div class="mode-title">현재 진행 중인 진입 구간</div>
