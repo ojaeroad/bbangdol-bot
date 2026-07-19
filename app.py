@@ -348,7 +348,7 @@ a{color:#73c9ff}.toplinks{margin-bottom:18px}
 .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:12px 0}
 .metric{background:#151517;border:1px solid #303033;border-radius:12px;padding:14px}
 .metric .title{color:var(--blue);font-weight:bold;margin-bottom:8px}.metric .value{font-size:20px;font-weight:bold}
-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;min-width:760px}
 th,td{border-bottom:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}
 th{color:var(--blue)}
 details{margin:10px 0;background:#141416;border-radius:10px;padding:11px}
@@ -484,10 +484,61 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 </div>
 
+<div class="mode-title">청산 후보별 진입 방식 비교</div>
+<div style="overflow-x:auto">
+<table>
+<tr>
+<th>청산 시간봉</th>
+<th>청산가</th>
+<th>TF 관계</th>
+<th>최대TF</th>
+<th>전체분할</th>
+<th>시간봉별 분할</th>
+<th>개별 평균</th>
+<th>개별 최고</th>
+<th>개별 최저</th>
+<th>평균 보유</th>
+</tr>
+{% for r in c.exit_results %}
+<tr>
+<td>{{r.exit.timeframe}}</td>
+<td>{{r.exit.price}}</td>
+<td>{{r.relation_to_max_entry}}</td>
+<td class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">
+{{'%.3f'|format(r.max_timeframe_return_pct)}}%
+</td>
+<td class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">
+{{'%.3f'|format(r.all_split_return_pct)}}%
+</td>
+<td>
+{% for tf in r.timeframe_split_results %}
+<div>
+<span class="blue">{{tf.timeframe}}</span>
+<span class="{{'pos' if tf.return_pct >= 0 else 'neg'}}">
+{{'%.3f'|format(tf.return_pct)}}%
+</span>
+</div>
+{% endfor %}
+</td>
+<td class="{{'pos' if r.individual_summary.average_return_pct >= 0 else 'neg'}}">
+{{'%.3f'|format(r.individual_summary.average_return_pct)}}%
+</td>
+<td class="{{'pos' if r.individual_summary.maximum_return_pct >= 0 else 'neg'}}">
+{{'%.3f'|format(r.individual_summary.maximum_return_pct)}}%
+</td>
+<td class="{{'pos' if r.individual_summary.minimum_return_pct >= 0 else 'neg'}}">
+{{'%.3f'|format(r.individual_summary.minimum_return_pct)}}%
+</td>
+<td>{{'%.0f'|format(r.individual_summary.average_holding_minutes)}}분</td>
+</tr>
+{% endfor %}
+</table>
+</div>
+
 {% for r in c.exit_results %}
 <details>
 <summary>
-청산 {{r.exit.timeframe}} · {{r.exit.price}} ·
+상세 보기 · 청산 {{r.exit.timeframe}} · {{r.exit.price}} ·
 최대TF <span class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</span> ·
 전체분할 <span class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%</span>
 </summary>

@@ -767,6 +767,15 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                         }
                     )
 
+                individual_return_values = [
+                    item["return_pct"]
+                    for item in individual_results
+                ]
+                individual_holding_values = [
+                    item["holding_minutes"]
+                    for item in individual_results
+                ]
+
                 timeframe_split_results = []
                 for (timeframe, minutes), tf_entries in sorted(
                     tf_groups.items(),
@@ -827,6 +836,27 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                         ),
                         "timeframe_split_results": timeframe_split_results,
                         "individual_results": individual_results,
+                        "individual_summary": {
+                            "entry_count": len(individual_results),
+                            "average_return_pct": (
+                                sum(individual_return_values)
+                                / len(individual_return_values)
+                                if individual_return_values else None
+                            ),
+                            "maximum_return_pct": (
+                                max(individual_return_values)
+                                if individual_return_values else None
+                            ),
+                            "minimum_return_pct": (
+                                min(individual_return_values)
+                                if individual_return_values else None
+                            ),
+                            "average_holding_minutes": (
+                                sum(individual_holding_values)
+                                / len(individual_holding_values)
+                                if individual_holding_values else None
+                            ),
+                        },
                     }
                 )
 
