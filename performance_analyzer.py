@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import defaultdict
 from decimal import Decimal
 from typing import Any
@@ -533,6 +534,50 @@ def latest_analysis_pairs(limit: int = 50) -> list[dict[str, Any]]:
     ]
 
 
+def _market_category(
+    strategy: str,
+    exchange: str | None,
+    symbol: str,
+) -> tuple[str, str]:
+    """성과 화면용 시장 카테고리 분류.
+
+    STARFLOWER는 코인으로 분류한다.
+    1Q는 거래소명과 종목코드를 함께 사용해 국장/미장을 구분한다.
+    """
+    strategy_upper = (strategy or "").upper()
+    exchange_upper = (exchange or "").upper()
+    symbol_upper = (symbol or "").upper()
+
+    if strategy_upper == "STARFLOWER":
+        return "COIN", "코인 · 별꽃타점"
+
+    if strategy_upper == "1Q":
+        korea_tokens = {
+            "KRX", "KOSPI", "KOSDAQ", "KONEX",
+            "KOREA", "KR", "KSC", "KOE",
+        }
+        us_tokens = {
+            "NASDAQ", "NASDAQGS", "NASDAQGM", "NASDAQCM",
+            "NYSE", "NYSEARCA", "AMEX", "ARCA", "BATS",
+            "CBOE", "OTC", "USA", "US",
+        }
+
+        if any(token in exchange_upper for token in korea_tokens):
+            return "KOREA_1Q", "국장 · 1Q 대형주"
+
+        if any(token in exchange_upper for token in us_tokens):
+            return "US_1Q", "미장 · 1Q 대형주"
+
+        # 국내 종목은 TradingView 심볼이 6자리 숫자인 경우가 많다.
+        compact_symbol = re.sub(r"[^0-9]", "", symbol_upper)
+        if len(compact_symbol) == 6 and compact_symbol == symbol_upper:
+            return "KOREA_1Q", "국장 · 1Q 대형주"
+
+        return "US_1Q", "미장 · 1Q 대형주"
+
+    return "OTHER", "기타"
+
+
 def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
     """회원용 대시보드 데이터.
 
@@ -779,8 +824,16 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
                 }
             )
 
+        category_key, category_label = _market_category(
+            strategy,
+            exchange,
+            symbol,
+        )
+
         symbols.append(
             {
+                "category_key": category_key,
+                "category_label": category_label,
                 "strategy": strategy,
                 "exchange": exchange,
                 "symbol": symbol,
@@ -805,8 +858,50 @@ def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
         reverse=True,
     )
 
+    category_order = ["COIN", "KOREA_1Q", "US_1Q", "OTHER"]
+    category_labels = {
+        "COIN": "코인 · 별꽃타점",
+        "KOREA_1Q": "국장 · 1Q 대형주",
+        "US_1Q": "미장 · 1Q 대형주",
+        "OTHER": "기타",
+    }
+
+    limited_symbols = symbols[:safe_limit]
+    categories = []
+
+    for category_key in category_order:
+        category_symbols = [
+            item for item in limited_symbols
+            if item["category_key"] == category_key
+        ]
+        if not category_symbols:
+            continue
+
+        categories.append(
+            {
+                "category_key": category_key,
+                "category_label": category_labels[category_key],
+                "anchor": category_key.lower(),
+                "symbol_count": len(category_symbols),
+                "completed_cycle_count": sum(
+                    item["completed_cycle_count"]
+                    for item in category_symbols
+                ),
+                "open_low_count": sum(
+                    item["open_low_count"]
+                    for item in category_symbols
+                ),
+                "signal_count": sum(
+                    item["low_count"] + item["high_count"]
+                    for item in category_symbols
+                ),
+                "symbols": category_symbols,
+            }
+        )
+
     return {
         "ok": True,
         "symbol_count": len(symbols),
-        "symbols": symbols[:safe_limit],
+        "categories": categories,
+        "symbols": limited_symbols,
     }

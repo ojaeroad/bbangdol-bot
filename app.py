@@ -338,6 +338,12 @@ details{margin:10px 0;background:#141416;border-radius:10px;padding:11px}
 summary{cursor:pointer;font-weight:bold}
 .small{font-size:12px;color:#aaa}.pos{color:var(--green);font-weight:bold}
 .mode-title{font-size:18px;color:var(--blue);margin:14px 0 4px}
+.category-nav{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 22px}
+.category-nav a{background:#242427;border:1px solid #3a3a3d;border-radius:999px;padding:9px 14px;text-decoration:none}
+.category-head{display:flex;justify-content:space-between;gap:15px;align-items:center;margin:32px 0 10px;padding:14px 16px;background:#171719;border-left:5px solid var(--blue);border-radius:10px}
+.category-head h2{margin:0}
+.category-summary{display:flex;gap:9px;flex-wrap:wrap}
+.empty-note{color:#999;padding:14px 0}
 @media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:10px}h1{font-size:27px}}
 </style>
 </head>
@@ -350,7 +356,27 @@ summary{cursor:pointer;font-weight:bold}
 <a href="/performance/cycles">사이클 JSON</a>
 </div>
 
-{% for s in data.symbols %}
+<div class="category-nav">
+{% for category in data.categories %}
+<a href="#{{category.anchor}}">
+{{category.category_label}} · 종목 {{category.symbol_count}}
+</a>
+{% endfor %}
+</div>
+
+{% for category in data.categories %}
+<section id="{{category.anchor}}">
+<div class="category-head">
+<h2>{{category.category_label}}</h2>
+<div class="category-summary">
+<span class="badge">종목 {{category.symbol_count}}</span>
+<span class="badge">신호 {{category.signal_count}}</span>
+<span class="badge ok">완료 Cycle {{category.completed_cycle_count}}</span>
+<span class="badge warn">청산 대기 {{category.open_low_count}}</span>
+</div>
+</div>
+
+{% for s in category.symbols %}
 <div class="card">
 <h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
 
@@ -409,7 +435,7 @@ summary{cursor:pointer;font-weight:bold}
 {% endif %}
 
 {% for c in s.completed_cycles %}
-<details open>
+<details>
 <summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 청산후보 {{c.exit_count}}회</summary>
 
 <div class="grid">
@@ -490,6 +516,8 @@ summary{cursor:pointer;font-weight:bold}
 </details>
 {% endif %}
 </div>
+{% endfor %}
+</section>
 {% endfor %}
 </body>
 </html>
