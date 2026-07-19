@@ -3,12 +3,12 @@ import os, json, logging, time, re, hmac, hashlib, math, threading
 from time import time as now
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlencode
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 import requests
 
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import queue_signal_save, health_summary, latest_signals
-from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs
+from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -271,7 +271,7 @@ def performance_latest():
 
 
 # --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 청산 ---
-@app.route("/performance/analyze", methods=["GET", "POST"])
+@app.post("/performance/analyze")
 def performance_analyze():
     try:
         return jsonify(rebuild_individual_pairs()), 200
@@ -298,6 +298,81 @@ def performance_analysis_latest():
         return jsonify({"ok": True, "count": len(rows), "pairs": rows}), 200
     except Exception as e:
         log.exception("Performance latest analysis failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/performance/dashboard")
+def performance_dashboard():
+    try:
+        try:
+            limit = int(request.args.get("limit", "30"))
+        except ValueError:
+            limit = 30
+        data = visual_cycle_data(limit)
+        return render_template_string("""
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>빵돌이 성과 분석</title>
+<style>
+body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px}
+.card{background:#1d1d1d;border:1px solid #333;border-radius:14px;padding:16px;margin:14px 0}
+.summary{display:flex;gap:10px;flex-wrap:wrap}.badge{background:#2a2a2a;border-radius:999px;padding:7px 12px}
+.ok{color:#57d38c}.warn{color:#ffcc66}.small{font-size:12px;color:#aaa}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}
+th,td{border-bottom:1px solid #333;padding:9px;text-align:left;vertical-align:top}th{color:#9fd3ff}
+details{margin:10px 0;background:#171717;border-radius:10px;padding:10px}summary{cursor:pointer;font-weight:bold}
+.pos{color:#57d38c;font-weight:bold}.neg{color:#ff7070;font-weight:bold}a{color:#83c5ff}
+</style></head><body>
+<h1>회원 운영용 성과 분석</h1>
+<div class="small"><a href="/performance/health">DB 상태</a> · <a href="/performance/latest">최근 신호</a> · <a href="/performance/analyze">분석 실행</a></div>
+{% for s in data.symbols %}
+<div class="card">
+<h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
+<div class="summary">
+<span class="badge">저점 {{s.low_count}}</span><span class="badge">고점 {{s.high_count}}</span>
+<span class="badge ok">완료 사이클 {{s.completed_cycle_count}}</span>
+<span class="badge warn">청산 대기 저점 {{s.open_low_count}}</span>
+<span class="badge">진입 전 고점 {{s.high_only_count}}</span>
+</div>
+{% for c in s.completed_cycles %}
+<details open><summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 청산후보 {{c.exit_count}}회</summary>
+<table><tr><th>진입 신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
+{% for e in c.entries %}<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>{% endfor %}
+</table>
+<table><tr><th>청산</th><th>관계</th><th>청산가</th><th>최대TF 진입</th><th>전체분할</th><th>보유시간</th></tr>
+{% for r in c.exit_results %}
+<tr><td>{{r.exit.signal_no}} / {{r.exit.timeframe}}</td><td>{{r.relation_to_max_entry}}</td><td>{{r.exit.price}}</td>
+<td class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</td>
+<td class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%<br><span class="small">평균가 {{r.all_split_entry_price}}</span></td>
+<td>{{r.holding_minutes_from_max_entry}}분</td></tr>{% endfor %}
+</table></details>{% endfor %}
+{% if s.open_lows %}
+<details><summary>아직 고점이 오지 않은 저점 신호 {{s.open_low_count}}건</summary>
+<table><tr><th>신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
+{% for e in s.open_lows %}<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>{% endfor %}
+</table></details>{% endif %}
+{% if s.high_only %}
+<details><summary>진입 저점보다 먼저 발생한 고점 {{s.high_only_count}}건</summary>
+<table><tr><th>신호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
+{% for e in s.high_only %}<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>{% endfor %}
+</table></details>{% endif %}
+</div>{% endfor %}
+</body></html>
+        """, data=data), 200
+    except Exception as e:
+        log.exception("Performance dashboard failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/performance/cycles")
+def performance_cycles_json():
+    try:
+        try:
+            limit = int(request.args.get("limit", "30"))
+        except ValueError:
+            limit = 30
+        return jsonify(visual_cycle_data(limit)), 200
+    except Exception as e:
+        log.exception("Performance cycles failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---

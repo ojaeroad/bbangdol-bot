@@ -531,3 +531,120 @@ def latest_analysis_pairs(limit: int = 50) -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+
+
+def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
+    """브라우저 시각화용 원본 사이클/신호 흐름 데이터."""
+    ensure_analysis_schema()
+    safe_limit = max(1, min(int(limit_symbols), 100))
+
+    with _connect() as conn:
+        signals = _load_signals(conn)
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for s in signals:
+        grouped[(s["strategy"], s["exchange"] or "", s["symbol"])].append(s)
+
+    symbols = []
+    for (strategy, exchange, symbol), rows in grouped.items():
+        lows = [r for r in rows if r["signal_type"] == "LOW"]
+        highs = [r for r in rows if r["signal_type"] == "HIGH"]
+
+        completed = []
+        open_lows = []
+        high_only = []
+        entries = []
+        exits = []
+
+        def finalize():
+            nonlocal entries, exits
+            if entries and exits:
+                completed.append({"entries": entries[:], "exits": exits[:]})
+            elif entries:
+                open_lows.extend(entries)
+            entries = []
+            exits = []
+
+        for r in rows:
+            if r["signal_type"] == "LOW":
+                if exits:
+                    finalize()
+                entries.append(r)
+            else:
+                if entries:
+                    exits.append(r)
+                else:
+                    high_only.append(r)
+        finalize()
+
+        def slim(r):
+            return {
+                "signal_no": r["signal_no"],
+                "type": r["signal_type"],
+                "timeframe": r["timeframe"],
+                "timeframe_minutes": r["timeframe_minutes"],
+                "price": str(r["price"]),
+                "time": r["time"].isoformat(),
+            }
+
+        cycle_rows = []
+        for idx, c in enumerate(completed, start=1):
+            entry_prices = [e["price"] for e in c["entries"]]
+            max_tf_entry = max(c["entries"], key=lambda e: e["timeframe_minutes"] or -1)
+            all_split_price = _weighted_average(entry_prices)
+
+            exit_results = []
+            for x in c["exits"]:
+                all_split_return = float(
+                    (x["price"] - all_split_price) / all_split_price * Decimal("100")
+                )
+                max_tf_return = float(
+                    (x["price"] - max_tf_entry["price"])
+                    / max_tf_entry["price"]
+                    * Decimal("100")
+                )
+                exit_results.append({
+                    "exit": slim(x),
+                    "relation_to_max_entry": _relation(
+                        max_tf_entry["timeframe_minutes"], x["timeframe_minutes"]
+                    ),
+                    "all_split_entry_price": str(all_split_price),
+                    "all_split_return_pct": all_split_return,
+                    "max_timeframe_entry": slim(max_tf_entry),
+                    "max_timeframe_return_pct": max_tf_return,
+                    "holding_minutes_from_max_entry": int(
+                        (x["time"] - max_tf_entry["time"]).total_seconds() // 60
+                    ),
+                })
+
+            cycle_rows.append({
+                "cycle_no": idx,
+                "entry_count": len(c["entries"]),
+                "exit_count": len(c["exits"]),
+                "entries": [slim(e) for e in c["entries"]],
+                "exit_results": exit_results,
+            })
+
+        symbols.append({
+            "strategy": strategy,
+            "exchange": exchange,
+            "symbol": symbol,
+            "low_count": len(lows),
+            "high_count": len(highs),
+            "completed_cycle_count": len(cycle_rows),
+            "open_low_count": len(open_lows),
+            "high_only_count": len(high_only),
+            "completed_cycles": cycle_rows,
+            "open_lows": [slim(r) for r in open_lows[-30:]],
+            "high_only": [slim(r) for r in high_only[-30:]],
+        })
+
+    symbols.sort(
+        key=lambda s: (
+            s["completed_cycle_count"],
+            s["open_low_count"],
+            s["high_count"] + s["low_count"],
+        ),
+        reverse=True,
+    )
+    return {"ok": True, "symbol_count": len(symbols), "symbols": symbols[:safe_limit]}
