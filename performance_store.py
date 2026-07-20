@@ -246,3 +246,41 @@ def health_summary() -> dict[str, Any]:
         "signal_count": int(row[0]),
         "latest_signal_at": row[1].isoformat() if row[1] else None,
     }
+
+
+def latest_signals(limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent saved signals as JSON-serializable dictionaries."""
+    safe_limit = max(1, min(int(limit), 500))
+    if not PERFORMANCE_DATABASE_URL:
+        return []
+    ensure_schema()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, strategy, route, exchange, raw_exchange, symbol,
+                   side, signal_type, timeframe, timeframe_minutes,
+                   signal_price, received_at, raw_message
+            FROM performance_signals
+            ORDER BY received_at DESC, id DESC
+            LIMIT %s
+            """,
+            (safe_limit,),
+        ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "strategy": row[1],
+            "route": row[2],
+            "exchange": row[3],
+            "raw_exchange": row[4],
+            "symbol": row[5],
+            "side": row[6],
+            "signal_type": row[7],
+            "timeframe": row[8],
+            "timeframe_minutes": row[9],
+            "signal_price": float(row[10]) if row[10] is not None else None,
+            "received_at": row[11].isoformat() if row[11] else None,
+            "raw_message": row[12],
+        }
+        for row in rows
+    ]
