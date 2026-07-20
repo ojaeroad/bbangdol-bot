@@ -521,6 +521,170 @@ def _member_symbol_statistics(symbol_data, period_key="all"):
 
 
 
+
+CATEGORY_DISPLAY_ORDER = {
+    "KOREA_1Q": 0,
+    "US_1Q": 1,
+    "COIN": 2,
+}
+
+
+def _sort_performance_categories(data):
+    """관리자·회원 화면 카테고리를 국장 → 미장 → 코인 순으로 정렬."""
+    if not data:
+        return data
+
+    categories = list(data.get("categories") or [])
+    categories.sort(
+        key=lambda item: CATEGORY_DISPLAY_ORDER.get(
+            item.get("category_key"),
+            999,
+        )
+    )
+    data = dict(data)
+    data["categories"] = categories
+    return data
+
+
+def _entry_exit_timeframe_matrix(symbol_data, period_key="all"):
+    """
+    진입 시간봉 × 청산 시간봉 조합별 실제 성과 집계.
+
+    기준:
+    - 각 개별 진입(individual_results)을 해당 청산 고점의 시간봉과 연결한다.
+    - 평균수익률: 조합별 개별 결과의 산술평균
+    - 누적수익률: 조합별 개별 수익률의 단순합
+    - 승률: 수익률이 0보다 큰 결과 비율
+    - 향후 시장상태(정배열·역배열 등)는 context_breakdown에 확장 가능
+    """
+    start_at = _period_start(period_key)
+    buckets = {}
+
+    for cycle in symbol_data.get("completed_cycles") or []:
+        if not _cycle_in_period(cycle, start_at):
+            continue
+
+        for result in cycle.get("exit_results") or []:
+            exit_obj = result.get("exit") or {}
+            exit_tf = exit_obj.get("timeframe") or "unknown"
+
+            for individual in result.get("individual_results") or []:
+                entry = individual.get("entry") or {}
+                entry_tf = entry.get("timeframe") or "unknown"
+                return_pct = individual.get("return_pct")
+                if return_pct is None:
+                    continue
+
+                holding_minutes = individual.get("holding_minutes")
+                key = (entry_tf, exit_tf)
+                bucket = buckets.setdefault(
+                    key,
+                    {
+                        "entry_timeframe": entry_tf,
+                        "entry_minutes": TIMEFRAME_ORDER_MINUTES.get(
+                            entry_tf, 999999
+                        ),
+                        "exit_timeframe": exit_tf,
+                        "exit_minutes": TIMEFRAME_ORDER_MINUTES.get(
+                            exit_tf, 999999
+                        ),
+                        "returns": [],
+                        "holding_minutes": [],
+                        # 향후 Pine 웹훅에 MA 상태 등이 들어오면 이곳에서 분류한다.
+                        "context_breakdown": {},
+                    },
+                )
+                bucket["returns"].append(float(return_pct))
+                if holding_minutes is not None:
+                    bucket["holding_minutes"].append(
+                        float(holding_minutes)
+                    )
+
+    rows = []
+    for bucket in buckets.values():
+        returns = bucket.pop("returns")
+        holdings = bucket.pop("holding_minutes")
+        wins = [value for value in returns if value > 0]
+
+        bucket.update(
+            {
+                "result_count": len(returns),
+                "win_count": len(wins),
+                "loss_count": len(returns) - len(wins),
+                "win_rate_pct": (
+                    len(wins) / len(returns) * 100
+                    if returns else None
+                ),
+                "average_return_pct": (
+                    sum(returns) / len(returns)
+                    if returns else None
+                ),
+                "cumulative_return_pct": (
+                    sum(returns) if returns else None
+                ),
+                "best_return_pct": (
+                    max(returns) if returns else None
+                ),
+                "worst_return_pct": (
+                    min(returns) if returns else None
+                ),
+                "average_holding_minutes": (
+                    sum(holdings) / len(holdings)
+                    if holdings else None
+                ),
+            }
+        )
+        rows.append(bucket)
+
+    rows.sort(
+        key=lambda item: (
+            item["entry_minutes"],
+            item["exit_minutes"],
+        )
+    )
+
+    entry_timeframes = sorted(
+        {row["entry_timeframe"] for row in rows},
+        key=lambda tf: TIMEFRAME_ORDER_MINUTES.get(tf, 999999),
+    )
+    exit_timeframes = sorted(
+        {row["exit_timeframe"] for row in rows},
+        key=lambda tf: TIMEFRAME_ORDER_MINUTES.get(tf, 999999),
+    )
+
+    lookup = {
+        (row["entry_timeframe"], row["exit_timeframe"]): row
+        for row in rows
+    }
+
+    matrix = []
+    for entry_tf in entry_timeframes:
+        cells = []
+        for exit_tf in exit_timeframes:
+            cells.append(
+                {
+                    "exit_timeframe": exit_tf,
+                    "stat": lookup.get((entry_tf, exit_tf)),
+                }
+            )
+        matrix.append(
+            {
+                "entry_timeframe": entry_tf,
+                "cells": cells,
+            }
+        )
+
+    return {
+        "rows": rows,
+        "matrix": matrix,
+        "entry_timeframes": entry_timeframes,
+        "exit_timeframes": exit_timeframes,
+        "has_results": bool(rows),
+        "result_count": sum(row["result_count"] for row in rows),
+    }
+
+
+
 def _build_member_chart_data(selected_category_data, period_key="all"):
     """
     회원용 시각화 데이터.
@@ -956,15 +1120,15 @@ def performance_member():
             limit = 100
 
         selected_category = (
-            request.args.get("category", "COIN")
+            request.args.get("category", "KOREA_1Q")
             .strip()
             .upper()
         )
         allowed_categories = {"COIN", "KOREA_1Q", "US_1Q"}
         if selected_category not in allowed_categories:
-            selected_category = "COIN"
+            selected_category = "KOREA_1Q"
 
-        data = visual_cycle_data(limit)
+        data = _sort_performance_categories(visual_cycle_data(limit))
         selected = next(
             (
                 category
@@ -1425,18 +1589,18 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 def performance_member_charts():
     try:
         selected_category = (
-            request.args.get("category", "COIN")
+            request.args.get("category", "KOREA_1Q")
             .strip()
             .upper()
         )
         if selected_category not in {"COIN", "KOREA_1Q", "US_1Q"}:
-            selected_category = "COIN"
+            selected_category = "KOREA_1Q"
 
         period_key = request.args.get("period", "all").strip().lower()
         if period_key not in {"today", "7d", "30d", "all"}:
             period_key = "all"
 
-        data = visual_cycle_data(1000)
+        data = _sort_performance_categories(visual_cycle_data(1000))
         selected = next(
             (
                 category
@@ -1628,11 +1792,11 @@ def performance_export_csv():
         if period_key not in {"today", "7d", "30d", "all"}:
             period_key = "all"
 
-        category_key = request.args.get("category", "COIN").strip().upper()
+        category_key = request.args.get("category", "KOREA_1Q").strip().upper()
         if category_key not in {"COIN", "KOREA_1Q", "US_1Q"}:
             category_key = "COIN"
 
-        data = visual_cycle_data(1000)
+        data = _sort_performance_categories(visual_cycle_data(1000))
         category = next(
             (
                 item for item in data["categories"]
@@ -1719,15 +1883,15 @@ def performance_dashboard():
             limit = 100
 
         selected_category = (
-            request.args.get("category", "COIN")
+            request.args.get("category", "KOREA_1Q")
             .strip()
             .upper()
         )
         allowed_categories = {"COIN", "KOREA_1Q", "US_1Q"}
         if selected_category not in allowed_categories:
-            selected_category = "COIN"
+            selected_category = "KOREA_1Q"
 
-        data = visual_cycle_data(limit)
+        data = _sort_performance_categories(visual_cycle_data(limit))
         selected = next(
             (
                 category
@@ -1822,6 +1986,14 @@ def performance_dashboard():
             .upper()
         )
         selected_symbol = None
+        entry_exit_matrix = {
+            "rows": [],
+            "matrix": [],
+            "entry_timeframes": [],
+            "exit_timeframes": [],
+            "has_results": False,
+            "result_count": 0,
+        }
         if selected and selected_symbol_name:
             selected_symbol = next(
                 (
@@ -1831,6 +2003,11 @@ def performance_dashboard():
                 ),
                 None,
             )
+            if selected_symbol:
+                entry_exit_matrix = _entry_exit_timeframe_matrix(
+                    selected_symbol,
+                    "all",
+                )
 
         return render_template_string("""
 <!doctype html>
@@ -1877,6 +2054,15 @@ summary{cursor:pointer;font-weight:bold}
 .symbol-result .label{font-size:12px;color:#aaa;margin-bottom:5px}
 .symbol-result .number{font-size:18px;font-weight:bold}
 .back-link{display:inline-block;margin:4px 0 14px;padding:8px 12px;border-radius:999px;background:#242427;text-decoration:none}
+.matrix-wrap{overflow-x:auto;margin-top:12px}
+.tf-matrix{border-collapse:separate;border-spacing:5px;min-width:760px}
+.tf-matrix th{background:#121214;border:none;text-align:center;position:sticky;top:0}
+.tf-matrix td{border:none;padding:0;min-width:125px}
+.matrix-cell{display:block;background:#151517;border:1px solid #303035;border-radius:10px;padding:10px;text-align:center;min-height:88px}
+.matrix-cell.empty{color:#666;display:flex;align-items:center;justify-content:center}
+.matrix-cell .main{font-size:20px;font-weight:bold;margin-bottom:5px}
+.matrix-cell .sub{font-size:12px;color:#aaa;line-height:1.45}
+.analysis-note{background:#141416;border-left:4px solid var(--yellow);padding:12px 14px;border-radius:8px;color:#bbb;margin:14px 0}
 @media(max-width:1100px){.market-performance{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:900px){.market-performance{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:650px){.market-performance,.symbol-result-grid{grid-template-columns:1fr}}
@@ -2048,6 +2234,103 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="value">{{s.performance_summary.result_count}}건</div>
 </div>
 </div>
+
+
+<details open>
+<summary>진입 시간봉 × 청산 시간봉 수익률 매트릭스</summary>
+
+<div class="analysis-note">
+각 칸은 해당 시간봉에서 진입해 해당 시간봉 고점에서 청산했을 때의
+개별 진입 결과를 누적한 통계다. 평균수익과 단순 누적수익을 함께 표시한다.
+</div>
+
+{% if entry_exit_matrix.has_results %}
+<div class="matrix-wrap">
+<table class="tf-matrix">
+<tr>
+<th>진입＼청산</th>
+{% for exit_tf in entry_exit_matrix.exit_timeframes %}
+<th>{{exit_tf}} 고점</th>
+{% endfor %}
+</tr>
+
+{% for matrix_row in entry_exit_matrix.matrix %}
+<tr>
+<th>{{matrix_row.entry_timeframe}} 진입</th>
+{% for cell in matrix_row.cells %}
+<td>
+{% if cell.stat %}
+<div class="matrix-cell">
+<div class="main {{'pos' if cell.stat.average_return_pct >= 0 else 'neg'}}">
+평균 {{'%.3f'|format(cell.stat.average_return_pct)}}%
+</div>
+<div class="sub">
+누적 {{'%.3f'|format(cell.stat.cumulative_return_pct)}}%<br>
+승률 {{'%.1f'|format(cell.stat.win_rate_pct)}}% · {{cell.stat.result_count}}건<br>
+평균 보유
+{% if cell.stat.average_holding_minutes is not none %}
+{{'%.0f'|format(cell.stat.average_holding_minutes)}}분
+{% else %}-{% endif %}
+</div>
+</div>
+{% else %}
+<div class="matrix-cell empty">데이터 없음</div>
+{% endif %}
+</td>
+{% endfor %}
+</tr>
+{% endfor %}
+</table>
+</div>
+
+<details>
+<summary>조합별 누적 통계 상세 {{entry_exit_matrix.result_count}}건</summary>
+<table>
+<tr>
+<th>진입 시간봉</th>
+<th>청산 시간봉</th>
+<th>결과 수</th>
+<th>승률</th>
+<th>평균수익</th>
+<th>누적수익</th>
+<th>최고수익</th>
+<th>최저수익</th>
+<th>평균 보유</th>
+</tr>
+{% for stat in entry_exit_matrix.rows %}
+<tr>
+<td>{{stat.entry_timeframe}}</td>
+<td>{{stat.exit_timeframe}}</td>
+<td>{{stat.result_count}}</td>
+<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td>
+<td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
+<td class="{{'pos' if stat.cumulative_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.cumulative_return_pct)}}%</td>
+<td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
+<td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
+<td>
+{% if stat.average_holding_minutes is not none %}
+{{'%.0f'|format(stat.average_holding_minutes)}}분
+{% else %}-{% endif %}
+</td>
+</tr>
+{% endfor %}
+</table>
+</details>
+{% else %}
+<div class="empty-note">
+진입 시간봉과 청산 시간봉을 연결할 완료 데이터가 아직 없습니다.
+</div>
+{% endif %}
+</details>
+
+<details>
+<summary>향후 시장 상태 조건 분석</summary>
+<div class="analysis-note">
+향후 TradingView 웹훅에 일봉·주봉 이평선 배열 상태를 함께 저장하면,
+정배열·역배열·혼조 상태별로 동일한 진입TF × 청산TF 통계를 분리할 수 있다.
+현재 과거 데이터에는 해당 시점의 이평선 배열 정보가 없으므로 임의 추정하지 않는다.
+</div>
+</details>
 
 <details>
 <summary>진입 방식별 통계</summary>
@@ -2276,6 +2559,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
         selected_symbol=selected_symbol,
         selected_symbol_name=selected_symbol_name,
         market_stats=market_stats,
+        entry_exit_matrix=entry_exit_matrix,
         ), 200
 
     except Exception as exc:
