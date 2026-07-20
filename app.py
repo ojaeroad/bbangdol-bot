@@ -13,6 +13,7 @@ import requests
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import queue_signal_save, health_summary, latest_signals
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
+from performance_group_analyzer import group_analysis_data, update_settings as update_group_settings
 
 app = Flask(__name__)
 app.secret_key = os.getenv("PERFORMANCE_SESSION_SECRET", "").strip()
@@ -2565,6 +2566,129 @@ class="{{'active-category' if category.category_key == selected_category else ''
     except Exception as exc:
         log.exception("Performance dashboard failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/performance/group-analysis", methods=["GET", "POST"])
+@admin_required
+def performance_group_analysis():
+    if request.method == "POST":
+        try:
+            recent_n = int(request.form.get("recent_interval_count", "5"))
+            update_group_settings(recent_interval_count=recent_n)
+            flash("최근 평균 횟수 설정을 저장했습니다.")
+        except Exception as exc:
+            flash(f"설정 저장 실패: {exc}")
+        market = request.form.get("market", "KOREA")
+        symbol = request.form.get("symbol", "")
+        return redirect(f"/performance/group-analysis?market={market}&symbol={symbol}")
+
+    market = request.args.get("market", "KOREA").upper()
+    symbol = request.args.get("symbol", "")
+    data = group_analysis_data(market=market, symbol=symbol)
+
+    return render_template_string("""
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>포지션 그룹 성과 분석</title>
+<style>
+:root{--bg:#09090b;--card:#17171a;--line:#303036;--text:#f4f4f5;--muted:#a1a1aa;--yellow:#facc15}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif}
+.wrap{max-width:1450px;margin:auto;padding:22px}.top{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+a{color:#fde047;text-decoration:none}.tab,.btn{padding:10px 14px;border-radius:9px;border:1px solid var(--line);background:#202024;color:white}
+.tab.on{background:#854d0e;border-color:#eab308}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:17px;margin-top:15px}
+table{width:100%;border-collapse:collapse;margin-top:10px;min-width:900px}th,td{padding:10px;border-bottom:1px solid #2d2d32;text-align:left}
+th{color:#d4d4d8}.scroll{overflow-x:auto}.pos{color:#4ade80}.neg{color:#fb7185}.muted{color:var(--muted);font-size:13px}
+input,select{background:#101012;color:white;border:1px solid #3f3f46;border-radius:8px;padding:9px}
+details{background:#121215;border:1px solid #2c2c31;border-radius:11px;padding:12px;margin-top:10px}
+summary{cursor:pointer;font-weight:bold}
+</style>
+</head>
+<body><div class="wrap">
+<div class="top">
+<a class="btn" href="/performance/dashboard">← 기존 관리자 대시보드</a>
+<h1 style="margin:0 14px 0 0">포지션 그룹 성과 분석</h1>
+{% for item in data.markets %}
+<a class="tab {{'on' if item == data.market else ''}}" href="?market={{item}}">{{ {'KOREA':'국장','US':'미장','COIN':'코인'}[item] }}</a>
+{% endfor %}
+</div>
+
+<div class="card">
+<form method="get" class="top">
+<input type="hidden" name="market" value="{{data.market}}">
+<label>종목
+<select name="symbol" onchange="this.form.submit()">
+{% for item in data.symbols %}
+<option value="{{item}}" {{'selected' if item == data.symbol else ''}}>{{item}}</option>
+{% endfor %}
+</select></label>
+</form>
+{% if not data.symbol %}<p class="muted">해당 시장에 저장된 종목 신호가 아직 없습니다.</p>{% endif %}
+</div>
+
+<div class="card">
+<h2>분석 설정</h2>
+<form method="post" class="top">
+<input type="hidden" name="market" value="{{data.market}}">
+<input type="hidden" name="symbol" value="{{data.symbol or ''}}">
+<label>최근 평균 횟수
+<input type="number" min="1" max="100" name="recent_interval_count" value="{{data.settings.recent_interval_count}}">
+</label>
+<button class="btn" type="submit">저장 후 재계산</button>
+<span class="muted">진입 최대 {{data.settings.entry_split_limit}}회 · 포지션별 진입 쿨타임 {{data.settings.entry_cooldown_minutes}}분 · 시간봉 자체 쿨타임은 발생주기 통계에만 적용</span>
+</form>
+</div>
+
+{% if data.symbol %}
+<div class="card">
+<h2>{{data.symbol}} 매수 그룹 → 매도 그룹 누적 성과</h2>
+<div class="scroll"><table>
+<tr><th>매수 그룹</th><th>최초 매수 시간봉</th><th>매도 그룹</th><th>매도 시간봉</th><th>완료</th><th>평균수익</th><th>최고</th><th>최저</th><th>승률</th><th>평균 보유</th></tr>
+{% for row in data.performance_summary %}
+<tr><td>{{row.entry_group_label}}</td><td>{{row.entry_timeframe}}</td>
+<td>{{row.exit_group_label}}</td><td>{{row.exit_timeframe}}</td><td>{{row.trade_count}}회</td>
+<td class="{{'pos' if row.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.average_return_pct)}}%</td>
+<td>{{'%.3f'|format(row.best_return_pct)}}%</td><td>{{'%.3f'|format(row.worst_return_pct)}}%</td>
+<td>{{'%.1f'|format(row.win_rate_pct)}}%</td><td>{{row.average_holding_text}}</td></tr>
+{% else %}<tr><td colspan="10">완료된 시간봉별 포지션이 아직 없습니다.</td></tr>{% endfor %}
+</table></div>
+</div>
+
+<div class="card">
+<h2>타점 발생 주기</h2>
+<div class="scroll"><table>
+<tr><th>그룹</th><th>시간봉</th><th>누적 발생</th><th>누적 평균</th><th>최근 {{data.settings.recent_interval_count}}회 평균</th><th>최단</th><th>최장</th><th>마지막 발생 후</th></tr>
+{% for row in data.occurrence_stats %}
+<tr><td>{{row.group_label}}</td><td>{{row.timeframe}}</td><td>{{row.occurrence_count}}회</td>
+<td>{{row.overall_average_text}}</td><td>{{row.recent_average_text}}</td><td>{{row.minimum_text}}</td><td>{{row.maximum_text}}</td><td>{{row.elapsed_text}}</td></tr>
+{% else %}<tr><td colspan="8">주기를 계산할 저점 신호가 없습니다.</td></tr>{% endfor %}
+</table></div>
+</div>
+
+<div class="card">
+<h2>실제 백데이터: 진입·청산 시각</h2>
+{% for position in data.positions|reverse %}
+<details>
+<summary>{{position.entry_group_label}} · 최초 {{position.entry_timeframe}} 포지션 · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
+<p><b>실제 진입 구성:</b> {{position.entry_source_summary}}<br>
+첫 진입 {{position.entry_first_time}}<br>마지막 진입 {{position.entry_last_time}}<br>
+상태: {{'3회 진입 완료' if position.entry_complete else '유효 진입만 계산'}}</p>
+<div class="scroll"><table>
+<tr><th>청산 그룹</th><th>청산 시간봉</th><th>청산 시각</th><th>청산가</th><th>보유기간</th><th>수익률</th></tr>
+{% for exit in position.exit_results %}
+<tr><td>{{exit.exit_group_label}}</td><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
+<td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>
+{% else %}<tr><td colspan="6">아직 유효한 첫 고점 청산이 없습니다.</td></tr>{% endfor %}
+</table></div>
+</details>
+{% else %}<p class="muted">생성된 매수 포지션이 없습니다.</p>{% endfor %}
+</div>
+{% endif %}
+</div></body></html>
+""", data=data), 200
+
 
 @app.get("/performance/cycles")
 @admin_required
