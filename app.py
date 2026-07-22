@@ -3389,6 +3389,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endif %}
 </section>
 {% endif %}
+{% endif %}
 </body>
 </html>
         """,
