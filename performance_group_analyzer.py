@@ -657,3 +657,58 @@ def group_analysis_data(
         ),
         "group_labels": GROUP_LABEL,
     }
+
+
+def group_analysis_market_data(
+    market: str | None = None,
+) -> dict[str, Any]:
+    """한 시장 전체 종목을 한 번의 신호 조회로 분석한다.
+
+    회원 페이지에서 종목마다 DB 전체를 다시 읽지 않도록 사용하는 배치 API다.
+    """
+    settings = get_settings()
+    all_signals = _load_signals()
+    now = datetime.now(timezone.utc)
+
+    available_markets = ["KOREA", "US", "COIN"]
+    selected_market = (
+        market if market in available_markets else "KOREA"
+    )
+    market_rows = [
+        row for row in all_signals if row["market"] == selected_market
+    ]
+
+    rows_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in market_rows:
+        rows_by_symbol[row["symbol"]].append(row)
+
+    symbol_data: dict[str, dict[str, Any]] = {}
+    for symbol, symbol_rows in sorted(rows_by_symbol.items()):
+        lows = [
+            row for row in symbol_rows if row["signal_type"] == "LOW"
+        ]
+        highs = [
+            row for row in symbol_rows if row["signal_type"] == "HIGH"
+        ]
+        positions = _build_positions(lows, highs, settings)
+        symbol_data[symbol] = {
+            "settings": settings,
+            "market": selected_market,
+            "symbol": symbol,
+            "raw_signal_count": len(symbol_rows),
+            "positions": positions,
+            "performance_summary": _performance_summary(positions),
+            "occurrence_stats": _occurrence_stats(
+                symbol_rows,
+                settings["recent_interval_count"],
+                now,
+            ),
+        }
+
+    return {
+        "settings": settings,
+        "market": selected_market,
+        "markets": available_markets,
+        "symbols": sorted(symbol_data),
+        "symbol_data": symbol_data,
+    }
