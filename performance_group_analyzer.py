@@ -444,6 +444,68 @@ def _build_entry_positions(
     return positions
 
 
+
+def _build_cycle_entry_positions(
+    lows: list[dict[str, Any]],
+    highs: list[dict[str, Any]],
+    settings: dict[str, int],
+) -> list[dict[str, Any]]:
+    """첫 유효 고점에서 사이클을 닫고 이후 LOW부터 새 사이클을 만든다."""
+    split_limit = settings["entry_split_limit"]
+    cooldown = timedelta(minutes=settings["entry_cooldown_minutes"])
+    positions: list[dict[str, Any]] = []
+    open_by_base_tf: dict[str, dict[str, Any]] = {}
+    sequence = 0
+
+    events = sorted(
+        [*lows, *highs],
+        key=lambda item: (
+            item["time"],
+            0 if item["signal_type"] == "LOW" else 1,
+            item["id"],
+        ),
+    )
+
+    for signal in events:
+        if signal["signal_type"] == "HIGH":
+            for base_tf, position in list(open_by_base_tf.items()):
+                if signal["time"] <= position["entry_last_time_raw"]:
+                    continue
+                if signal["timeframe"] not in _exit_timeframes(
+                    position["market"],
+                    position["entry_group"],
+                ):
+                    continue
+                position["cycle_closed"] = True
+                position["cycle_close_time_raw"] = signal["time"]
+                position["cycle_close_timeframe"] = signal["timeframe"]
+                position["cycle_close_signal_id"] = signal["id"]
+                del open_by_base_tf[base_tf]
+            continue
+
+        for position in list(open_by_base_tf.values()):
+            if _can_position_accept(
+                position,
+                signal,
+                split_limit,
+                cooldown,
+            ):
+                _append_entry(position, signal, split_limit)
+
+        if signal["timeframe"] not in open_by_base_tf:
+            sequence += 1
+            own = _new_position(signal, sequence)
+            own["cycle_closed"] = False
+            own["cycle_close_time_raw"] = None
+            own["cycle_close_timeframe"] = None
+            own["cycle_close_signal_id"] = None
+            _append_entry(own, signal, split_limit)
+            positions.append(own)
+            open_by_base_tf[signal["timeframe"]] = own
+
+    return positions
+
+
 def _attach_exit_results(
     positions: list[dict[str, Any]],
     highs: list[dict[str, Any]],
@@ -523,6 +585,20 @@ def _attach_exit_results(
                 "entry_price": float(average_price),
                 "entry_signal_ids": position["entry_signal_ids"],
                 "entry_source_timeframes": position["entry_source_timeframes"],
+                "entry_points": [
+                    {
+                        "timeframe": entry["timeframe"],
+                        "time": entry["time"].isoformat(),
+                        "price": float(entry["price"]),
+                    }
+                    for entry in entries
+                ],
+                "cycle_closed": bool(position.get("cycle_closed")),
+                "cycle_close_time": (
+                    position["cycle_close_time_raw"].isoformat()
+                    if position.get("cycle_close_time_raw") else None
+                ),
+                "cycle_close_timeframe": position.get("cycle_close_timeframe"),
                 "entry_source_summary": " + ".join(
                     f"{timeframe} {count}회"
                     for timeframe, count in sorted(
@@ -542,7 +618,11 @@ def _build_positions(
     highs: list[dict[str, Any]],
     settings: dict[str, int],
 ) -> list[dict[str, Any]]:
-    entry_positions = _build_entry_positions(lows, settings)
+    entry_positions = _build_cycle_entry_positions(
+        lows,
+        highs,
+        settings,
+    )
     return _attach_exit_results(entry_positions, highs)
 
 

@@ -18,6 +18,7 @@ from performance_group_analyzer import group_analysis_data, group_analysis_marke
 app = Flask(__name__)
 app.jinja_env.globals["symbol_display"] = lambda symbol, exchange=None: symbol_display(symbol, exchange)
 app.jinja_env.globals["exchange_only_label"] = lambda exchange=None, market=None: exchange_only_label(exchange, market)
+app.jinja_env.globals["price_path_svg"] = price_path_svg
 app.secret_key = os.getenv("PERFORMANCE_SESSION_SECRET", "").strip()
 if not app.secret_key:
     # Render 환경변수가 아직 없을 때 서버가 죽지는 않게 하되,
@@ -549,6 +550,8 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
     exit_tf_buckets = {}
 
     for position in all_positions:
+        if not position.get("cycle_closed"):
+            continue
         filtered_exits = []
         for result in position.get("exit_results") or []:
             exit_time = _parse_iso_datetime(result.get("exit_time"))
@@ -716,6 +719,8 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
         "completed_cycle_count": completed_cycle_count,
         "result_count": completed_cycle_count,
         "outcome_count": len(all_outcome_returns),
+        "win_count": len(cycle_wins),
+        "loss_count": len(cycle_average_returns) - len(cycle_wins),
         "average_return_pct": (
             sum(cycle_average_returns) / len(cycle_average_returns)
             if cycle_average_returns else None
@@ -741,6 +746,83 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
         "entry_timeframes_1h_plus": [],
         "exit_timeframes": exit_timeframes,
     }
+
+
+
+def _svg_escape(value):
+    return (
+        str(value).replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def price_path_svg(position, width=960, height=360):
+    """진입 가격과 각 청산 시간봉 가격만 표시하는 생략 차트."""
+    points = []
+    for index, entry in enumerate(position.get("entry_points") or [], 1):
+        points.append({
+            "kind": "entry",
+            "label": f"진입{index} · {entry.get('timeframe')}",
+            "price": float(entry.get("price") or 0),
+        })
+    for result in sorted(
+        position.get("exit_results") or [],
+        key=lambda row: row.get("exit_timeframe_minutes", 999999),
+    ):
+        points.append({
+            "kind": "exit",
+            "label": f"청산 · {result.get('exit_timeframe')}",
+            "price": float(result.get("exit_price") or 0),
+            "return_pct": float(result.get("return_pct") or 0),
+        })
+    if not points:
+        return '<div class="empty-note">가격 데이터 없음</div>'
+
+    prices = [p["price"] for p in points]
+    lo, hi = min(prices), max(prices)
+    spread = max(hi - lo, abs(hi) * 0.01, 1e-9)
+    px, py = 70, 55
+    uw, uh = width - px * 2, height - py * 2
+
+    def xp(i):
+        return width / 2 if len(points) == 1 else px + uw * i / (len(points) - 1)
+    def yp(price):
+        return py + (hi - price) / spread * uh
+
+    coords = [(xp(i), yp(p["price"])) for i, p in enumerate(points)]
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+        f'aria-label="진입 및 청산 가격 생략 차트" '
+        f'style="background:#101012;border:1px solid #303035;border-radius:14px">',
+        f'<rect width="{width}" height="{height}" rx="14" fill="#101012"/>',
+        '<text x="24" y="31" fill="#8bd0ff" font-size="16" font-weight="700">'
+        '실제 신호 가격 경로 · 중간 캔들 생략</text>',
+    ]
+    for i in range(len(coords) - 1):
+        x1, y1 = coords[i]
+        x2, y2 = coords[i + 1]
+        parts.append(
+            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+            'stroke="#61dca3" stroke-width="4" stroke-dasharray="12 10"/>'
+        )
+        parts.append(
+            f'<text x="{(x1+x2)/2:.1f}" y="{(y1+y2)/2-10:.1f}" '
+            'text-anchor="middle" fill="#8d8d95" font-size="13">… 중간 과정 생략 …</text>'
+        )
+    for i, point in enumerate(points):
+        x, y = coords[i]
+        entry = point["kind"] == "entry"
+        color = "#ffd24d" if entry else "#56e69b"
+        extra = "" if entry else f' · {point.get("return_pct", 0):+.2f}%'
+        parts.extend([
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="9" fill="{color}" stroke="#111" stroke-width="5"/>',
+            f'<text x="{x:.1f}" y="{y-20:.1f}" text-anchor="middle" fill="{color}" '
+            f'font-size="15" font-weight="700">{_svg_escape(point["label"] + extra)}</text>',
+            f'<text x="{x:.1f}" y="{y+29:.1f}" text-anchor="middle" fill="#f4f4f4" '
+            f'font-size="14">{_svg_escape(f"{point["price"]:,.8g}")}</text>',
+        ])
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 ENTRY_GROUP_LABELS = {
@@ -1886,6 +1968,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {{'%.1f'|format(market_stats.win_rate_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
+<div class="small" style="margin-top:7px">{% if market_stats.best_symbol %}{{symbol_display(market_stats.best_symbol, market_stats.best_symbol_exchange)}} 최대{% else %}완료 종목 없음{% endif %}</div>
 </div>
 <div class="metric">
 <div class="title">평균 보유시간</div>
@@ -2224,6 +2307,19 @@ summary{cursor:pointer;font-weight:bold}
 </div>
 
 <div class="card">
+<h2>실제 신호 가격 차트</h2>
+<p class="muted">진입 가격과 각 청산 시간봉 가격만 표시하고 중간 캔들은 생략한다.</p>
+{% for position in data.positions|reverse %}
+{% if position.cycle_closed and position.exit_results %}
+<details>
+<summary>사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입</summary>
+{{price_path_svg(position)|safe}}
+</details>
+{% endif %}
+{% else %}<p class="muted">완료 사이클이 아직 없습니다.</p>{% endfor %}
+</div>
+
+<div class="card">
 <h2>실제 백데이터: 진입·청산 시각</h2>
 {% for position in data.positions|reverse %}
 <details>
@@ -2299,6 +2395,9 @@ def performance_member_image_preview():
                 stats.get("entry_timeframes") or [],
             )
             enriched = dict(item)
+            enriched["group_analysis"] = analysis_by_symbol.get(
+                item.get("symbol"), {"positions": []}
+            )
             enriched["member_stats"] = stats
             cards.append(enriched)
 
@@ -2342,9 +2441,10 @@ a{color:var(--blue);text-decoration:none}.toolbar{max-width:1080px;margin:auto a
 <div class="chartbox">
 <div style="font-size:28px;font-weight:bold">{{symbol_display(top.symbol, top.exchange)}}</div>
 <div class="sub">진입 ①②③ → 청산 구간 시각화 예시</div>
-<div class="fake-chart"></div><div class="line"></div>
-<div class="dot d1"></div><div class="dot d2"></div><div class="dot d3"></div><div class="dot sell"></div>
-<div class="chart-label l1">진입①</div><div class="chart-label l2">진입②</div><div class="chart-label l3">진입③</div><div class="chart-label ls">청산</div>
+{% set completed_positions = top.group_analysis.positions|selectattr('cycle_closed')|list %}
+{% if completed_positions %}
+{{price_path_svg(completed_positions[-1])|safe}}
+{% else %}<div class="sub" style="padding:50px 0">완료 사이클 가격 데이터 대기</div>{% endif %}
 </div>
 <div>
 <div class="metric life">
@@ -2703,14 +2803,31 @@ def performance_dashboard():
             "average_holding_minutes": None,
             "result_symbol_count": 0,
             "result_count": 0,
+            "best_symbol": None,
+            "best_symbol_exchange": None,
         }
 
         if selected:
+            category_market = {
+                "KOREA_1Q": "KOREA",
+                "US_1Q": "US",
+                "COIN": "COIN",
+            }
+            market_analysis = group_analysis_market_data(
+                category_market[selected_category]
+            )
+            analysis_by_symbol = market_analysis.get("symbol_data", {})
+
             enriched_symbols = []
             for item in selected.get("symbols") or []:
+                analysis = analysis_by_symbol.get(
+                    item.get("symbol"),
+                    {"positions": [], "performance_summary": [], "occurrence_stats": []},
+                )
                 enriched = dict(item)
-                enriched["member_stats"] = _member_symbol_statistics(
-                    item,
+                enriched["group_analysis"] = analysis
+                enriched["member_stats"] = _member_group_engine_statistics(
+                    analysis,
                     "all",
                 )
                 enriched_symbols.append(enriched)
@@ -2772,6 +2889,24 @@ def performance_dashboard():
                 ),
                 "result_symbol_count": len(result_symbols),
                 "result_count": total_results,
+                "best_symbol": (
+                    max(
+                        result_symbols,
+                        key=lambda item: item["member_stats"]["best_return_pct"]
+                        if item["member_stats"]["best_return_pct"] is not None
+                        else float("-inf"),
+                    )["symbol"]
+                    if result_symbols else None
+                ),
+                "best_symbol_exchange": (
+                    max(
+                        result_symbols,
+                        key=lambda item: item["member_stats"]["best_return_pct"]
+                        if item["member_stats"]["best_return_pct"] is not None
+                        else float("-inf"),
+                    ).get("exchange")
+                    if result_symbols else None
+                ),
             }
 
         selected_symbol_name = (
@@ -2798,10 +2933,16 @@ def performance_dashboard():
                 None,
             )
             if selected_symbol:
-                entry_exit_matrix = _entry_exit_timeframe_matrix(
-                    selected_symbol,
-                    "all",
-                )
+                analysis = selected_symbol.get("group_analysis") or {}
+                rows = analysis.get("performance_summary") or []
+                entry_exit_matrix = {
+                    "rows": rows,
+                    "matrix": [],
+                    "entry_timeframes": [],
+                    "exit_timeframes": [],
+                    "has_results": bool(rows),
+                    "result_count": selected_symbol["member_stats"]["completed_cycle_count"],
+                }
 
         return render_template_string("""
 <!doctype html>
@@ -2907,6 +3048,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {{'%.2f'|format(market_stats.average_return_pct)}}%
 {% else %}결과 대기{% endif %}
 </div>
+<div class="small" style="margin-top:7px">{{market_stats.result_symbol_count}}개 종목의 완료 사이클 평균</div>
 </div>
 <div class="metric">
 <div class="title">시장 최고수익</div>
@@ -2996,7 +3138,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% set s = selected_symbol %}
 
 <div class="card">
-<h2>{{s.symbol}} <span class="small">{{exchange_only_label(s.exchange)}}</span></h2>
+<h2>{{symbol_display(s.symbol, s.exchange)}} <span class="small">{{exchange_only_label(s.exchange)}}</span></h2>
 
 <div class="summary">
 <span class="badge">저점 {{s.low_count}}</span>
@@ -3013,154 +3155,57 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="value {{'pos' if s.member_stats.win_rate_pct >= 50 else 'neg'}}">
 {{'%.1f'|format(s.member_stats.win_rate_pct)}}%
 </div>
-<div class="small">승 {{s.performance_summary.win_count}} · 패 {{s.performance_summary.loss_count}}</div>
+<div class="small">승 {{s.member_stats.win_count}} · 패 {{s.member_stats.loss_count}}</div>
 </div>
 <div class="metric">
 <div class="title">최고 / 최저 수익</div>
 <div class="value">
 <span class="pos">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
 <span class="small"> / </span>
-<span class="{{'pos' if s.performance_summary.worst_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.performance_summary.worst_return_pct)}}%</span>
+<span class="{{'pos' if s.performance_summary.worst_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.worst_return_pct)}}%</span>
 </div>
 </div>
 <div class="metric">
-<div class="title">전체 결과 수</div>
-<div class="value">{{s.performance_summary.result_count}}건</div>
+<div class="title">완료 사이클</div>
+<div class="value">{{s.member_stats.completed_cycle_count}}회</div>
 </div>
 </div>
 
 
 <details open>
-<summary>진입 시간봉 × 청산 시간봉 수익률 매트릭스</summary>
-
+<summary>진입 시간봉 × 청산 시간봉 완료 사이클 성과</summary>
 <div class="analysis-note">
-각 칸은 해당 시간봉에서 진입해 해당 시간봉 고점에서 청산했을 때의
-개별 진입 결과를 누적한 통계다. 평균수익과 단순 누적수익을 함께 표시한다.
+관리자 설정의 진입 최대 횟수로 평균 진입가를 계산한다.
+최초 유효 고점 청산 후 다음 LOW부터 새 사이클로 센다.
+같은 사이클의 여러 청산 시간봉은 비교 시나리오이며 사이클 수를 중복 증가시키지 않는다.
 </div>
-
 {% if entry_exit_matrix.has_results %}
-<div class="matrix-wrap">
-<table class="tf-matrix">
-<tr>
-<th>진입＼청산</th>
-{% for exit_tf in entry_exit_matrix.exit_timeframes %}
-<th>{{exit_tf}} 고점</th>
-{% endfor %}
-</tr>
-
-{% for matrix_row in entry_exit_matrix.matrix %}
-<tr>
-<th>{{matrix_row.entry_timeframe}} 진입</th>
-{% for cell in matrix_row.cells %}
-<td>
-{% if cell.stat %}
-<div class="matrix-cell">
-<div class="main {{'pos' if cell.stat.average_return_pct >= 0 else 'neg'}}">
-평균 {{'%.3f'|format(cell.stat.average_return_pct)}}%
-</div>
-<div class="sub">
-누적 {{'%.3f'|format(cell.stat.cumulative_return_pct)}}%<br>
-승률 {{'%.1f'|format(cell.stat.win_rate_pct)}}% · {{cell.stat.result_count}}건<br>
-평균 보유
-{% if cell.stat.average_holding_minutes is not none %}
-{{'%.0f'|format(cell.stat.average_holding_minutes)}}분
-{% else %}-{% endif %}
-</div>
-</div>
-{% else %}
-<div class="matrix-cell empty">데이터 없음</div>
-{% endif %}
-</td>
-{% endfor %}
-</tr>
-{% endfor %}
-</table>
-</div>
-
-<details>
-<summary>조합별 누적 통계 상세 {{entry_exit_matrix.result_count}}건</summary>
 <table>
-<tr>
-<th>진입 시간봉</th>
-<th>청산 시간봉</th>
-<th>결과 수</th>
-<th>승률</th>
-<th>평균수익</th>
-<th>누적수익</th>
-<th>최고수익</th>
-<th>최저수익</th>
-<th>평균 보유</th>
-</tr>
+<tr><th>최초 진입 시간봉</th><th>청산 시간봉</th><th>완료 사이클</th><th>평균수익</th><th>최고수익</th><th>최저수익</th><th>승률</th><th>평균 보유</th></tr>
 {% for stat in entry_exit_matrix.rows %}
 <tr>
-<td>{{stat.entry_timeframe}}</td>
-<td>{{stat.exit_timeframe}}</td>
-<td>{{stat.result_count}}</td>
-<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td>
+<td>{{stat.entry_timeframe}}</td><td>{{stat.exit_timeframe}}</td><td>{{stat.trade_count}}회</td>
 <td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
-<td class="{{'pos' if stat.cumulative_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.cumulative_return_pct)}}%</td>
 <td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
 <td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
-<td>
-{% if stat.average_holding_minutes is not none %}
-{{'%.0f'|format(stat.average_holding_minutes)}}분
-{% else %}-{% endif %}
-</td>
+<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td><td>{{stat.average_holding_text}}</td>
 </tr>
 {% endfor %}
 </table>
+{% else %}<div class="empty-note">완료된 사이클이 아직 없습니다.</div>{% endif %}
 </details>
-{% else %}
-<div class="empty-note">
-진입 시간봉과 청산 시간봉을 연결할 완료 데이터가 아직 없습니다.
+
+<details>
+<summary>실제 사이클별 진입·청산 가격 차트</summary>
+{% for position in s.group_analysis.positions|reverse %}
+{% if position.cycle_closed and position.exit_results %}
+<div class="card">
+<div class="small">사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · 평균 진입가 {{position.entry_price}}</div>
+{{price_path_svg(position)|safe}}
 </div>
 {% endif %}
+{% else %}<div class="empty-note">표시할 완료 사이클이 없습니다.</div>{% endfor %}
 </details>
-
-<details>
-<summary>향후 시장 상태 조건 분석</summary>
-<div class="analysis-note">
-향후 TradingView 웹훅에 일봉·주봉 이평선 배열 상태를 함께 저장하면,
-정배열·역배열·혼조 상태별로 동일한 진입TF × 청산TF 통계를 분리할 수 있다.
-현재 과거 데이터에는 해당 시점의 이평선 배열 정보가 없으므로 임의 추정하지 않는다.
-</div>
-</details>
-
-<details>
-<summary>진입 방식별 통계</summary>
-<table>
-<tr><th>진입 방식</th><th>결과 수</th><th>승률</th><th>평균수익</th><th>최고수익</th><th>최저수익</th></tr>
-{% for stat in s.performance_summary.entry_mode_stats %}
-<tr>
-<td>{{stat.label}}</td>
-<td>{{stat.result_count}}</td>
-<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td>
-<td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
-<td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
-<td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
-</tr>
-{% endfor %}
-</table>
-</details>
-
-<details>
-<summary>청산 시간봉별 통계</summary>
-<table>
-<tr><th>청산 시간봉</th><th>결과 수</th><th>승률</th><th>평균수익</th><th>최고수익</th><th>최저수익</th><th>평균 보유</th></tr>
-{% for stat in s.performance_summary.exit_timeframe_stats %}
-<tr>
-<td>{{stat.timeframe}}</td>
-<td>{{stat.result_count}}</td>
-<td>{{'%.1f'|format(stat.win_rate_pct)}}%</td>
-<td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
-<td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
-<td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
-<td>{{'%.0f'|format(stat.average_holding_minutes)}}분</td>
-</tr>
-{% endfor %}
-</table>
-</details>
-{% endif %}
 
 {% if s.open_cycle_preview %}
 <div class="mode-title">현재 진행 중인 진입 구간</div>
