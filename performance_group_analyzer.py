@@ -126,7 +126,7 @@ def get_settings() -> dict[str, int]:
             1, min(int(raw.get("recent_interval_count", 5)), 100)
         ),
         "entry_split_limit": max(
-            1, min(int(raw.get("entry_split_limit", 3)), 20)
+            1, min(int(raw.get("entry_split_limit", 3)), 10)
         ),
         "entry_cooldown_minutes": max(
             1, min(int(raw.get("entry_cooldown_minutes", 5)), 1440)
@@ -134,24 +134,39 @@ def get_settings() -> dict[str, int]:
     }
 
 
-def update_settings(recent_interval_count: int | None = None) -> dict[str, int]:
+def update_settings(
+    recent_interval_count: int | None = None,
+    entry_split_limit: int | None = None,
+) -> dict[str, int]:
     ensure_schema()
+    updates = []
     if recent_interval_count is not None:
-        value = max(1, min(int(recent_interval_count), 100))
+        updates.append((
+            "recent_interval_count",
+            str(max(1, min(int(recent_interval_count), 100))),
+        ))
+    if entry_split_limit is not None:
+        updates.append((
+            "entry_split_limit",
+            str(max(1, min(int(entry_split_limit), 10))),
+        ))
+
+    if updates:
         with _connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO performance_analysis_settings(
-                    setting_key, setting_value, updated_at
+            for setting_key, setting_value in updates:
+                conn.execute(
+                    """
+                    INSERT INTO performance_analysis_settings(
+                        setting_key, setting_value, updated_at
+                    )
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (setting_key)
+                    DO UPDATE SET
+                        setting_value=EXCLUDED.setting_value,
+                        updated_at=NOW()
+                    """,
+                    (setting_key, setting_value),
                 )
-                VALUES ('recent_interval_count', %s, NOW())
-                ON CONFLICT (setting_key)
-                DO UPDATE SET
-                    setting_value=EXCLUDED.setting_value,
-                    updated_at=NOW()
-                """,
-                (str(value),),
-            )
     return get_settings()
 
 

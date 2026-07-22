@@ -16,6 +16,8 @@ from performance_analyzer import rebuild_individual_pairs, analysis_summary, lat
 from performance_group_analyzer import group_analysis_data, update_settings as update_group_settings
 
 app = Flask(__name__)
+app.jinja_env.globals["symbol_display"] = lambda symbol, exchange=None: symbol_display(symbol, exchange)
+app.jinja_env.globals["exchange_only_label"] = lambda exchange=None, market=None: exchange_only_label(exchange, market)
 app.secret_key = os.getenv("PERFORMANCE_SESSION_SECRET", "").strip()
 if not app.secret_key:
     # Render 환경변수가 아직 없을 때 서버가 죽지는 않게 하되,
@@ -521,6 +523,106 @@ def _member_symbol_statistics(symbol_data, period_key="all"):
     }
 
 
+
+
+
+# 회원·관리자 화면 공통 종목 표기
+# KRX는 한글 종목명과 종목코드를 항상 함께 표시한다.
+KRX_SYMBOL_NAMES = {
+    "005930": "삼성전자",
+    "000660": "SK하이닉스",
+    "005380": "현대차",
+    "032830": "삼성생명",
+    "373220": "LG에너지솔루션",
+    "207940": "삼성바이오로직스",
+    "000270": "기아",
+    "068270": "셀트리온",
+    "105560": "KB금융",
+    "055550": "신한지주",
+    "035420": "NAVER",
+    "035720": "카카오",
+    "012450": "한화에어로스페이스",
+    "034020": "두산에너빌리티",
+    "086520": "에코프로",
+    "247540": "에코프로비엠",
+    "006400": "삼성SDI",
+    "051910": "LG화학",
+    "005490": "POSCO홀딩스",
+    "028260": "삼성물산",
+    "012330": "현대모비스",
+    "066570": "LG전자",
+    "003670": "포스코퓨처엠",
+    "009150": "삼성전기",
+    "042700": "한미반도체",
+    "000810": "삼성화재",
+    "329180": "HD현대중공업",
+    "267250": "HD현대",
+    "010130": "고려아연",
+    "015760": "한국전력",
+    "034730": "SK",
+    "096770": "SK이노베이션",
+    "316140": "우리금융지주",
+    "138040": "메리츠금융지주",
+    "024110": "기업은행",
+    "003550": "LG",
+    "017670": "SK텔레콤",
+    "030200": "KT",
+    "259960": "크래프톤",
+    "352820": "하이브",
+    "018260": "삼성에스디에스",
+    "009540": "HD한국조선해양",
+    "011200": "HMM",
+    "010140": "삼성중공업",
+    "047050": "포스코인터내셔널",
+    "042660": "한화오션",
+    "010950": "S-Oil",
+    "000720": "현대건설",
+    "090430": "아모레퍼시픽",
+    "161390": "한국타이어앤테크놀로지",
+    "011170": "롯데케미칼",
+    "271560": "오리온",
+    "097950": "CJ제일제당",
+    "251270": "넷마블",
+    "035250": "강원랜드",
+    "036570": "엔씨소프트",
+    "326030": "SK바이오팜",
+    "302440": "SK바이오사이언스",
+    "128940": "한미약품",
+}
+
+
+def _clean_symbol_code(symbol):
+    text = str(symbol or "").strip().upper()
+    if ":" in text:
+        text = text.split(":")[-1]
+    if text.endswith(".KS") or text.endswith(".KQ"):
+        text = text[:-3]
+    return text
+
+
+def symbol_display(symbol, exchange=None):
+    """국장은 '한글 종목명(코드)', 그 외는 코드/티커 그대로 표시."""
+    code = _clean_symbol_code(symbol)
+    exchange_text = str(exchange or "").upper()
+    is_krx = (
+        exchange_text in {"KRX", "KOSPI", "KOSDAQ", "KOREA"}
+        or (code.isdigit() and len(code) == 6)
+    )
+    if is_krx:
+        name = KRX_SYMBOL_NAMES.get(code)
+        return f"{name}({code})" if name else f"종목명 미등록({code})"
+    return code
+
+
+def exchange_only_label(exchange=None, market=None):
+    """화면 카드에서는 전략명(1Q/별꽃타점)을 빼고 거래소만 표시."""
+    market_text = str(market or "").upper()
+    exchange_text = str(exchange or "").upper()
+    if market_text == "KOREA" or exchange_text in {"KRX", "KOSPI", "KOSDAQ", "KOREA"}:
+        return "KRX"
+    if market_text == "US":
+        return exchange_text or "US"
+    return exchange_text or "COIN"
 
 
 CATEGORY_DISPLAY_ORDER = {
@@ -1282,7 +1384,7 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 .market h2{font-size:27px;margin:0}.badges{display:flex;gap:8px;flex-wrap:wrap}
 .badge{background:#29292c;border-radius:999px;padding:8px 12px}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0 20px}
-.metric,.symbol{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.metric,.symbol{display:block;color:#f5f5f5;text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
 .title{color:var(--blue);font-weight:bold;margin-bottom:8px}.value{font-size:25px;font-weight:bold}
 .pos{color:var(--green)}.warn{color:var(--yellow)}.muted{color:#aaa}
 .ranking-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px;margin:0 0 20px}
@@ -1403,7 +1505,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% for s in average_ranking %}
 <div class="rank-row">
 <span class="rank-no">{{loop.index}}</span>
-<span class="rank-symbol">{{s.symbol}}</span>
+<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}</span>
 <span class="rank-value">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</span>
 </div>
 {% endfor %}
@@ -1414,7 +1516,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% for s in best_ranking %}
 <div class="rank-row">
 <span class="rank-no">{{loop.index}}</span>
-<span class="rank-symbol">{{s.symbol}}</span>
+<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}</span>
 <span class="rank-value">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
 </div>
 {% endfor %}
@@ -1425,7 +1527,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% for s in win_rate_ranking %}
 <div class="rank-row">
 <span class="rank-no">{{loop.index}}</span>
-<span class="rank-symbol">{{s.symbol}}</span>
+<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}</span>
 <span class="rank-value">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</span>
 </div>
 {% endfor %}
@@ -1437,7 +1539,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% for s in ranked_symbols|sort(attribute='symbol') %}
 {% set avg = s.member_stats.average_return_pct %}
 <div class="bar-row">
-<div class="bar-name">{{s.symbol}}</div>
+<div class="bar-name">{{symbol_display(s.symbol, s.exchange)}}</div>
 <div class="bar-track">
 <div class="bar-fill {{'negbar' if avg < 0 else ''}}"
 style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
@@ -1455,7 +1557,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 {% for s in ranked_symbols|sort(attribute='symbol') %}
 {% if s.member_stats.entry_timeframes %}
 <details style="margin-bottom:9px;background:#141416;border-radius:10px;padding:11px">
-<summary style="cursor:pointer;font-weight:bold">{{s.symbol}}</summary>
+<summary style="cursor:pointer;font-weight:bold">{{symbol_display(s.symbol, s.exchange)}}</summary>
 <div style="overflow-x:auto">
 <table style="width:100%;border-collapse:collapse;margin-top:10px;min-width:760px">
 <tr>
@@ -1498,7 +1600,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 {% if s.member_stats.entry_timeframes_1h_plus %}
 {% set ns.has_any = true %}
 <details style="margin-bottom:9px;background:#141416;border-radius:10px;padding:11px">
-<summary style="cursor:pointer;font-weight:bold">{{s.symbol}}</summary>
+<summary style="cursor:pointer;font-weight:bold">{{symbol_display(s.symbol, s.exchange)}}</summary>
 <div style="overflow-x:auto">
 <table style="width:100%;border-collapse:collapse;margin-top:10px;min-width:680px">
 <tr>
@@ -1535,8 +1637,8 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 
 <div class="symbols">
 {% for s in selected.symbols %}
-<div class="symbol">
-<h3>{{s.symbol}}</h3>
+<a class="symbol" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
+<h3>{{symbol_display(s.symbol, s.exchange)}}</h3>
 <div class="values">
 <div class="mini"><span>최고수익</span><b class="{{'pos' if s.member_stats.best_return_pct is not none and s.member_stats.best_return_pct >= 0 else 'muted'}}">
 {% if s.member_stats.best_return_pct is not none %}{{'%.2f'|format(s.member_stats.best_return_pct)}}%{% else %}대기{% endif %}
@@ -1551,7 +1653,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 {% if s.member_stats.average_holding_minutes is not none %}{{'%.0f'|format(s.member_stats.average_holding_minutes)}}분{% else %}대기{% endif %}
 </b></div>
 </div>
-</div>
+</a>
 {% endfor %}
 </div>
 {% else %}
@@ -1583,6 +1685,142 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+
+
+
+@app.get("/performance/member/symbol")
+@member_required
+def performance_member_symbol():
+    category = request.args.get("category", "KOREA_1Q").strip().upper()
+    symbol = request.args.get("symbol", "").strip().upper()
+
+    category_market = {
+        "KOREA_1Q": "KOREA",
+        "US_1Q": "US",
+        "COIN": "COIN",
+    }
+    if category not in category_market:
+        category = "KOREA_1Q"
+
+    data = group_analysis_data(
+        market=category_market[category],
+        symbol=symbol,
+    )
+
+    if not data.get("symbol"):
+        return render_template_string("""
+<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>종목 상세 성과</title>
+<style>
+body{background:#0e0e0f;color:#f4f4f4;font-family:Arial,"Noto Sans KR",sans-serif;padding:20px}
+a{color:#76ceff}.card{background:#1b1b1d;border:1px solid #343438;border-radius:14px;padding:18px}
+</style></head><body>
+<a href="/performance/member?category={{category}}">← 종목 목록</a>
+<div class="card"><h2>종목 데이터가 없습니다.</h2></div>
+</body></html>
+""", category=category), 404
+
+    return render_template_string("""
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{symbol_display(data.symbol, 'KRX' if data.market == 'KOREA' else '')}} 상세 성과</title>
+<style>
+:root{--bg:#0e0e0f;--card:#1b1b1d;--line:#343438;--blue:#7ed2ff;--green:#55e69a;--red:#ff7878;--muted:#aaa}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:#f5f5f5;font-family:Arial,"Noto Sans KR",sans-serif;padding:18px}
+a{color:#78d1ff;text-decoration:none}
+h1{font-size:29px;margin:15px 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:16px;margin:14px 0}
+.badges{display:flex;gap:8px;flex-wrap:wrap}.badge{background:#29292c;border-radius:999px;padding:8px 12px}
+.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:850px}
+th,td{padding:10px;border-bottom:1px solid #303034;text-align:left}
+th{color:var(--blue)}.pos{color:var(--green);font-weight:bold}.neg{color:var(--red);font-weight:bold}.muted{color:var(--muted)}
+details{background:#141416;border:1px solid #303035;border-radius:11px;padding:12px;margin:10px 0}
+summary{cursor:pointer;font-weight:bold}
+</style>
+</head>
+<body>
+<a href="/performance/member?category={{category}}">← 종목 목록으로</a>
+<h1>{{symbol_display(data.symbol, 'KRX' if data.market == 'KOREA' else '')}}</h1>
+<div class="badges">
+<span class="badge">{{exchange_only_label('KRX' if data.market == 'KOREA' else '', data.market)}}</span>
+<span class="badge">진입 최대 {{data.settings.entry_split_limit}}회</span>
+<span class="badge">최근 평균 {{data.settings.recent_interval_count}}회</span>
+</div>
+
+<div class="card">
+<h2>진입 시간봉 × 청산 시간봉별 성과</h2>
+<div class="scroll">
+<table>
+<tr>
+<th>최초 진입 시간봉</th><th>청산 시간봉</th><th>결과</th><th>평균수익</th>
+<th>최고수익</th><th>최저수익</th><th>승률</th><th>평균 보유기간</th>
+</tr>
+{% for row in data.performance_summary %}
+<tr>
+<td>{{row.entry_timeframe}}</td>
+<td>{{row.exit_timeframe}}</td>
+<td>{{row.trade_count}}회</td>
+<td class="{{'pos' if row.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.average_return_pct)}}%</td>
+<td class="{{'pos' if row.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.best_return_pct)}}%</td>
+<td class="{{'pos' if row.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.worst_return_pct)}}%</td>
+<td>{{'%.1f'|format(row.win_rate_pct)}}%</td>
+<td>{{row.average_holding_text}}</td>
+</tr>
+{% else %}
+<tr><td colspan="8" class="muted">완료된 진입·청산 조합이 아직 없습니다.</td></tr>
+{% endfor %}
+</table>
+</div>
+</div>
+
+<div class="card">
+<h2>타점 발생 주기</h2>
+<div class="scroll">
+<table>
+<tr><th>그룹</th><th>시간봉</th><th>누적 발생</th><th>누적 평균</th>
+<th>최근 {{data.settings.recent_interval_count}}회 평균</th><th>최단</th><th>최장</th><th>마지막 발생 후</th></tr>
+{% for row in data.occurrence_stats %}
+<tr><td>{{row.group_label}}</td><td>{{row.timeframe}}</td><td>{{row.occurrence_count}}회</td>
+<td>{{row.overall_average_text}}</td><td>{{row.recent_average_text}}</td>
+<td>{{row.minimum_text}}</td><td>{{row.maximum_text}}</td><td>{{row.elapsed_text}}</td></tr>
+{% else %}
+<tr><td colspan="8" class="muted">발생 주기 데이터가 아직 없습니다.</td></tr>
+{% endfor %}
+</table>
+</div>
+</div>
+
+<div class="card">
+<h2>실제 백데이터: 진입·청산 시각</h2>
+{% for position in data.positions|reverse %}
+<details>
+<summary>최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
+<p><b>실제 진입 구성:</b> {{position.entry_source_summary}}<br>
+첫 진입: {{position.entry_first_time}}<br>
+마지막 진입: {{position.entry_last_time}}</p>
+<div class="scroll"><table>
+<tr><th>청산 시간봉</th><th>청산 시각</th><th>청산가</th><th>보유기간</th><th>수익률</th></tr>
+{% for exit in position.exit_results %}
+<tr><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
+<td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>
+{% else %}
+<tr><td colspan="5" class="muted">아직 유효한 청산 신호가 없습니다.</td></tr>
+{% endfor %}
+</table></div>
+</details>
+{% else %}
+<p class="muted">생성된 진입 포지션이 없습니다.</p>
+{% endfor %}
+</div>
+</body>
+</html>
+""", data=data, category=category), 200
 
 
 @app.get("/performance/member/charts")
@@ -2154,8 +2392,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% for s in selected.symbols %}
 <a class="symbol-card" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}">
 <div class="symbol-card-head">
-<div class="symbol-name">{{s.symbol}}</div>
-<div class="small">{{s.strategy}} / {{s.exchange}}</div>
+<div class="symbol-name">{{symbol_display(s.symbol, s.exchange)}}</div>
+<div class="small">{{exchange_only_label(s.exchange)}}</div>
 </div>
 <div class="symbol-result-grid">
 <div class="symbol-result">
@@ -2203,7 +2441,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% set s = selected_symbol %}
 
 <div class="card">
-<h2>{{s.symbol}} <span class="small">{{s.strategy}} / {{s.exchange}}</span></h2>
+<h2>{{s.symbol}} <span class="small">{{exchange_only_label(s.exchange)}}</span></h2>
 
 <div class="summary">
 <span class="badge">저점 {{s.low_count}}</span>
@@ -2574,8 +2812,12 @@ def performance_group_analysis():
     if request.method == "POST":
         try:
             recent_n = int(request.form.get("recent_interval_count", "5"))
-            update_group_settings(recent_interval_count=recent_n)
-            flash("최근 평균 횟수 설정을 저장했습니다.")
+            entry_split_limit = int(request.form.get("entry_split_limit", "3"))
+            update_group_settings(
+                recent_interval_count=recent_n,
+                entry_split_limit=entry_split_limit,
+            )
+            flash("최근 평균 횟수와 진입 최대 횟수를 저장했습니다.")
         except Exception as exc:
             flash(f"설정 저장 실패: {exc}")
         market = request.form.get("market", "KOREA")
@@ -2621,7 +2863,7 @@ summary{cursor:pointer;font-weight:bold}
 <label>종목
 <select name="symbol" onchange="this.form.submit()">
 {% for item in data.symbols %}
-<option value="{{item}}" {{'selected' if item == data.symbol else ''}}>{{item}}</option>
+<option value="{{item}}" {{'selected' if item == data.symbol else ''}}>{{symbol_display(item, 'KRX' if data.market == 'KOREA' else '')}}</option>
 {% endfor %}
 </select></label>
 </form>
@@ -2636,14 +2878,17 @@ summary{cursor:pointer;font-weight:bold}
 <label>최근 평균 횟수
 <input type="number" min="1" max="100" name="recent_interval_count" value="{{data.settings.recent_interval_count}}">
 </label>
+<label>진입 최대 횟수
+<input type="number" min="1" max="10" name="entry_split_limit" value="{{data.settings.entry_split_limit}}">
+</label>
 <button class="btn" type="submit">저장 후 재계산</button>
-<span class="muted">진입 최대 {{data.settings.entry_split_limit}}회 · 포지션별 진입 쿨타임 {{data.settings.entry_cooldown_minutes}}분 · 시간봉 자체 쿨타임은 발생주기 통계에만 적용</span>
+<span class="muted">포지션별 진입 쿨타임 {{data.settings.entry_cooldown_minutes}}분 · 시간봉 자체 쿨타임은 발생주기 통계에만 적용</span>
 </form>
 </div>
 
 {% if data.symbol %}
 <div class="card">
-<h2>{{data.symbol}} 매수 그룹 → 매도 그룹 누적 성과</h2>
+<h2>{{symbol_display(data.symbol, 'KRX' if data.market == 'KOREA' else '')}} 매수 그룹 → 매도 그룹 누적 성과</h2>
 <div class="scroll"><table>
 <tr><th>매수 그룹</th><th>최초 매수 시간봉</th><th>매도 그룹</th><th>매도 시간봉</th><th>완료</th><th>평균수익</th><th>최고</th><th>최저</th><th>승률</th><th>평균 보유</th></tr>
 {% for row in data.performance_summary %}
@@ -2671,7 +2916,7 @@ summary{cursor:pointer;font-weight:bold}
 <h2>실제 백데이터: 진입·청산 시각</h2>
 {% for position in data.positions|reverse %}
 <details>
-<summary>{{position.entry_group_label}} · 최초 {{position.entry_timeframe}} 포지션 · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
+<summary>최초 {{position.entry_timeframe}} 포지션 · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
 <p><b>실제 진입 구성:</b> {{position.entry_source_summary}}<br>
 첫 진입 {{position.entry_first_time}}<br>마지막 진입 {{position.entry_last_time}}<br>
 상태: {{'3회 진입 완료' if position.entry_complete else '유효 진입만 계산'}}</p>
