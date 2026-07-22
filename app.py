@@ -18,7 +18,7 @@ from performance_group_analyzer import group_analysis_data, group_analysis_marke
 app = Flask(__name__)
 app.jinja_env.globals["symbol_display"] = lambda symbol, exchange=None: symbol_display(symbol, exchange)
 app.jinja_env.globals["exchange_only_label"] = lambda exchange=None, market=None: exchange_only_label(exchange, market)
-app.jinja_env.globals["price_path_svg"] = price_path_svg
+app.jinja_env.globals["price_path_svg"] = lambda position, width=960, height=360: price_path_svg(position, width, height)
 app.secret_key = os.getenv("PERFORMANCE_SESSION_SECRET", "").strip()
 if not app.secret_key:
     # Render 환경변수가 아직 없을 때 서버가 죽지는 않게 하되,
