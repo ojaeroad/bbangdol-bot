@@ -14,7 +14,35 @@ import requests
 from performance_store import queue_signal_save, health_summary, latest_signals
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 from performance_group_analyzer import group_analysis_data, group_analysis_market_data, update_settings as update_group_settings
-from performance_automation import start_performance_automation
+try:
+    from performance_automation import (
+        automation_status,
+        send_latest_cycle_test,
+        send_period_report_test,
+        start_performance_automation,
+    )
+    PERFORMANCE_AUTOMATION_IMPORT_ERROR = ""
+except Exception as exc:
+    PERFORMANCE_AUTOMATION_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+    def start_performance_automation():
+        logging.getLogger("bbangdol-bot").exception(
+            "Performance automation import failed: %s",
+            PERFORMANCE_AUTOMATION_IMPORT_ERROR,
+        )
+        return False
+
+    def automation_status():
+        return {
+            "ok": False,
+            "import_error": PERFORMANCE_AUTOMATION_IMPORT_ERROR,
+        }
+
+    def send_period_report_test(kind):
+        raise RuntimeError(PERFORMANCE_AUTOMATION_IMPORT_ERROR)
+
+    def send_latest_cycle_test(market=None, symbol=None):
+        raise RuntimeError(PERFORMANCE_AUTOMATION_IMPORT_ERROR)
 
 app = Flask(__name__)
 app.jinja_env.globals["symbol_display"] = lambda symbol, exchange=None: symbol_display(symbol, exchange)
@@ -2847,6 +2875,51 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 
     except Exception as exc:
         log.exception("Member performance chart failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/performance/debug/automation-status")
+@admin_required
+def performance_automation_status():
+    try:
+        return jsonify(automation_status()), 200
+    except Exception as exc:
+        log.exception("Performance automation status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/performance/debug/send-weekly", methods=["GET", "POST"])
+@admin_required
+def performance_debug_send_weekly():
+    try:
+        result = send_period_report_test("weekly")
+        return jsonify(result), 200
+    except Exception as exc:
+        log.exception("Weekly performance test send failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/performance/debug/send-monthly", methods=["GET", "POST"])
+@admin_required
+def performance_debug_send_monthly():
+    try:
+        result = send_period_report_test("monthly")
+        return jsonify(result), 200
+    except Exception as exc:
+        log.exception("Monthly performance test send failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/performance/debug/send-latest-cycle", methods=["GET", "POST"])
+@admin_required
+def performance_debug_send_latest_cycle():
+    try:
+        market = request.values.get("market", "").strip().upper() or None
+        symbol = request.values.get("symbol", "").strip().upper() or None
+        result = send_latest_cycle_test(market=market, symbol=symbol)
+        return jsonify(result), 200
+    except Exception as exc:
+        log.exception("Latest cycle test send failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 

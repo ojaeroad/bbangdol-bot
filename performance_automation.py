@@ -660,3 +660,97 @@ def start_performance_automation() -> bool:
         ).start()
     log.info("performance automation thread started")
     return True
+
+
+
+def automation_status() -> dict[str, Any]:
+    """관리자 화면에서 민감값 없이 자동발송 준비 상태를 확인."""
+    notice_id = os.getenv(MEMBER_NOTICE_ENV, "").strip()
+    return {
+        "ok": True,
+        "enabled": AUTOMATION_ENABLED,
+        "database_configured": bool(DATABASE_URL),
+        "bot_token_configured": bool(BOT_TOKEN),
+        "member_notice_env": MEMBER_NOTICE_ENV,
+        "member_notice_configured": bool(notice_id),
+        "poll_seconds": POLL_SECONDS,
+        "thread_started": _STARTED,
+        "entry_destinations": {
+            f"{market}_{group}": {
+                "env": env_name,
+                "configured": bool(os.getenv(env_name, "").strip()),
+            }
+            for (market, group), env_name in ENTRY_CHAT_ENV.items()
+        },
+    }
+
+
+def send_period_report_test(kind: str) -> dict[str, Any]:
+    """주간/월간 리포트를 회원 공지방으로 즉시 테스트 발송."""
+    kind = str(kind or "").strip().lower()
+    if kind not in {"weekly", "monthly"}:
+        raise ValueError("kind must be weekly or monthly")
+    chat_id = os.getenv(MEMBER_NOTICE_ENV, "").strip()
+    if not chat_id:
+        raise RuntimeError(f"{MEMBER_NOTICE_ENV} is not configured")
+    png, caption = render_period_report(kind, datetime.now(NY))
+    _send_photo(chat_id, png, f"[관리자 테스트]\n{caption}")
+    return {
+        "ok": True,
+        "kind": kind,
+        "destination_env": MEMBER_NOTICE_ENV,
+        "caption": caption,
+    }
+
+
+def send_latest_cycle_test(
+    market: str | None = None,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """최근 청산 결과 1건을 해당 기존 진입방으로 즉시 테스트 발송."""
+    requested_market = str(market or "").strip().upper()
+    requested_symbol = str(symbol or "").strip().upper()
+    candidates: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+
+    market_order = (requested_market,) if requested_market else ("KOREA", "US", "COIN")
+    for current_market in market_order:
+        if current_market not in {"KOREA", "US", "COIN"}:
+            continue
+        data = group_analysis_market_data(current_market)
+        for current_symbol, symbol_data in data.get("symbol_data", {}).items():
+            if requested_symbol and current_symbol.upper() != requested_symbol:
+                continue
+            for position in symbol_data.get("positions", []):
+                for result in position.get("exit_results") or []:
+                    candidates.append((current_market, current_symbol, position, result))
+
+    if not candidates:
+        raise RuntimeError("조건에 맞는 완료 청산 결과가 없습니다")
+
+    def sort_key(item):
+        result = item[3]
+        return str(result.get("exit_time") or "")
+
+    current_market, current_symbol, position, result = max(candidates, key=sort_key)
+    env_name, chat_id = _entry_destination(current_market, position["entry_group"])
+    if not env_name:
+        raise RuntimeError("해당 진입 그룹의 기존 알람방 환경변수 매핑이 없습니다")
+    if not chat_id:
+        raise RuntimeError(f"{env_name} is not configured")
+
+    png = render_exit_image(current_market, current_symbol, position, result)
+    caption = (
+        f"[관리자 테스트]\n📈 {current_symbol} "
+        f"{GROUP_LABEL.get(position['entry_group'])} "
+        f"{result['exit_timeframe']} 청산\n"
+        f"수익률 {float(result['return_pct']):+.3f}%"
+    )
+    _send_photo(chat_id, png, caption)
+    return {
+        "ok": True,
+        "market": current_market,
+        "symbol": current_symbol,
+        "entry_group": position["entry_group"],
+        "exit_timeframe": result["exit_timeframe"],
+        "destination_env": env_name,
+    }
