@@ -14,6 +14,7 @@ import requests
 from performance_store import queue_signal_save, health_summary, latest_signals
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 from performance_group_analyzer import group_analysis_data, group_analysis_market_data, update_settings as update_group_settings
+from performance_automation import start_performance_automation
 
 app = Flask(__name__)
 app.jinja_env.globals["symbol_display"] = lambda symbol, exchange=None: symbol_display(symbol, exchange)
@@ -36,13 +37,17 @@ app.config.update(
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bbangdol-bot")
 
+# 성과 자동발송은 별도 데몬 스레드로 실행된다.
+# 실패해도 기존 텔레그램 알람과 자동매매 요청에는 영향이 없다.
+start_performance_automation()
+
 # ---- Version / Service markers (for live check) ----
 APP_VERSION  = os.getenv("APP_VERSION", "dev")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # 회원 전용 주간·월간 성과 리포트 공지방.
 # 값이 없어도 기존 알람과 서버 실행에는 영향이 없다.
-MEMBER_NOTICE_CHAT_ID = os.getenv("1Q_MEMBER_NOTICE", "").strip()
+MEMBER_NOTICE_CHAT_ID = os.getenv("MEMBER_NOTICE_1Q", "").strip()
 
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -54,6 +59,9 @@ def version():
         "service": SERVICE_NAME,
         "version": APP_VERSION,
         "member_notice_configured": bool(MEMBER_NOTICE_CHAT_ID),
+        "performance_automation_enabled": os.getenv(
+            "PERFORMANCE_AUTOMATION_ENABLED", "1"
+        ).strip().lower() not in ("0", "false", "off", "no"),
         "economic_calendar_feature": "removed",
     })
 
