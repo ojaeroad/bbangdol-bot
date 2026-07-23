@@ -312,6 +312,25 @@ def _occurrence_stats(
         overall_average = _average(intervals)
         recent_average = _average(recent_intervals)
 
+        reference_average = recent_average or overall_average
+        readiness_ratio = (
+            elapsed / reference_average
+            if elapsed is not None and reference_average
+            else None
+        )
+        if len(intervals) < 1:
+            readiness_label = "통계 형성 중"
+            readiness_level = "WAIT"
+        elif readiness_ratio is not None and readiness_ratio >= 1.0:
+            readiness_label = "평균 주기 초과"
+            readiness_level = "DUE"
+        elif readiness_ratio is not None and readiness_ratio >= 0.8:
+            readiness_label = "평균 주기 근접"
+            readiness_level = "NEAR"
+        else:
+            readiness_label = "평균 주기 전"
+            readiness_level = "EARLY"
+
         result.append(
             {
                 "group": group,
@@ -336,6 +355,10 @@ def _occurrence_stats(
                     max(intervals) if intervals else None
                 ),
                 "elapsed_text": _format_duration(elapsed),
+                "readiness_ratio": readiness_ratio,
+                "readiness_label": readiness_label,
+                "readiness_level": readiness_level,
+                "reference_average_text": _format_duration(reference_average),
             }
         )
 
@@ -509,11 +532,13 @@ def _build_cycle_entry_positions(
 def _attach_exit_results(
     positions: list[dict[str, Any]],
     highs: list[dict[str, Any]],
+    lows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     highs_by_tf: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for high in sorted(highs, key=lambda item: (item["time"], item["id"])):
         highs_by_tf[high["timeframe"]].append(high)
 
+    sorted_lows = sorted(lows, key=lambda item: (item["time"], item["id"]))
     output: list[dict[str, Any]] = []
     for position in positions:
         entries = position["entries"]
@@ -544,6 +569,26 @@ def _attach_exit_results(
             holding_minutes = int(
                 (exit_signal["time"] - last_time).total_seconds() / 60
             )
+            adverse_candidates = [
+                low for low in sorted_lows
+                if low["time"] >= first_time
+                and low["time"] <= exit_signal["time"]
+            ]
+            adverse_signal = (
+                min(adverse_candidates, key=lambda row: row["price"])
+                if adverse_candidates else None
+            )
+            adverse_price = (
+                adverse_signal["price"] if adverse_signal else average_price
+            )
+            signal_adverse_pct = float(
+                (adverse_price - average_price)
+                / average_price * Decimal("100")
+            )
+            recovery_minutes = (
+                int((exit_signal["time"] - adverse_signal["time"]).total_seconds() / 60)
+                if adverse_signal else None
+            )
             return_pct = float(
                 (exit_signal["price"] - average_price)
                 / average_price
@@ -562,6 +607,14 @@ def _attach_exit_results(
                     "holding_minutes": holding_minutes,
                     "holding_text": _format_duration(holding_minutes),
                     "return_pct": return_pct,
+                    "signal_adverse_pct": signal_adverse_pct,
+                    "signal_adverse_price": float(adverse_price),
+                    "signal_adverse_time": (
+                        adverse_signal["time"].isoformat()
+                        if adverse_signal else None
+                    ),
+                    "recovery_minutes": recovery_minutes,
+                    "recovery_text": _format_duration(recovery_minutes),
                     "exit_signal_id": exit_signal["id"],
                 }
             )
@@ -606,6 +659,12 @@ def _attach_exit_results(
                         key=lambda item: TF_MINUTES.get(item[0], 999999),
                     )
                 ),
+                "signal_adverse_pct": (
+                    min(
+                        (row.get("signal_adverse_pct", 0.0) for row in exit_results),
+                        default=0.0,
+                    )
+                ),
                 "exit_results": exit_results,
             }
         )
@@ -623,7 +682,7 @@ def _build_positions(
         highs,
         settings,
     )
-    return _attach_exit_results(entry_positions, highs)
+    return _attach_exit_results(entry_positions, highs, lows)
 
 
 def _performance_summary(
@@ -651,6 +710,14 @@ def _performance_summary(
     ), rows in buckets.items():
         returns = [row["return_pct"] for row in rows]
         holdings = [row["holding_minutes"] for row in rows]
+        adverse_values = [
+            row["signal_adverse_pct"] for row in rows
+            if row.get("signal_adverse_pct") is not None
+        ]
+        recovery_values = [
+            row["recovery_minutes"] for row in rows
+            if row.get("recovery_minutes") is not None
+        ]
 
         output.append(
             {
@@ -674,6 +741,14 @@ def _performance_summary(
                 "average_holding_minutes": _average(holdings),
                 "average_holding_text": _format_duration(
                     _average(holdings)
+                ),
+                "average_signal_adverse_pct": _average(adverse_values),
+                "worst_signal_adverse_pct": (
+                    min(adverse_values) if adverse_values else None
+                ),
+                "average_recovery_minutes": _average(recovery_values),
+                "average_recovery_text": _format_duration(
+                    _average(recovery_values)
                 ),
             }
         )
