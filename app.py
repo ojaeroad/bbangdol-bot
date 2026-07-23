@@ -17,6 +17,7 @@ from performance_group_analyzer import group_analysis_data, group_analysis_marke
 try:
     from performance_automation import (
         automation_status,
+    korean_font_status,
         send_latest_cycle_test,
         send_period_report_test,
         start_performance_automation,
@@ -2885,6 +2886,16 @@ def performance_automation_status():
         return jsonify(automation_status()), 200
     except Exception as exc:
         log.exception("Performance automation status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/performance/debug/font-status")
+@admin_required
+def performance_font_status():
+    try:
+        return jsonify(korean_font_status(prepare=True)), 200
+    except Exception as exc:
+        log.exception("Performance Korean font status failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 

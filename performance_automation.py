@@ -39,6 +39,27 @@ MEMBER_NOTICE_ENV = "MEMBER_NOTICE_1Q"
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
+# Render 기본 이미지에는 한글 폰트가 없을 수 있으므로 공식 Noto CJK 폰트를
+# 실행 중 /tmp에 내려받아 사용한다. 폰트 파일은 저장소에 포함하지 않는다.
+FONT_CACHE_DIR = Path(os.getenv("PERFORMANCE_FONT_CACHE_DIR", "/tmp/bbangdol-fonts"))
+FONT_REGULAR_URLS = [
+    os.getenv("PERFORMANCE_FONT_REGULAR_URL", "").strip(),
+    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
+    "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
+]
+FONT_BOLD_URLS = [
+    os.getenv("PERFORMANCE_FONT_BOLD_URL", "").strip(),
+    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Bold.otf",
+    "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansCJKkr-Bold.otf",
+]
+FONT_DOWNLOAD_TIMEOUT = max(
+    10, int(os.getenv("PERFORMANCE_FONT_DOWNLOAD_TIMEOUT", "45"))
+)
+_FONT_LOCK = threading.Lock()
+_FONT_PATHS: dict[bool, Path | None] = {False: None, True: None}
+_FONT_OBJECT_CACHE: dict[tuple[int, bool], Any] = {}
+_FONT_LAST_ERROR = ""
+
 POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60")))
 
 def _automation_enabled() -> bool:
@@ -185,22 +206,132 @@ def _release(delivery_key: str) -> None:
         log.exception("delivery claim release failed key=%s", delivery_key)
 
 
+def _system_korean_font_candidates(bold: bool) -> list[Path]:
+    names = (
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Bold.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansKR-Bold.ttf",
+        ]
+        if bold
+        else
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
+        ]
+    )
+    return [Path(name) for name in names]
+
+
+def _download_font(urls: list[str], destination: Path) -> Path:
+    errors: list[str] = []
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for url in [value for value in urls if value]:
+        temp = destination.with_suffix(destination.suffix + ".part")
+        try:
+            response = requests.get(url, timeout=FONT_DOWNLOAD_TIMEOUT)
+            response.raise_for_status()
+            if len(response.content) < 500_000:
+                raise RuntimeError(
+                    f"downloaded file is too small ({len(response.content)} bytes)"
+                )
+            temp.write_bytes(response.content)
+            # 실제로 Pillow가 열 수 있는 폰트인지 확인한 후 원자적으로 교체한다.
+            ImageFont.truetype(str(temp), 20)
+            temp.replace(destination)
+            log.info("Korean font downloaded path=%s url=%s", destination, url)
+            return destination
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            try:
+                temp.unlink(missing_ok=True)
+            except Exception:
+                pass
+    raise RuntimeError("; ".join(errors) or "No Korean font download URL configured")
+
+
+def _resolve_korean_font_path(bold: bool) -> Path:
+    global _FONT_LAST_ERROR
+    cached = _FONT_PATHS.get(bold)
+    if cached and cached.exists():
+        return cached
+
+    with _FONT_LOCK:
+        cached = _FONT_PATHS.get(bold)
+        if cached and cached.exists():
+            return cached
+
+        for candidate in _system_korean_font_candidates(bold):
+            if candidate.exists():
+                try:
+                    ImageFont.truetype(str(candidate), 20)
+                    _FONT_PATHS[bold] = candidate
+                    _FONT_LAST_ERROR = ""
+                    log.info("Korean system font selected path=%s", candidate)
+                    return candidate
+                except Exception:
+                    continue
+
+        destination = FONT_CACHE_DIR / (
+            "NotoSansCJKkr-Bold.otf" if bold else "NotoSansCJKkr-Regular.otf"
+        )
+        if destination.exists():
+            try:
+                ImageFont.truetype(str(destination), 20)
+                _FONT_PATHS[bold] = destination
+                _FONT_LAST_ERROR = ""
+                return destination
+            except Exception:
+                destination.unlink(missing_ok=True)
+
+        try:
+            path = _download_font(
+                FONT_BOLD_URLS if bold else FONT_REGULAR_URLS,
+                destination,
+            )
+            _FONT_PATHS[bold] = path
+            _FONT_LAST_ERROR = ""
+            return path
+        except Exception as exc:
+            _FONT_LAST_ERROR = str(exc)
+            log.exception("Korean font preparation failed bold=%s", bold)
+            raise RuntimeError(
+                "한글 이미지 폰트를 준비하지 못했습니다. "
+                "Render의 외부 네트워크 또는 PERFORMANCE_FONT_*_URL을 확인하세요."
+            ) from exc
+
+
 def _font(size: int, bold: bool = False):
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
-        if bold else
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"
-        if bold else
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if bold else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for candidate in candidates:
-        if Path(candidate).exists():
-            return ImageFont.truetype(candidate, size)
-    return ImageFont.load_default()
+    key = (int(size), bool(bold))
+    cached = _FONT_OBJECT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = _resolve_korean_font_path(bool(bold))
+    font = ImageFont.truetype(str(path), int(size))
+    _FONT_OBJECT_CACHE[key] = font
+    return font
+
+
+def korean_font_status(prepare: bool = False) -> dict[str, Any]:
+    if prepare:
+        try:
+            _resolve_korean_font_path(False)
+            _resolve_korean_font_path(True)
+        except Exception:
+            pass
+    regular = _FONT_PATHS.get(False)
+    bold = _FONT_PATHS.get(True)
+    return {
+        "korean_font_ready": bool(
+            regular and regular.exists() and bold and bold.exists()
+        ),
+        "regular_font": regular.name if regular and regular.exists() else None,
+        "bold_font": bold.name if bold and bold.exists() else None,
+        "font_error": _FONT_LAST_ERROR or None,
+    }
 
 
 def _duration(minutes: float | int | None) -> str:
@@ -756,6 +887,7 @@ def automation_status() -> dict[str, Any]:
         "no_backfill_mode": True,
         "poll_seconds": POLL_SECONDS,
         "thread_started": _STARTED,
+        "font": korean_font_status(prepare=True),
         "entry_destinations": {
             f"{market}_{group}": {
                 "env": env_name,
