@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -76,6 +76,65 @@ CREATE INDEX IF NOT EXISTS idx_performance_signals_strategy_route
     ON performance_signals(strategy, route);
 CREATE INDEX IF NOT EXISTS idx_performance_signals_side_tf
     ON performance_signals(side, timeframe_minutes);
+
+CREATE TABLE IF NOT EXISTS performance_candle_watch (
+    symbol VARCHAR(100) PRIMARY KEY,
+    exchange VARCHAR(30),
+    raw_exchange VARCHAR(30),
+    started_at TIMESTAMPTZ NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    need_1m BOOLEAN NOT NULL DEFAULT FALSE,
+    need_5m BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE performance_candle_watch ADD COLUMN IF NOT EXISTS need_1m BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE performance_candle_watch ADD COLUMN IF NOT EXISTS need_5m BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS performance_candles_1m (
+    id BIGSERIAL PRIMARY KEY,
+    exchange VARCHAR(30),
+    raw_exchange VARCHAR(30),
+    symbol VARCHAR(100) NOT NULL,
+    bar_time TIMESTAMPTZ NOT NULL,
+    bar_close_time TIMESTAMPTZ,
+    open NUMERIC(30,10) NOT NULL,
+    high NUMERIC(30,10) NOT NULL,
+    low NUMERIC(30,10) NOT NULL,
+    close NUMERIC(30,10) NOT NULL,
+    volume NUMERIC(40,10),
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(symbol, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_performance_candles_1m_symbol_time
+    ON performance_candles_1m(symbol, bar_time);
+
+CREATE TABLE IF NOT EXISTS performance_candles_5m (
+    id BIGSERIAL PRIMARY KEY,
+    exchange VARCHAR(30),
+    raw_exchange VARCHAR(30),
+    symbol VARCHAR(100) NOT NULL,
+    bar_time TIMESTAMPTZ NOT NULL,
+    bar_close_time TIMESTAMPTZ,
+    open NUMERIC(30,10) NOT NULL,
+    high NUMERIC(30,10) NOT NULL,
+    low NUMERIC(30,10) NOT NULL,
+    close NUMERIC(30,10) NOT NULL,
+    volume NUMERIC(40,10),
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(symbol, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_performance_candles_5m_symbol_time
+    ON performance_candles_5m(symbol, bar_time);
+
+CREATE TABLE IF NOT EXISTS performance_cycle_chart_archive (
+    archive_key VARCHAR(300) PRIMARY KEY,
+    market VARCHAR(20),
+    symbol VARCHAR(100) NOT NULL,
+    entry_first_time TIMESTAMPTZ,
+    completion_time TIMESTAMPTZ,
+    image_png BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -149,6 +208,22 @@ def _make_signal_hash(route: str, symbol: str, message: str, received_at: dateti
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def _env_enabled(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _collection_requirements(route: str) -> tuple[bool, bool]:
+    """Return (need_1m, need_5m) for a newly observed LOW route."""
+    route = str(route or "").upper()
+    if route == "BD_BUY_SHORT":
+        return _env_enabled("PERFORMANCE_COLLECT_COIN_SCALP", "1"), False
+    if "SWING" in route:
+        return True, False
+    if "LONG" in route or "LIFE" in route:
+        return False, True
+    return False, False
+
+
 def save_signal(payload: dict[str, Any]) -> bool:
     """Save one eligible TradingView signal. Returns True if inserted."""
     route = str(payload.get("route", payload.get("type", ""))).strip().upper()
@@ -201,6 +276,39 @@ def save_signal(payload: dict[str, Any]) -> bool:
     with _connect() as conn:
         inserted = conn.execute(sql, params).fetchone()
     if inserted:
+        if row["signal_type"] == "LOW":
+            need_1m, need_5m = _collection_requirements(route)
+            if need_1m or need_5m:
+                with _connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO performance_candle_watch(
+                            symbol, exchange, raw_exchange, started_at, active,
+                            need_1m, need_5m, updated_at
+                        ) VALUES (%s, %s, %s, %s, TRUE, %s, %s, NOW())
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            exchange=EXCLUDED.exchange,
+                            raw_exchange=EXCLUDED.raw_exchange,
+                            started_at=CASE
+                                WHEN performance_candle_watch.active
+                                THEN LEAST(performance_candle_watch.started_at, EXCLUDED.started_at)
+                                ELSE EXCLUDED.started_at
+                            END,
+                            active=TRUE,
+                            need_1m=CASE
+                                WHEN performance_candle_watch.active
+                                THEN performance_candle_watch.need_1m OR EXCLUDED.need_1m
+                                ELSE EXCLUDED.need_1m
+                            END,
+                            need_5m=CASE
+                                WHEN performance_candle_watch.active
+                                THEN performance_candle_watch.need_5m OR EXCLUDED.need_5m
+                                ELSE EXCLUDED.need_5m
+                            END,
+                            updated_at=NOW()
+                        """,
+                        (symbol, row["exchange"], row["raw_exchange"], received_at, need_1m, need_5m),
+                    )
         log.info(
             "Performance signal saved id=%s strategy=%s route=%s symbol=%s tf=%s price=%s",
             inserted[0], row["strategy"], route, symbol, timeframe, price,
@@ -284,3 +392,162 @@ def latest_signals(limit: int = 20) -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def _ms_to_datetime(value: Any) -> datetime:
+    number = int(float(value))
+    return datetime.fromtimestamp(number / 1000.0, tz=timezone.utc)
+
+
+def _candle_interval(payload: dict[str, Any]) -> int:
+    event = str(payload.get("event_type", "")).upper()
+    if event == "PERFORMANCE_CANDLE_1M":
+        return 1
+    if event == "PERFORMANCE_CANDLE_5M":
+        return 5
+    try:
+        value = int(payload.get("interval_minutes", 0))
+    except (TypeError, ValueError):
+        value = 0
+    if value not in (1, 5):
+        raise ValueError(f"unsupported candle interval: {value}")
+    return value
+
+
+def save_candle(payload: dict[str, Any]) -> bool:
+    """Store confirmed TradingView 1m/5m OHLC only while its resolution is required."""
+    symbol = str(payload.get("symbol", "")).strip()
+    if not symbol:
+        raise ValueError("candle payload missing symbol")
+    interval = _candle_interval(payload)
+    bar_time = _ms_to_datetime(payload.get("bar_time"))
+    bar_close_time = _ms_to_datetime(payload.get("bar_close_time")) if payload.get("bar_close_time") else None
+    values = {name: Decimal(str(payload.get(name))) for name in ("open", "high", "low", "close")}
+    volume = Decimal(str(payload.get("volume", 0)))
+    ensure_schema()
+    with _connect() as conn:
+        watch = conn.execute(
+            "SELECT active, started_at, need_1m, need_5m FROM performance_candle_watch WHERE symbol=%s",
+            (symbol,),
+        ).fetchone()
+        required = bool(watch and watch[0] and ((interval == 1 and watch[2]) or (interval == 5 and watch[3])))
+        if not required or bar_time < watch[1] - timedelta(minutes=interval):
+            return False
+        table = "performance_candles_1m" if interval == 1 else "performance_candles_5m"
+        sql = f"""
+            INSERT INTO {table}(
+                exchange, raw_exchange, symbol, bar_time, bar_close_time,
+                open, high, low, close, volume
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(symbol, bar_time) DO NOTHING
+            RETURNING id
+        """
+        row = conn.execute(
+            sql,
+            (
+                str(payload.get("exchange", "")) or None,
+                str(payload.get("raw_exchange", "")) or None,
+                symbol, bar_time, bar_close_time,
+                values["open"], values["high"], values["low"], values["close"], volume,
+            ),
+        ).fetchone()
+    return bool(row)
+
+
+def queue_candle_save(payload: dict[str, Any]) -> None:
+    snapshot = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    def worker():
+        try:
+            save_candle(snapshot)
+        except Exception:
+            log.exception("Performance candle save failed event=%s", snapshot.get("event_type"))
+    threading.Thread(target=worker, daemon=True, name="performance-candle-save").start()
+
+
+def load_candles(
+    symbol: str,
+    start_time: str | datetime,
+    end_time: str | datetime,
+    interval_minutes: int,
+) -> list[dict[str, Any]]:
+    if interval_minutes not in (1, 5):
+        raise ValueError("interval_minutes must be 1 or 5")
+    ensure_schema()
+    start = datetime.fromisoformat(start_time) if isinstance(start_time, str) else start_time
+    end = datetime.fromisoformat(end_time) if isinstance(end_time, str) else end_time
+    table = "performance_candles_1m" if interval_minutes == 1 else "performance_candles_5m"
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT bar_time, open, high, low, close, volume
+            FROM {table}
+            WHERE symbol=%s AND bar_time BETWEEN %s AND %s
+            ORDER BY bar_time
+            """, (symbol, start, end)
+        ).fetchall()
+    return [
+        {
+            "time": r[0], "open": float(r[1]), "high": float(r[2]),
+            "low": float(r[3]), "close": float(r[4]), "volume": float(r[5] or 0),
+            "interval_minutes": interval_minutes,
+        }
+        for r in rows
+    ]
+
+
+def candle_watch_status(symbol: str) -> dict[str, Any] | None:
+    ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT started_at, active, need_1m, need_5m FROM performance_candle_watch WHERE symbol=%s",
+            (symbol,),
+        ).fetchone()
+    if not row:
+        return None
+    return {"started_at": row[0], "active": bool(row[1]), "need_1m": bool(row[2]), "need_5m": bool(row[3])}
+
+
+# v19 compatibility aliases
+def save_candle_5m(payload: dict[str, Any]) -> bool:
+    payload = dict(payload)
+    payload.setdefault("event_type", "PERFORMANCE_CANDLE_5M")
+    return save_candle(payload)
+
+
+def load_candles_5m(symbol: str, start_time: str | datetime, end_time: str | datetime) -> list[dict[str, Any]]:
+    return load_candles(symbol, start_time, end_time, 5)
+
+
+
+def archive_cycle_chart(archive_key: str, market: str, symbol: str, entry_first_time: str, completion_time: str, png: bytes) -> None:
+    ensure_schema()
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO performance_cycle_chart_archive
+            (archive_key, market, symbol, entry_first_time, completion_time, image_png)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(archive_key) DO UPDATE SET image_png=EXCLUDED.image_png, created_at=NOW()""",
+            (archive_key, market, symbol, entry_first_time, completion_time, png),
+        )
+
+
+def finish_candle_watch(symbol: str, through_time: str | datetime) -> int:
+    """Deactivate collection and delete raw 1m/5m candles after final chart archive."""
+    end = datetime.fromisoformat(through_time) if isinstance(through_time, str) else through_time
+    ensure_schema()
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE performance_candle_watch
+               SET active=FALSE, need_1m=FALSE, need_5m=FALSE, updated_at=NOW()
+               WHERE symbol=%s""",
+            (symbol,),
+        )
+        deleted_1m = conn.execute(
+            "DELETE FROM performance_candles_1m WHERE symbol=%s AND bar_time<=%s RETURNING id",
+            (symbol, end),
+        ).fetchall()
+        deleted_5m = conn.execute(
+            "DELETE FROM performance_candles_5m WHERE symbol=%s AND bar_time<=%s RETURNING id",
+            (symbol, end),
+        ).fetchall()
+    return len(deleted_1m) + len(deleted_5m)

@@ -21,6 +21,7 @@ import psycopg
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+from performance_store import load_candles, archive_cycle_chart, finish_candle_watch, candle_watch_status
 from performance_group_analyzer import (
     EXIT_GROUPS,
     GROUP_LABEL,
@@ -39,33 +40,14 @@ MEMBER_NOTICE_ENV = "MEMBER_NOTICE_1Q"
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
-# Render 기본 이미지에는 한글 폰트가 없을 수 있으므로 공식 Noto CJK 폰트를
-# 실행 중 /tmp에 내려받아 사용한다. 폰트 파일은 저장소에 포함하지 않는다.
-FONT_CACHE_DIR = Path(os.getenv("PERFORMANCE_FONT_CACHE_DIR", "/tmp/bbangdol-fonts"))
-FONT_REGULAR_URLS = [
-    os.getenv("PERFORMANCE_FONT_REGULAR_URL", "").strip(),
-    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
-    "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
-]
-FONT_BOLD_URLS = [
-    os.getenv("PERFORMANCE_FONT_BOLD_URL", "").strip(),
-    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Bold.otf",
-    "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Korean/NotoSansCJKkr-Bold.otf",
-]
-FONT_DOWNLOAD_TIMEOUT = max(
-    10, int(os.getenv("PERFORMANCE_FONT_DOWNLOAD_TIMEOUT", "45"))
-)
-_FONT_LOCK = threading.Lock()
-_FONT_PATHS: dict[bool, Path | None] = {False: None, True: None}
-_FONT_OBJECT_CACHE: dict[tuple[int, bool], Any] = {}
-_FONT_LAST_ERROR = ""
-
 POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60")))
 
 def _automation_enabled() -> bool:
     return os.getenv(
         "PERFORMANCE_AUTOMATION_ENABLED", "1"
     ).strip().lower() not in {"0", "false", "off", "no"}
+
+SEND_COIN_SCALP = os.getenv("PERFORMANCE_SEND_COIN_SCALP", "0").strip().lower() not in {"0", "false", "off", "no"}
 
 MARKET_LABEL = {
     "KOREA": "국장",
@@ -206,132 +188,22 @@ def _release(delivery_key: str) -> None:
         log.exception("delivery claim release failed key=%s", delivery_key)
 
 
-def _system_korean_font_candidates(bold: bool) -> list[Path]:
-    names = (
-        [
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Bold.otf",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansKR-Bold.ttf",
-        ]
-        if bold
-        else
-        [
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
-        ]
-    )
-    return [Path(name) for name in names]
-
-
-def _download_font(urls: list[str], destination: Path) -> Path:
-    errors: list[str] = []
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    for url in [value for value in urls if value]:
-        temp = destination.with_suffix(destination.suffix + ".part")
-        try:
-            response = requests.get(url, timeout=FONT_DOWNLOAD_TIMEOUT)
-            response.raise_for_status()
-            if len(response.content) < 500_000:
-                raise RuntimeError(
-                    f"downloaded file is too small ({len(response.content)} bytes)"
-                )
-            temp.write_bytes(response.content)
-            # 실제로 Pillow가 열 수 있는 폰트인지 확인한 후 원자적으로 교체한다.
-            ImageFont.truetype(str(temp), 20)
-            temp.replace(destination)
-            log.info("Korean font downloaded path=%s url=%s", destination, url)
-            return destination
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-            try:
-                temp.unlink(missing_ok=True)
-            except Exception:
-                pass
-    raise RuntimeError("; ".join(errors) or "No Korean font download URL configured")
-
-
-def _resolve_korean_font_path(bold: bool) -> Path:
-    global _FONT_LAST_ERROR
-    cached = _FONT_PATHS.get(bold)
-    if cached and cached.exists():
-        return cached
-
-    with _FONT_LOCK:
-        cached = _FONT_PATHS.get(bold)
-        if cached and cached.exists():
-            return cached
-
-        for candidate in _system_korean_font_candidates(bold):
-            if candidate.exists():
-                try:
-                    ImageFont.truetype(str(candidate), 20)
-                    _FONT_PATHS[bold] = candidate
-                    _FONT_LAST_ERROR = ""
-                    log.info("Korean system font selected path=%s", candidate)
-                    return candidate
-                except Exception:
-                    continue
-
-        destination = FONT_CACHE_DIR / (
-            "NotoSansCJKkr-Bold.otf" if bold else "NotoSansCJKkr-Regular.otf"
-        )
-        if destination.exists():
-            try:
-                ImageFont.truetype(str(destination), 20)
-                _FONT_PATHS[bold] = destination
-                _FONT_LAST_ERROR = ""
-                return destination
-            except Exception:
-                destination.unlink(missing_ok=True)
-
-        try:
-            path = _download_font(
-                FONT_BOLD_URLS if bold else FONT_REGULAR_URLS,
-                destination,
-            )
-            _FONT_PATHS[bold] = path
-            _FONT_LAST_ERROR = ""
-            return path
-        except Exception as exc:
-            _FONT_LAST_ERROR = str(exc)
-            log.exception("Korean font preparation failed bold=%s", bold)
-            raise RuntimeError(
-                "한글 이미지 폰트를 준비하지 못했습니다. "
-                "Render의 외부 네트워크 또는 PERFORMANCE_FONT_*_URL을 확인하세요."
-            ) from exc
-
-
 def _font(size: int, bold: bool = False):
-    key = (int(size), bool(bold))
-    cached = _FONT_OBJECT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    path = _resolve_korean_font_path(bool(bold))
-    font = ImageFont.truetype(str(path), int(size))
-    _FONT_OBJECT_CACHE[key] = font
-    return font
-
-
-def korean_font_status(prepare: bool = False) -> dict[str, Any]:
-    if prepare:
-        try:
-            _resolve_korean_font_path(False)
-            _resolve_korean_font_path(True)
-        except Exception:
-            pass
-    regular = _FONT_PATHS.get(False)
-    bold = _FONT_PATHS.get(True)
-    return {
-        "korean_font_ready": bool(
-            regular and regular.exists() and bold and bold.exists()
-        ),
-        "regular_font": regular.name if regular and regular.exists() else None,
-        "bold_font": bold.name if bold and bold.exists() else None,
-        "font_error": _FONT_LAST_ERROR or None,
-    }
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+        if bold else
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"
+        if bold else
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return ImageFont.truetype(candidate, size)
+    return ImageFont.load_default()
 
 
 def _duration(minutes: float | int | None) -> str:
@@ -391,13 +263,64 @@ def _png_bytes(image: Image.Image) -> bytes:
     return output.getvalue()
 
 
+
+def _chart_interval(entry_group: str) -> int:
+    return 1 if entry_group in {"SCALP", "SWING"} else 5
+
+
+def _telegram_send_allowed(market: str, entry_group: str) -> bool:
+    if market == "COIN" and entry_group == "SCALP":
+        return SEND_COIN_SCALP
+    return True
+
+
+def _compress_candles(candles: list[dict[str, Any]], max_items: int = 150) -> list[dict[str, Any]]:
+    if len(candles) <= max_items:
+        return candles
+    step = (len(candles) + max_items - 1) // max_items
+    output = []
+    for i in range(0, len(candles), step):
+        chunk = candles[i:i+step]
+        output.append({
+            "time": chunk[0]["time"], "open": chunk[0]["open"],
+            "high": max(x["high"] for x in chunk), "low": min(x["low"] for x in chunk),
+            "close": chunk[-1]["close"], "volume": sum(x.get("volume",0) for x in chunk),
+        })
+    return output
+
+
+def _draw_candle_chart(draw, box, candles, entry_price, entry_points, exit_price):
+    x0,y0,x1,y1=box
+    if not candles:
+        draw.text((x0+20,y0+20), f"{candles[0].get('interval_minutes', 5) if candles else '선택'}분봉 데이터 없음 · 진입/청산 신호만 표시", font=_font(22), fill="#a5a6ad")
+        return None
+    candles=_compress_candles(candles)
+    hi=max(c["high"] for c in candles); lo=min(c["low"] for c in candles)
+    if hi<=lo: hi=lo+1
+    pad=(hi-lo)*0.06; hi+=pad; lo-=pad
+    def py(v): return y0+(hi-v)/(hi-lo)*(y1-y0)
+    width=max(2,(x1-x0)/max(len(candles),1))
+    for i,c in enumerate(candles):
+        x=x0+(i+0.5)*(x1-x0)/len(candles)
+        up=c["close"]>=c["open"]; color="#43d69b" if up else "#ff6f7d"
+        draw.line((x,py(c["high"]),x,py(c["low"])),fill=color,width=1)
+        top=min(py(c["open"]),py(c["close"])); bot=max(py(c["open"]),py(c["close"]))
+        draw.rectangle((x-width*.3,top,x+width*.3,max(top+2,bot)),fill=color)
+    draw.line((x0,py(entry_price),x1,py(entry_price)),fill="#ffc857",width=2)
+    draw.text((x0+6,py(entry_price)-26),"평균 진입가",font=_font(17,True),fill="#ffc857")
+    draw.line((x0,py(exit_price),x1,py(exit_price)),fill="#54e39a",width=2)
+    draw.text((x1-120,py(exit_price)-26),"청산",font=_font(17,True),fill="#54e39a")
+    return min(c["low"] for c in candles)
+
 def render_exit_image(
     market: str,
     symbol: str,
     position: dict[str, Any],
     result: dict[str, Any],
 ) -> bytes:
-    image, draw = _base_canvas(1430)
+    interval = _chart_interval(position["entry_group"])
+    candles = load_candles(symbol, position["entry_first_time"], result["exit_time"], interval)
+    image, draw = _base_canvas(1540)
     white, blue, green, red, muted, gold = (
         "#f4f4f5", "#73cfff", "#54e39a", "#ff7f87", "#a5a6ad", "#ffc857"
     )
@@ -426,7 +349,9 @@ def render_exit_image(
         draw.text((x, y + 38), str(value), font=_font(31, True), fill=white)
 
     return_pct = float(result.get("return_pct") or 0)
-    adverse_pct = float(result.get("signal_adverse_pct") or 0)
+    candle_low = min((c["low"] for c in candles), default=None)
+    adverse_pct = ((candle_low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if candle_low is not None else float(result.get("signal_adverse_pct") or 0)
+    adverse_basis = f"{interval}분봉 저가 기준" if candle_low is not None else "신호 가격 기준"
     _rounded(draw, (45, 550, 1035, 765), outline=green if return_pct >= 0 else red)
     draw.text((75, 585), "실현 가능 수익률", font=_font(27, True), fill=blue)
     draw.text(
@@ -435,36 +360,17 @@ def render_exit_image(
         font=_font(70, True),
         fill=green if return_pct >= 0 else red,
     )
-    draw.text((625, 590), "신호 기준 최대 역행", font=_font(23, True), fill=muted)
+    draw.text((625, 590), "최대 손실폭", font=_font(23, True), fill=muted)
+    draw.text((625, 620), adverse_basis, font=_font(17), fill=muted)
     draw.text((625, 635), f"{adverse_pct:+.3f}%", font=_font(40, True), fill=red)
 
-    _rounded(draw, (45, 800, 1035, 1240))
-    draw.text((75, 835), "실제 신호 가격 흐름", font=_font(30, True), fill=white)
-
-    points = list(position.get("entry_points") or [])
-    y = 915
-    for idx, point in enumerate(points[:10], 1):
-        draw.ellipse((85, y + 8, 105, y + 28), fill=gold)
-        draw.text(
-            (125, y),
-            f"진입 {idx} · {point.get('timeframe')} · {_price(point.get('price'))}",
-            font=_font(25, True),
-            fill=white,
-        )
-        y += 60
-    draw.text((95, y + 5), "⋯ 중간 캔들 생략 ⋯", font=_font(23), fill=muted)
-    y += 70
-    draw.ellipse((85, y + 8, 105, y + 28), fill=green)
-    draw.text(
-        (125, y),
-        f"청산 · {result['exit_timeframe']} · {_price(result['exit_price'])}",
-        font=_font(27, True),
-        fill=green,
-    )
+    _rounded(draw, (45, 800, 1035, 1370))
+    draw.text((75, 830), "TradingView 5분봉 캔들 흐름", font=_font(30, True), fill=white)
+    _draw_candle_chart(draw, (85, 900, 995, 1315), candles, float(position["entry_price"]), position.get("entry_points") or [], float(result["exit_price"]))
 
     draw.text(
-        (60, 1305),
-        "※ TradingView 신호 가격 기반 통계이며 수수료·슬리피지는 포함하지 않습니다.",
+        (60, 1435),
+        "※ TradingView 5분봉/신호 가격 기반이며 수수료·슬리피지는 포함하지 않습니다.",
         font=_font(20),
         fill=muted,
     )
@@ -480,7 +386,10 @@ def render_cycle_summary_image(
         position.get("exit_results") or [],
         key=lambda row: row.get("exit_timeframe_minutes", 0),
     )
-    height = max(1450, 780 + len(results) * 105)
+    completion_time = max((row["exit_time"] for row in results), default=position["entry_first_time"])
+    interval = _chart_interval(position["entry_group"])
+    candles = load_candles(symbol, position["entry_first_time"], completion_time, interval)
+    height = max(1900, 1220 + len(results) * 96)
     image, draw = _base_canvas(height)
     white, blue, green, red, muted, gold = (
         "#f4f4f5", "#73cfff", "#54e39a", "#ff7f87", "#a5a6ad", "#ffc857"
@@ -490,21 +399,32 @@ def render_cycle_summary_image(
     draw.text(
         (60, 115),
         f"{MARKET_LABEL.get(market, market)} · {GROUP_LABEL.get(position['entry_group'], position['entry_group'])}",
-        font=_font(29, True),
-        fill=blue,
+        font=_font(29, True), fill=blue,
     )
     draw.text((60, 170), symbol, font=_font(44, True), fill=white)
 
     _rounded(draw, (45, 250, 1035, 475))
-    draw.text((75, 285), "최초 진입 시간봉", font=_font(22, True), fill=blue)
-    draw.text((75, 330), position["entry_timeframe"], font=_font(35, True), fill=white)
-    draw.text((380, 285), "분할 진입", font=_font(22, True), fill=blue)
-    draw.text((380, 330), f"{position['entry_count']}회", font=_font(35, True), fill=white)
-    draw.text((680, 285), "평균 진입가", font=_font(22, True), fill=blue)
-    draw.text((680, 330), _price(position["entry_price"]), font=_font(35, True), fill=white)
+    stats = [
+        ("최초 진입 시간봉", position["entry_timeframe"]),
+        ("분할 진입", f"{position['entry_count']}회"),
+        ("평균 진입가", _price(position["entry_price"])),
+    ]
+    for idx, (label, value) in enumerate(stats):
+        x = 75 + idx * 305
+        draw.text((x, 285), label, font=_font(22, True), fill=blue)
+        draw.text((x, 330), str(value), font=_font(35, True), fill=white)
 
-    draw.text((60, 530), "시간봉별 청산 결과", font=_font(32, True), fill=white)
-    y = 600
+    _rounded(draw, (45, 520, 1035, 1020), fill="#111216")
+    draw.text((70, 545), f"TradingView 확정 {interval}분봉 압축 차트", font=_font(27, True), fill=white)
+    final_exit = float(results[-1]["exit_price"]) if results else float(position["entry_price"])
+    low = _draw_candle_chart(
+        draw, (80, 610, 1000, 975), candles, float(position["entry_price"]),
+        position.get("entry_points") or [], final_exit,
+    )
+    adverse = ((low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if low is not None else None
+
+    draw.text((60, 1060), "시간봉별 청산 결과", font=_font(32, True), fill=white)
+    y = 1125
     returns = []
     for result in results:
         value = float(result.get("return_pct") or 0)
@@ -512,18 +432,8 @@ def render_cycle_summary_image(
         _rounded(draw, (55, y, 1025, y + 82), fill="#15161a")
         draw.text((85, y + 22), result["exit_timeframe"], font=_font(25, True), fill=blue)
         draw.text((230, y + 22), _price(result["exit_price"]), font=_font(24, True), fill=white)
-        draw.text(
-            (520, y + 18),
-            f"{value:+.3f}%",
-            font=_font(31, True),
-            fill=green if value >= 0 else red,
-        )
-        draw.text(
-            (745, y + 22),
-            result.get("holding_text") or _duration(result.get("holding_minutes")),
-            font=_font(22),
-            fill=muted,
-        )
+        draw.text((520, y + 18), f"{value:+.3f}%", font=_font(31, True), fill=green if value >= 0 else red)
+        draw.text((745, y + 22), result.get("holding_text") or _duration(result.get("holding_minutes")), font=_font(22), fill=muted)
         y += 98
 
     if returns:
@@ -531,13 +441,12 @@ def render_cycle_summary_image(
         draw.text((250, y + 20), f"{sum(returns)/len(returns):+.3f}%", font=_font(34, True), fill=green)
         draw.text((550, y + 25), "최고 수익", font=_font(24, True), fill=blue)
         draw.text((735, y + 20), f"{max(returns):+.3f}%", font=_font(34, True), fill=green)
+        if adverse is not None:
+            draw.text((65, y + 78), "최대 손실폭", font=_font(22, True), fill=blue)
+            draw.text((250, y + 72), f"{adverse:+.3f}%", font=_font(30, True), fill=red)
+            draw.text((470, y + 80), f"{interval}분봉 저가 기준", font=_font(19), fill=muted)
 
-    draw.text(
-        (60, height - 75),
-        "※ 각 청산 시간봉의 첫 유효 고점 결과를 한 장으로 합산했습니다.",
-        font=_font(20),
-        fill=muted,
-    )
+    draw.text((60, height - 75), "※ 캔들은 TradingView 확정 OHLC를 화면 폭에 맞게 압축했습니다.", font=_font(20), fill=muted)
     return _png_bytes(image)
 
 
@@ -567,7 +476,8 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
         for symbol, symbol_data in market_data.get("symbol_data", {}).items():
             for position in symbol_data.get("positions", []):
                 env_name, chat_id = _entry_destination(market, position["entry_group"])
-                if not env_name or not chat_id:
+                send_allowed = _telegram_send_allowed(market, position["entry_group"])
+                if send_allowed and (not env_name or not chat_id):
                     continue
 
                 position_key = _position_key(market, symbol, position)
@@ -584,6 +494,9 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
 
                 for result in fresh_results:
                     exit_id = int(result["exit_signal_id"])
+                    if not send_allowed:
+                        log.info("coin scalp exit image suppressed symbol=%s exit_id=%s", symbol, exit_id)
+                        continue
                     delivery_key = f"exit-v3:{position_key}:{exit_id}:{result['exit_timeframe']}"
                     if not _claim(delivery_key, "EXIT_IMAGE", market, symbol, env_name):
                         continue
@@ -625,7 +538,31 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                                 f"청산 {len(all_results)}개 · 평균 {sum(values)/len(values):+.3f}% · "
                                 f"최고 {max(values):+.3f}%"
                             )
-                            _send_photo(chat_id, png, caption)
+                            if send_allowed:
+                                _send_photo(chat_id, png, caption)
+                            else:
+                                log.info("coin scalp summary image archived without Telegram symbol=%s", symbol)
+                            completion_time = max(row["exit_time"] for row in all_results)
+                            archive_cycle_chart(summary_key, market, symbol, position["entry_first_time"], completion_time, png)
+                            # 현재 수집 시작 이후의 진행 포지션이 모두 끝났을 때만 1m/5m 원본을 정리한다.
+                            watch = candle_watch_status(symbol)
+                            watch_started = watch.get("started_at") if watch else None
+                            incomplete = False
+                            for other in symbol_data.get("positions", []):
+                                try:
+                                    other_start = datetime.fromisoformat(other["entry_first_time"])
+                                except Exception:
+                                    continue
+                                if watch_started and other_start < watch_started:
+                                    continue
+                                other_expected = set(_expected_exit_timeframes(market, other["entry_group"]))
+                                other_done = {r["exit_timeframe"] for r in (other.get("exit_results") or [])}
+                                if other_expected and not other_expected.issubset(other_done):
+                                    incomplete = True
+                                    break
+                            if not incomplete:
+                                deleted = finish_candle_watch(symbol, completion_time)
+                                log.info("candle watch finished symbol=%s deleted_1m_5m=%s", symbol, deleted)
                             log.info(
                                 "new cycle summary sent market=%s symbol=%s trigger_id=%s env=%s",
                                 market, symbol, completion_trigger_id, env_name,
@@ -885,9 +822,10 @@ def automation_status() -> dict[str, Any]:
         "member_notice_configured": bool(notice_id),
         "high_signal_watermark": _get_state("last_processed_high_signal_id") if DATABASE_URL else None,
         "no_backfill_mode": True,
+        "collect_coin_scalp": os.getenv("PERFORMANCE_COLLECT_COIN_SCALP", "1"),
+        "send_coin_scalp": os.getenv("PERFORMANCE_SEND_COIN_SCALP", "0"),
         "poll_seconds": POLL_SECONDS,
         "thread_started": _STARTED,
-        "font": korean_font_status(prepare=True),
         "entry_destinations": {
             f"{market}_{group}": {
                 "env": env_name,

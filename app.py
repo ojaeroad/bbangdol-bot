@@ -11,13 +11,12 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 import requests
 
 # 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
-from performance_store import queue_signal_save, health_summary, latest_signals
+from performance_store import queue_signal_save, queue_candle_save, health_summary, latest_signals
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 from performance_group_analyzer import group_analysis_data, group_analysis_market_data, update_settings as update_group_settings
 try:
     from performance_automation import (
         automation_status,
-    korean_font_status,
         send_latest_cycle_test,
         send_period_report_test,
         start_performance_automation,
@@ -808,7 +807,7 @@ def promo_cycle_svg(position, title, width=1080, height=1080):
         f'<text x="105" y="885" fill="#55e69a" font-size="70" font-weight="900">{best.get("return_pct",0):+.2f}%</text>'
         f'<text x="105" y="930" fill="#ffffff" font-size="24">{best.get("exit_timeframe","-")} 청산 · {best.get("holding_text","-")}</text>'
         '<rect x="545" y="745" width="460" height="210" rx="22" fill="#19191c" stroke="#6e5520"/>'
-        '<text x="575" y="800" fill="#aaaaaf" font-size="24">신호 기준 최대 역행</text>'
+        '<text x="575" y="800" fill="#aaaaaf" font-size="24">최대 손실폭</text>'
         f'<text x="575" y="875" fill="#ff7878" font-size="56" font-weight="900">{position.get("signal_adverse_pct",0):.2f}%</text>'
         '<text x="575" y="930" fill="#aaaaaf" font-size="20">중간 캔들이 아닌 저장 LOW 신호 기준</text>'
         '<text x="75" y="1010" fill="#77777e" font-size="18">실제 체결가·수수료·슬리피지·세금은 반영되지 않을 수 있습니다.</text>'
@@ -2009,7 +2008,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="trust-meta">
 <span>승률 {{'%.1f'|format(group.win_rate_pct)}}%</span>
 <span>보유 {{format_minutes_compact(group.average_holding_minutes)}}</span>
-<span>신호 기준 역행 {% if group.average_signal_adverse_pct is not none %}{{'%.2f'|format(group.average_signal_adverse_pct)}}%{% else %}-{% endif %}</span>
+<span>최대 손실폭 {% if group.average_signal_adverse_pct is not none %}{{'%.2f'|format(group.average_signal_adverse_pct)}}%{% else %}-{% endif %}</span>
 <span>회복 {{format_minutes_compact(group.average_recovery_minutes)}}</span>
 </div></div>
 {% endfor %}
@@ -2018,7 +2017,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="life-hero">
 <h3>★ 인생타점 집중 보기</h3>
 {% if life %}
-<p>평균 {{'%.2f'|format(life[0].average_return_pct)}}% · 승률 {{'%.1f'|format(life[0].win_rate_pct)}}% · 평균 보유 {{format_minutes_compact(life[0].average_holding_minutes)}} · 신호 기준 평균 최대 역행 {{'%.2f'|format(life[0].average_signal_adverse_pct)}}%</p>
+<p>평균 {{'%.2f'|format(life[0].average_return_pct)}}% · 승률 {{'%.1f'|format(life[0].win_rate_pct)}}% · 평균 보유 {{format_minutes_compact(life[0].average_holding_minutes)}} · 평균 최대 손실폭 {{'%.2f'|format(life[0].average_signal_adverse_pct)}}%</p>
 {% else %}<p class="muted">인생타점 완료 사이클이 쌓이면 이곳에 최우선으로 표시됩니다.</p>{% endif %}
 </div>
 <div class="ranking-wrap">
@@ -2079,7 +2078,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 <div>• <b>완료 사이클 1회</b>: 첫 진입부터 최초 유효 고점 청산까지입니다. 청산 후 다음 LOW부터 새 사이클입니다.</div>
 <div>• <b>평균수익률</b>: 사이클마다 허용된 청산 시간봉 결과의 평균을 구한 뒤, 완료 사이클끼리 평균합니다.</div>
 <div>• <b>최고수익률</b>: 저장된 청산 시간봉 비교 결과 중 최고값이며, 해당 종목·진입 시간봉·청산 시간봉을 함께 표시합니다.</div>
-<div>• <b>신호 기준 최대 역행</b>: 전체 캔들 저가가 아니라 청산 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
+<div>• <b>최대 손실폭</b>: 전체 캔들 저가가 아니라 청산 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
 <div>• 수수료·슬리피지·세금·실제 주문 체결 오차는 반영되지 않을 수 있습니다.</div>
 <div>• 발생 주기의 ‘근접/초과’는 과거 평균 간격 비교이며 다음 신호를 보장하지 않습니다.</div>
 </div>
@@ -2327,11 +2326,11 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <div class="trust-mini"><span>완료 사이클</span><b>{{member_stats.completed_cycle_count}}회</b></div>
 <div class="trust-mini"><span>평균 수익</span><b class="pos">{% if member_stats.average_return_pct is not none %}{{'%.2f'|format(member_stats.average_return_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="trust-mini"><span>승률</span><b>{% if member_stats.win_rate_pct is not none %}{{'%.1f'|format(member_stats.win_rate_pct)}}%{% else %}-{% endif %}</b></div>
-<div class="trust-mini"><span>신호 기준 평균 최대 역행</span><b class="neg">{% if member_stats.average_signal_adverse_pct is not none %}{{'%.2f'|format(member_stats.average_signal_adverse_pct)}}%{% else %}-{% endif %}</b></div>
+<div class="trust-mini"><span>평균 최대 손실폭</span><b class="neg">{% if member_stats.average_signal_adverse_pct is not none %}{{'%.2f'|format(member_stats.average_signal_adverse_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="trust-mini"><span>역행 후 평균 회복</span><b>{{format_minutes_compact(member_stats.average_recovery_minutes)}}</b></div>
 <div class="trust-mini"><span>최고 사례</span><b class="pos">{% if member_stats.best_detail %}{{member_stats.best_detail.entry_timeframe}}→{{member_stats.best_detail.exit_timeframe}} {{'%.2f'|format(member_stats.best_detail.return_pct)}}%{% else %}-{% endif %}</b></div>
 </div>
-<p class="muted">※ 최대 역행은 전체 캔들 저가가 아니라 저장된 LOW 신호 가격 기준입니다.</p>
+<p class="muted">※ 최대 역행은 5분봉 데이터가 없는 과거 사이클은 저장된 신호 가격을 기준으로 계산합니다.</p>
 </div>
 
 <div class="card">
@@ -2388,14 +2387,14 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 
 <div class="card">
 <h2>사이클별 체감 흐름</h2>
-<p class="muted">진입 → 신호 기준 최대 역행 → 청산 시간봉별 결과를 한눈에 비교합니다.</p>
+<p class="muted">진입 → 최대 손실폭 → 청산 시간봉별 결과를 한눈에 비교합니다.</p>
 {% for position in data.positions|reverse %}
 {% if position.cycle_closed and position.exit_results %}
 <details>
 <summary>사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입</summary>
 <div class="cycle-flow">
 {% for entry in position.entry_points %}<div class="flow-step"><strong>진입 {{loop.index}} · {{entry.timeframe}}</strong><div>{{entry.price}}</div><small>{{entry.time}}</small></div>{% endfor %}
-<div class="flow-step adverse"><strong>신호 기준 최대 역행</strong><div>{{'%.2f'|format(position.signal_adverse_pct)}}%</div><small>전체 캔들 MDD가 아닌 LOW 신호 기준</small></div>
+<div class="flow-step adverse"><strong>최대 손실폭</strong><div>{{'%.2f'|format(position.signal_adverse_pct)}}%</div><small>신호 가격 기준</small></div>
 {% for exit in position.exit_results %}<div class="flow-step exit"><strong>{{exit.exit_timeframe}} 청산</strong><div>{{'%.2f'|format(exit.return_pct)}}%</div><small>{{exit.holding_text}} · 회복 {{exit.recovery_text}}</small></div>{% endfor %}
 </div>
 <p><a href="/performance/member/cycle-image?category={{category}}&symbol={{data.symbol}}&cycle={{position.position_sequence}}" target="_blank">이미지 열기·PNG 저장·공유 →</a></p>
@@ -2886,16 +2885,6 @@ def performance_automation_status():
         return jsonify(automation_status()), 200
     except Exception as exc:
         log.exception("Performance automation status failed")
-        return jsonify({"ok": False, "error": str(exc)}), 500
-
-
-@app.get("/performance/debug/font-status")
-@admin_required
-def performance_font_status():
-    try:
-        return jsonify(korean_font_status(prepare=True)), 200
-    except Exception as exc:
-        log.exception("Performance Korean font status failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
@@ -3845,6 +3834,9 @@ def tv_webhook_legacy():
     data = request.get_json(silent=True, force=True) or {}
     bad = _require_webhook_secret(data)
     if bad: return bad
+    if str(data.get("event_type", "")).upper() in {"PERFORMANCE_CANDLE_1M", "PERFORMANCE_CANDLE_5M"}:
+        queue_candle_save(data)
+        return jsonify({"ok": True, "queued": str(data.get("event_type", "")).lower()}), 200
     # 통계 저장은 별도 스레드에서 실행. 실패해도 기존 텔레그램 전송에는 영향 없음.
     queue_signal_save(data)
     route  = str(data.get("route", "")).strip()
@@ -3858,6 +3850,9 @@ def tv_webhook_new():
     data = request.get_json(silent=True, force=True) or {}
     bad = _require_webhook_secret(data)
     if bad: return bad
+    if str(data.get("event_type", "")).upper() in {"PERFORMANCE_CANDLE_1M", "PERFORMANCE_CANDLE_5M"}:
+        queue_candle_save(data)
+        return jsonify({"ok": True, "queued": str(data.get("event_type", "")).lower()}), 200
     # /webhook 경로도 동일하게 원본 신호를 저장한다.
     queue_signal_save(data)
     route  = str(data.get("type", data.get("route", ""))).strip()
