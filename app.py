@@ -571,7 +571,7 @@ def _member_symbol_statistics(symbol_data, period_key="all"):
 
 
 def _member_group_engine_statistics(analysis_data, period_key="all"):
-    """완료 사이클 기준 회원 통계. 청산 시간봉은 비교 시나리오다."""
+    """완료 사이클 기준 회원 통계. 매도 시간봉은 비교 시나리오다."""
     start_at = _period_start(period_key)
     positions = analysis_data.get("positions") or []
     completed = []
@@ -721,7 +721,7 @@ def _svg_escape(value):
 
 
 def price_path_svg(position, width=960, height=360):
-    """진입 가격과 각 청산 시간봉 가격만 표시하는 생략 차트."""
+    """매수가과 각 매도 시간봉 가격만 표시하는 생략 차트."""
     points = []
     for index, entry in enumerate(position.get("entry_points") or [], 1):
         points.append({
@@ -1080,12 +1080,25 @@ def _sort_performance_categories(data):
     return data
 
 
+def _format_iso_kst(value):
+    """관리자 집계표용 한국시간 표시. 값이 없으면 '-'."""
+    if not value:
+        return "-"
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _entry_exit_timeframe_matrix(symbol_data, period_key="all"):
     """
-    진입 시간봉 × 청산 시간봉 조합별 실제 성과 집계.
+    진입 시간봉 × 매도 시간봉 조합별 실제 성과 집계.
 
     기준:
-    - 각 개별 진입(individual_results)을 해당 청산 고점의 시간봉과 연결한다.
+    - 각 개별 매수(individual_results)을 해당 청산 고점의 시간봉과 연결한다.
     - 평균수익률: 조합별 개별 결과의 산술평균
     - 누적수익률: 조합별 개별 수익률의 단순합
     - 승률: 수익률이 0보다 큰 결과 비율
@@ -1124,6 +1137,7 @@ def _entry_exit_timeframe_matrix(symbol_data, period_key="all"):
                         ),
                         "returns": [],
                         "holding_minutes": [],
+                        "time_pairs": [],
                         # 향후 Pine 웹훅에 MA 상태 등이 들어오면 이곳에서 분류한다.
                         "context_breakdown": {},
                     },
@@ -1133,16 +1147,34 @@ def _entry_exit_timeframe_matrix(symbol_data, period_key="all"):
                     bucket["holding_minutes"].append(
                         float(holding_minutes)
                     )
+                bucket["time_pairs"].append(
+                    {
+                        "entry_time": entry.get("time"),
+                        "exit_time": exit_obj.get("time"),
+                    }
+                )
 
     rows = []
     for bucket in buckets.values():
         returns = bucket.pop("returns")
         holdings = bucket.pop("holding_minutes")
+        time_pairs = bucket.pop("time_pairs", [])
+        latest_pair = max(
+            time_pairs,
+            key=lambda row: str(row.get("exit_time") or ""),
+            default={},
+        )
         wins = [value for value in returns if value > 0]
 
         bucket.update(
             {
                 "result_count": len(returns),
+                "latest_entry_time": _format_iso_kst(
+                    latest_pair.get("entry_time")
+                ),
+                "latest_exit_time": _format_iso_kst(
+                    latest_pair.get("exit_time")
+                ),
                 "win_count": len(wins),
                 "loss_count": len(returns) - len(wins),
                 "win_rate_pct": (
@@ -1222,7 +1254,7 @@ def _entry_exit_timeframe_matrix(symbol_data, period_key="all"):
 def _build_member_chart_data(selected_category_data, period_key="all"):
     """
     회원용 시각화 데이터.
-    누적곡선은 각 청산 후보의 전체 분할 수익률을 시간순으로 단순 합산한다.
+    누적곡선은 각 매도 후보의 전체 분할 수익률을 시간순으로 단순 합산한다.
     복리·동시 보유·자금배분은 반영하지 않는다.
     """
     start_at = _period_start(period_key)
@@ -2076,8 +2108,8 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 <summary style="cursor:pointer;font-size:19px;font-weight:bold;color:var(--blue)">통계 계산 기준·신뢰 안내</summary>
 <div style="margin-top:12px;line-height:1.75;color:#d7d7da">
 <div>• <b>완료 사이클 1회</b>: 첫 진입부터 최초 유효 고점 청산까지입니다. 청산 후 다음 LOW부터 새 사이클입니다.</div>
-<div>• <b>평균수익률</b>: 사이클마다 허용된 청산 시간봉 결과의 평균을 구한 뒤, 완료 사이클끼리 평균합니다.</div>
-<div>• <b>최고수익률</b>: 저장된 청산 시간봉 비교 결과 중 최고값이며, 해당 종목·진입 시간봉·청산 시간봉을 함께 표시합니다.</div>
+<div>• <b>평균수익률</b>: 사이클마다 허용된 매도 시간봉 결과의 평균을 구한 뒤, 완료 사이클끼리 평균합니다.</div>
+<div>• <b>최고수익률</b>: 저장된 매도 시간봉 비교 결과 중 최고값이며, 해당 종목·진입 시간봉·매도 시간봉을 함께 표시합니다.</div>
 <div>• <b>최대 손실폭</b>: 전체 캔들 저가가 아니라 청산 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
 <div>• 수수료·슬리피지·세금·실제 주문 체결 오차는 반영되지 않을 수 있습니다.</div>
 <div>• 발생 주기의 ‘근접/초과’는 과거 평균 간격 비교이며 다음 신호를 보장하지 않습니다.</div>
@@ -2316,7 +2348,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <h1>{{symbol_display(data.symbol, 'KRX' if data.market == 'KOREA' else '')}}</h1>
 <div class="badges">
 <span class="badge">{{exchange_only_label('KRX' if data.market == 'KOREA' else '', data.market)}}</span>
-<span class="badge">진입 최대 {{data.settings.entry_split_limit}}회</span>
+<span class="badge">분할 매수 최대 {{data.settings.entry_split_limit}}회</span>
 <span class="badge">최근 평균 {{data.settings.recent_interval_count}}회</span>
 </div>
 
@@ -2324,13 +2356,13 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <h2>회원 체감 핵심 요약</h2>
 <div class="trust-summary">
 <div class="trust-mini"><span>완료 사이클</span><b>{{member_stats.completed_cycle_count}}회</b></div>
-<div class="trust-mini"><span>평균 수익</span><b class="pos">{% if member_stats.average_return_pct is not none %}{{'%.2f'|format(member_stats.average_return_pct)}}%{% else %}-{% endif %}</b></div>
+<div class="trust-mini"><span>평균 수익률</span><b class="pos">{% if member_stats.average_return_pct is not none %}{{'%.2f'|format(member_stats.average_return_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="trust-mini"><span>승률</span><b>{% if member_stats.win_rate_pct is not none %}{{'%.1f'|format(member_stats.win_rate_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="trust-mini"><span>평균 최대 손실폭</span><b class="neg">{% if member_stats.average_signal_adverse_pct is not none %}{{'%.2f'|format(member_stats.average_signal_adverse_pct)}}%{% else %}-{% endif %}</b></div>
-<div class="trust-mini"><span>역행 후 평균 회복</span><b>{{format_minutes_compact(member_stats.average_recovery_minutes)}}</b></div>
-<div class="trust-mini"><span>최고 사례</span><b class="pos">{% if member_stats.best_detail %}{{member_stats.best_detail.entry_timeframe}}→{{member_stats.best_detail.exit_timeframe}} {{'%.2f'|format(member_stats.best_detail.return_pct)}}%{% else %}-{% endif %}</b></div>
+<div class="trust-mini"><span>평균 보유시간</span><b>{{format_minutes_compact(member_stats.average_holding_minutes)}}</b></div>
+<div class="trust-mini"><span>최대 수익률</span><b class="pos">{% if member_stats.best_detail %}{{'%.2f'|format(member_stats.best_detail.return_pct)}}%{% else %}-{% endif %}</b>{% if member_stats.best_detail %}<small>매수 {{member_stats.best_detail.entry_timeframe}} → 매도 {{member_stats.best_detail.exit_timeframe}}</small>{% endif %}</div>
 </div>
-<p class="muted">※ 최대 역행은 5분봉 데이터가 없는 과거 사이클은 저장된 신호 가격을 기준으로 계산합니다.</p>
+<p class="muted">※ 최대 손실폭은 캔들 데이터가 없는 과거 사이클의 경우 저장된 신호 가격을 기준으로 계산합니다.</p>
 </div>
 
 <div class="card">
@@ -2342,18 +2374,20 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 </div></div>
 
 <div class="card">
-<h2>진입 시간봉 × 청산 시간봉별 성과</h2>
+<h2>매수 · 매도 시간봉별 성과</h2>
 <div class="scroll">
 <table>
 <tr>
-<th>최초 진입 시간봉</th><th>청산 시간봉</th><th>완료 사이클</th><th>평균수익</th>
-<th>최고수익</th><th>최저수익</th><th>승률</th><th>평균 보유기간</th>
+<th>매수 시간봉</th><th>최근 매수 시각</th><th>매도 시간봉</th><th>최근 종료 시각</th><th>완료 횟수</th><th>평균 수익률</th>
+<th>최대 수익률</th><th>최소 수익률</th><th>승률</th><th>평균 보유기간</th>
 </tr>
 {% for row in data.performance_summary %}
 <tr>
 <td>{{row.entry_timeframe}}</td>
+<td>{{row.latest_entry_time or '-'}}</td>
 <td>{{row.exit_timeframe}}</td>
-<td>{{row.trade_count}}사이클</td>
+<td>{{row.latest_exit_time or '-'}}</td>
+<td>{{row.trade_count}}회</td>
 <td class="{{'pos' if row.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.average_return_pct)}}%</td>
 <td class="{{'pos' if row.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.best_return_pct)}}%</td>
 <td class="{{'pos' if row.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(row.worst_return_pct)}}%</td>
@@ -2361,7 +2395,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <td>{{row.average_holding_text}}</td>
 </tr>
 {% else %}
-<tr><td colspan="8" class="muted">완료된 진입·청산 조합이 아직 없습니다.</td></tr>
+<tr><td colspan="10" class="muted">완료된 매수·매도 조합이 아직 없습니다.</td></tr>
 {% endfor %}
 </table>
 </div>
@@ -2387,7 +2421,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 
 <div class="card">
 <h2>사이클별 체감 흐름</h2>
-<p class="muted">진입 → 최대 손실폭 → 청산 시간봉별 결과를 한눈에 비교합니다.</p>
+<p class="muted">매수 → 최대 손실폭 → 매도 시간봉별 결과를 한눈에 비교합니다.</p>
 {% for position in data.positions|reverse %}
 {% if position.cycle_closed and position.exit_results %}
 <details>
@@ -2405,7 +2439,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 
 <div class="card">
 <h2>실제 신호 가격 차트</h2>
-<p class="muted">진입 가격과 각 청산 시간봉 가격만 표시하고 중간 캔들은 생략한다.</p>
+<p class="muted">매수가와 각 매도 시간봉 가격을 표시하며, 캔들 데이터가 없는 과거 구간은 중간 과정을 생략합니다.</p>
 {% for position in data.positions|reverse %}
 {% if position.cycle_closed and position.exit_results %}
 <details>
@@ -2417,15 +2451,15 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 </div>
 
 <div class="card">
-<h2>실제 백데이터: 진입·청산 시각</h2>
+<h2>실제 매수·종료 시각</h2>
 {% for position in data.positions|reverse %}
 <details>
 <summary>최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
-<p><b>실제 진입 구성:</b> {{position.entry_source_summary}}<br>
+<p><b>실제 매수 구성:</b> {{position.entry_source_summary}}<br>
 첫 진입: {{position.entry_first_time}}<br>
 마지막 진입: {{position.entry_last_time}}</p>
 <div class="scroll"><table>
-<tr><th>청산 시간봉</th><th>청산 시각</th><th>청산가</th><th>보유기간</th><th>수익률</th></tr>
+<tr><th>매도 시간봉</th><th>종료 시각</th><th>매도가</th><th>보유기간</th><th>수익률</th></tr>
 {% for exit in position.exit_results %}
 <tr><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
 <td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>
@@ -2860,7 +2894,7 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 </div>
 
 <div class="foot">
-누적 수익률 곡선은 각 청산 후보의 전체 분할 수익률을 시간순으로 단순 합산한 값이다.
+누적 수익률 곡선은 각 매도 후보의 전체 분할 수익률을 시간순으로 단순 합산한 값이다.
 복리, 동시 포지션, 자금 배분, 실제 체결가격, 수수료, 슬리피지 및 세금은 반영하지 않는다.
 </div>
 </body>
@@ -3403,7 +3437,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="small">승 {{s.member_stats.win_count}} · 패 {{s.member_stats.loss_count}}</div>
 </div>
 <div class="metric">
-<div class="title">최고 / 최저 수익</div>
+<div class="title">최대 / 최소 수익률</div>
 <div class="value">
 <span class="pos">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
 <span class="small"> / </span>
@@ -3418,18 +3452,18 @@ class="{{'active-category' if category.category_key == selected_category else ''
 
 
 <details open>
-<summary>진입 시간봉 × 청산 시간봉 완료 사이클 성과</summary>
+<summary>매수 · 매도 시간봉별 완료 성과</summary>
 <div class="analysis-note">
-관리자 설정의 진입 최대 횟수로 평균 진입가를 계산한다.
-최초 유효 고점 청산 후 다음 LOW부터 새 사이클로 센다.
-같은 사이클의 여러 청산 시간봉은 비교 시나리오이며 사이클 수를 중복 증가시키지 않는다.
+관리자 설정의 분할 매수 최대 횟수로 평균 매수가를 계산합니다.
+최초 유효 매도 신호로 사이클이 종료되며, 다음 매수 신호부터 새 사이클로 계산합니다.
+같은 사이클의 여러 매도 시간봉은 비교 결과이며 완료 횟수를 중복 증가시키지 않습니다.
 </div>
 {% if entry_exit_matrix.has_results %}
 <table>
-<tr><th>최초 진입 시간봉</th><th>청산 시간봉</th><th>완료 사이클</th><th>평균수익</th><th>최고수익</th><th>최저수익</th><th>승률</th><th>평균 보유</th></tr>
+<tr><th>매수 시간봉</th><th>최근 매수 시각</th><th>매도 시간봉</th><th>최근 종료 시각</th><th>완료 횟수</th><th>평균 수익률</th><th>최대 수익률</th><th>최소 수익률</th><th>승률</th><th>평균 보유시간</th></tr>
 {% for stat in entry_exit_matrix.rows %}
 <tr>
-<td>{{stat.entry_timeframe}}</td><td>{{stat.exit_timeframe}}</td><td>{{stat.trade_count}}회</td>
+<td>{{stat.entry_timeframe}}</td><td>{{stat.latest_entry_time or '-'}}</td><td>{{stat.exit_timeframe}}</td><td>{{stat.latest_exit_time or '-'}}</td><td>{{stat.trade_count}}회</td>
 <td class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.average_return_pct)}}%</td>
 <td class="{{'pos' if stat.best_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.best_return_pct)}}%</td>
 <td class="{{'pos' if stat.worst_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(stat.worst_return_pct)}}%</td>
@@ -3445,7 +3479,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% for position in s.group_analysis.positions|reverse %}
 {% if position.cycle_closed and position.exit_results %}
 <div class="card">
-<div class="small">사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · 평균 진입가 {{position.entry_price}}</div>
+<div class="small">사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · 평균 매수가 {{position.entry_price}}</div>
 {{price_path_svg(position)|safe}}
 </div>
 {% endif %}
@@ -3461,7 +3495,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="small">{{s.open_cycle_preview.max_timeframe_entry.signal_no}}</div>
 </div>
 <div class="metric">
-<div class="title">전체 분할진입 평균가</div>
+<div class="title">전체 분할매수 평균가</div>
 <div class="value">{{s.open_cycle_preview.all_split_average_price}}</div>
 <div class="small">총 {{s.open_cycle_preview.entry_count}}회 분할</div>
 </div>
@@ -3473,9 +3507,9 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 
 <details>
-<summary>시간봉별 분할진입 평균가</summary>
+<summary>시간봉별 분할매수 평균가</summary>
 <table>
-<tr><th>시간봉</th><th>진입 횟수</th><th>평균 진입가</th><th>마지막 진입 시각</th></tr>
+<tr><th>시간봉</th><th>매수 횟수</th><th>평균 매수가</th><th>마지막 매수 시각</th></tr>
 {% for tf in s.open_cycle_preview.timeframe_splits %}
 <tr>
 <td>{{tf.timeframe}}</td>
@@ -3488,7 +3522,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </details>
 
 <details>
-<summary>개별 진입 {{s.open_cycle_preview.entry_count}}건</summary>
+<summary>개별 매수 {{s.open_cycle_preview.entry_count}}건</summary>
 <table>
 <tr><th>신호번호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
 {% for e in s.open_cycle_preview.individual_entries %}
@@ -3508,22 +3542,22 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="value">{{c.entry_preview.max_timeframe_entry.timeframe}} · {{c.entry_preview.max_timeframe_entry.price}}</div>
 </div>
 <div class="metric">
-<div class="title">전체 분할진입 평균가</div>
+<div class="title">전체 분할매수 평균가</div>
 <div class="value">{{c.entry_preview.all_split_average_price}}</div>
 <div class="small">{{c.entry_preview.entry_count}}회 분할</div>
 </div>
 <div class="metric">
-<div class="title">청산 후보</div>
+<div class="title">매도 후보</div>
 <div class="value">{{c.exit_count}}건</div>
 </div>
 </div>
 
-<div class="mode-title">청산 후보별 진입 방식 비교</div>
+<div class="mode-title">매도 후보별 진입 방식 비교</div>
 <div style="overflow-x:auto">
 <table>
 <tr>
-<th>청산 시간봉</th>
-<th>청산가</th>
+<th>매도 시간봉</th>
+<th>매도가</th>
 <th>TF 관계</th>
 <th>최대TF</th>
 <th>전체분할</th>
@@ -3591,7 +3625,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 
 <div class="mode-title">시간봉별 분할진입 결과</div>
 <table>
-<tr><th>시간봉</th><th>진입 횟수</th><th>평균가</th><th>수익률</th><th>보유시간</th></tr>
+<tr><th>시간봉</th><th>매수 횟수</th><th>평균가</th><th>수익률</th><th>보유시간</th></tr>
 {% for tf in r.timeframe_split_results %}
 <tr>
 <td>{{tf.timeframe}}</td><td>{{tf.entry_count}}</td><td>{{tf.average_entry_price}}</td>
@@ -3602,7 +3636,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </table>
 
 <details>
-<summary>각 개별 진입 결과 {{r.individual_results|length}}건</summary>
+<summary>각 개별 매수 결과 {{r.individual_results|length}}건</summary>
 <table>
 <tr><th>진입 신호</th><th>시간봉</th><th>진입가</th><th>수익률</th><th>보유시간</th></tr>
 {% for item in r.individual_results %}
@@ -3759,15 +3793,15 @@ summary{cursor:pointer;font-weight:bold}
 </div>
 
 <div class="card">
-<h2>실제 백데이터: 진입·청산 시각</h2>
+<h2>실제 매수·종료 시각</h2>
 {% for position in data.positions|reverse %}
 <details>
 <summary>최초 {{position.entry_timeframe}} 포지션 · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
-<p><b>실제 진입 구성:</b> {{position.entry_source_summary}}<br>
+<p><b>실제 매수 구성:</b> {{position.entry_source_summary}}<br>
 첫 진입 {{position.entry_first_time}}<br>마지막 진입 {{position.entry_last_time}}<br>
 상태: {{'3회 진입 완료' if position.entry_complete else '유효 진입만 계산'}}</p>
 <div class="scroll"><table>
-<tr><th>청산 그룹</th><th>청산 시간봉</th><th>청산 시각</th><th>청산가</th><th>보유기간</th><th>수익률</th></tr>
+<tr><th>매도 그룹</th><th>매도 시간봉</th><th>종료 시각</th><th>매도가</th><th>보유기간</th><th>수익률</th></tr>
 {% for exit in position.exit_results %}
 <tr><td>{{exit.exit_group_label}}</td><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
 <td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>

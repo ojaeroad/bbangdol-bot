@@ -307,7 +307,7 @@ def _draw_candle_chart(draw, box, candles, entry_price, entry_points, exit_price
         top=min(py(c["open"]),py(c["close"])); bot=max(py(c["open"]),py(c["close"]))
         draw.rectangle((x-width*.3,top,x+width*.3,max(top+2,bot)),fill=color)
     draw.line((x0,py(entry_price),x1,py(entry_price)),fill="#ffc857",width=2)
-    draw.text((x0+6,py(entry_price)-26),"평균 진입가",font=_font(17,True),fill="#ffc857")
+    draw.text((x0+6,py(entry_price)-26),"평균 매수가",font=_font(17,True),fill="#ffc857")
     draw.line((x0,py(exit_price),x1,py(exit_price)),fill="#54e39a",width=2)
     draw.text((x1-120,py(exit_price)-26),"청산",font=_font(17,True),fill="#54e39a")
     return min(c["low"] for c in candles)
@@ -337,9 +337,9 @@ def render_exit_image(
     labels = [
         ("최초 진입", position["entry_timeframe"]),
         ("분할 진입", f"{position['entry_count']}회"),
-        ("평균 진입가", _price(position["entry_price"])),
-        ("청산 시간봉", result["exit_timeframe"]),
-        ("청산가", _price(result["exit_price"])),
+        ("평균 매수가", _price(position["entry_price"])),
+        ("매도 시간봉", result["exit_timeframe"]),
+        ("매도가", _price(result["exit_price"])),
         ("보유기간", result.get("holding_text") or _duration(result.get("holding_minutes"))),
     ]
     for idx, (label, value) in enumerate(labels):
@@ -405,9 +405,9 @@ def render_cycle_summary_image(
 
     _rounded(draw, (45, 250, 1035, 475))
     stats = [
-        ("최초 진입 시간봉", position["entry_timeframe"]),
+        ("매수 시간봉", position["entry_timeframe"]),
         ("분할 진입", f"{position['entry_count']}회"),
-        ("평균 진입가", _price(position["entry_price"])),
+        ("평균 매수가", _price(position["entry_price"])),
     ]
     for idx, (label, value) in enumerate(stats):
         x = 75 + idx * 305

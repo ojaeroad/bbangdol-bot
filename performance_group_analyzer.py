@@ -244,6 +244,20 @@ def _load_signals() -> list[dict[str, Any]]:
     return output
 
 
+def _format_kst_datetime(value: str | datetime | None) -> str:
+    """ISO/UTC 시각을 회원 화면용 한국시간으로 표시한다."""
+    if not value:
+        return "-"
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        kst = timezone(timedelta(hours=9))
+        return dt.astimezone(kst).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _format_duration(minutes: float | int | None) -> str:
     if minutes is None:
         return "-"
@@ -699,7 +713,9 @@ def _performance_summary(
                 result["exit_group"],
                 result["exit_timeframe"],
             )
-            buckets[key].append(result)
+            enriched_result = dict(result)
+            enriched_result["entry_first_time"] = position.get("entry_first_time")
+            buckets[key].append(enriched_result)
 
     output: list[dict[str, Any]] = []
     for (
@@ -719,6 +735,11 @@ def _performance_summary(
             if row.get("recovery_minutes") is not None
         ]
 
+        latest_row = max(
+            rows,
+            key=lambda row: row.get("exit_time") or "",
+        )
+
         output.append(
             {
                 "entry_group": entry_group,
@@ -729,6 +750,12 @@ def _performance_summary(
                 "exit_group_label": GROUP_LABEL[exit_group],
                 "exit_timeframe": exit_timeframe,
                 "exit_timeframe_minutes": TF_MINUTES[exit_timeframe],
+                "latest_entry_time": _format_kst_datetime(
+                    latest_row.get("entry_first_time")
+                ),
+                "latest_exit_time": _format_kst_datetime(
+                    latest_row.get("exit_time")
+                ),
                 "trade_count": len(rows),
                 "average_return_pct": _average(returns),
                 "best_return_pct": max(returns),
