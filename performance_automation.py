@@ -40,9 +40,11 @@ NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
 POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60")))
-AUTOMATION_ENABLED = os.getenv(
-    "PERFORMANCE_AUTOMATION_ENABLED", "1"
-).strip().lower() not in {"0", "false", "off", "no"}
+
+def _automation_enabled() -> bool:
+    return os.getenv(
+        "PERFORMANCE_AUTOMATION_ENABLED", "1"
+    ).strip().lower() not in {"0", "false", "off", "no"}
 
 MARKET_LABEL = {
     "KOREA": "국장",
@@ -75,6 +77,12 @@ CREATE TABLE IF NOT EXISTS performance_delivery_log (
 );
 CREATE INDEX IF NOT EXISTS idx_performance_delivery_type_time
 ON performance_delivery_log(delivery_type, delivered_at);
+
+CREATE TABLE IF NOT EXISTS performance_automation_state (
+    state_key VARCHAR(100) PRIMARY KEY,
+    state_value BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -92,6 +100,53 @@ def _connect():
 def ensure_schema() -> None:
     with _connect() as conn:
         conn.execute(SCHEMA_SQL)
+
+
+def _current_max_high_signal_id() -> int:
+    ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM performance_signals WHERE signal_type='HIGH'"
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def _get_state(key: str) -> int | None:
+    ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT state_value FROM performance_automation_state WHERE state_key=%s",
+            (key,),
+        ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _set_state(key: str, value: int) -> None:
+    ensure_schema()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO performance_automation_state(state_key, state_value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (state_key) DO UPDATE
+            SET state_value=EXCLUDED.state_value, updated_at=NOW()
+            """,
+            (key, int(value)),
+        )
+
+
+def _bootstrap_or_get_high_watermark() -> tuple[int, bool]:
+    key = "last_processed_high_signal_id"
+    existing = _get_state(key)
+    if existing is not None:
+        return existing, False
+    current = _current_max_high_signal_id()
+    _set_state(key, current)
+    log.warning(
+        "performance automation baseline initialized high_signal_id=%s; historical results skipped",
+        current,
+    )
+    return current, True
 
 
 def _claim(
@@ -373,7 +428,9 @@ def _entry_destination(market: str, entry_group: str) -> tuple[str, str]:
     return env_name, os.getenv(env_name, "").strip() if env_name else ""
 
 
-def process_new_cycle_deliveries() -> None:
+def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
+    """Send only results whose HIGH signal id is newer than the saved watermark."""
+    observed_max = after_high_signal_id
     for market in ("KOREA", "US", "COIN"):
         market_data = group_analysis_market_data(market)
         for symbol, symbol_data in market_data.get("symbol_data", {}).items():
@@ -383,13 +440,20 @@ def process_new_cycle_deliveries() -> None:
                     continue
 
                 position_key = _position_key(market, symbol, position)
-                results = position.get("exit_results") or []
+                all_results = position.get("exit_results") or []
+                fresh_results = []
+                for result in all_results:
+                    try:
+                        exit_id = int(result.get("exit_signal_id") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    observed_max = max(observed_max, exit_id)
+                    if exit_id > after_high_signal_id:
+                        fresh_results.append(result)
 
-                # 청산 시간봉별 이미지
-                for result in results:
-                    delivery_key = (
-                        f"exit:{position_key}:{result.get('exit_signal_id')}:{result['exit_timeframe']}"
-                    )
+                for result in fresh_results:
+                    exit_id = int(result["exit_signal_id"])
+                    delivery_key = f"exit-v3:{position_key}:{exit_id}:{result['exit_timeframe']}"
                     if not _claim(delivery_key, "EXIT_IMAGE", market, symbol, env_name):
                         continue
                     try:
@@ -402,37 +466,43 @@ def process_new_cycle_deliveries() -> None:
                         )
                         _send_photo(chat_id, png, caption)
                         log.info(
-                            "exit result sent market=%s symbol=%s group=%s exit_tf=%s env=%s",
-                            market, symbol, position["entry_group"],
-                            result["exit_timeframe"], env_name,
+                            "new exit result sent market=%s symbol=%s exit_id=%s exit_tf=%s env=%s",
+                            market, symbol, exit_id, result["exit_timeframe"], env_name,
                         )
                     except Exception:
                         _release(delivery_key)
-                        log.exception("exit result delivery failed key=%s", delivery_key)
+                        log.exception("new exit result delivery failed key=%s", delivery_key)
 
-                # 허용된 청산 시간봉이 전부 수집되면 종합 이미지
                 expected = set(_expected_exit_timeframes(market, position["entry_group"]))
-                completed = {row["exit_timeframe"] for row in results}
-                if expected and expected.issubset(completed):
-                    summary_key = f"cycle-summary:{position_key}"
+                completed = {row["exit_timeframe"] for row in all_results}
+                completion_trigger_id = max(
+                    (int(row.get("exit_signal_id") or 0) for row in all_results),
+                    default=0,
+                )
+                if (
+                    expected
+                    and expected.issubset(completed)
+                    and completion_trigger_id > after_high_signal_id
+                ):
+                    summary_key = f"cycle-summary-v3:{position_key}:{completion_trigger_id}"
                     if _claim(summary_key, "CYCLE_SUMMARY", market, symbol, env_name):
                         try:
                             png = render_cycle_summary_image(market, symbol, position)
-                            values = [float(row["return_pct"]) for row in results]
+                            values = [float(row["return_pct"]) for row in all_results]
                             caption = (
-                                f"✅ {symbol} {GROUP_LABEL.get(position['entry_group'])} "
-                                f"완료 사이클 종합\n"
-                                f"청산 {len(results)}개 · 평균 {sum(values)/len(values):+.3f}% · "
+                                f"✅ {symbol} {GROUP_LABEL.get(position['entry_group'])} 완료 사이클 종합\n"
+                                f"청산 {len(all_results)}개 · 평균 {sum(values)/len(values):+.3f}% · "
                                 f"최고 {max(values):+.3f}%"
                             )
                             _send_photo(chat_id, png, caption)
                             log.info(
-                                "cycle summary sent market=%s symbol=%s group=%s env=%s",
-                                market, symbol, position["entry_group"], env_name,
+                                "new cycle summary sent market=%s symbol=%s trigger_id=%s env=%s",
+                                market, symbol, completion_trigger_id, env_name,
                             )
                         except Exception:
                             _release(summary_key)
-                            log.exception("cycle summary delivery failed key=%s", summary_key)
+                            log.exception("new cycle summary delivery failed key=%s", summary_key)
+    return observed_max
 
 
 def _period_bounds(kind: str, now_ny: datetime) -> tuple[datetime, datetime, str]:
@@ -618,7 +688,7 @@ def process_scheduled_reports() -> None:
 
 
 def run_once() -> None:
-    if not AUTOMATION_ENABLED:
+    if not _automation_enabled():
         return
     if not DATABASE_URL or not BOT_TOKEN:
         log.warning(
@@ -626,7 +696,15 @@ def run_once() -> None:
             bool(DATABASE_URL), bool(BOT_TOKEN),
         )
         return
-    process_new_cycle_deliveries()
+
+    watermark, bootstrapped = _bootstrap_or_get_high_watermark()
+    if bootstrapped:
+        return
+
+    current_max = _current_max_high_signal_id()
+    if current_max > watermark:
+        process_new_cycle_deliveries(watermark)
+        _set_state("last_processed_high_signal_id", current_max)
     process_scheduled_reports()
 
 
@@ -634,7 +712,8 @@ def _loop() -> None:
     time.sleep(15)
     while True:
         try:
-            run_once()
+            if _automation_enabled():
+                run_once()
         except Exception:
             log.exception("performance automation loop failed")
         time.sleep(POLL_SECONDS)
@@ -646,8 +725,8 @@ _STARTED = False
 
 def start_performance_automation() -> bool:
     global _STARTED
-    if not AUTOMATION_ENABLED:
-        log.info("performance automation disabled")
+    if not _automation_enabled():
+        log.warning("performance automation hard-disabled; background thread not started")
         return False
     with _LOCK:
         if _STARTED:
@@ -668,11 +747,13 @@ def automation_status() -> dict[str, Any]:
     notice_id = os.getenv(MEMBER_NOTICE_ENV, "").strip()
     return {
         "ok": True,
-        "enabled": AUTOMATION_ENABLED,
+        "enabled": _automation_enabled(),
         "database_configured": bool(DATABASE_URL),
         "bot_token_configured": bool(BOT_TOKEN),
         "member_notice_env": MEMBER_NOTICE_ENV,
         "member_notice_configured": bool(notice_id),
+        "high_signal_watermark": _get_state("last_processed_high_signal_id") if DATABASE_URL else None,
+        "no_backfill_mode": True,
         "poll_seconds": POLL_SECONDS,
         "thread_started": _STARTED,
         "entry_destinations": {
