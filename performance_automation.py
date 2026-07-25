@@ -38,6 +38,7 @@ BOT_TOKEN = (
 )
 MEMBER_NOTICE_ENV = "MEMBER_NOTICE_1Q"
 NY = ZoneInfo("America/New_York")
+KST = ZoneInfo("Asia/Seoul")
 UTC = timezone.utc
 
 POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60")))
@@ -48,6 +49,12 @@ def _automation_enabled() -> bool:
     ).strip().lower() not in {"0", "false", "off", "no"}
 
 SEND_COIN_SCALP = os.getenv("PERFORMANCE_SEND_COIN_SCALP", "0").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _coin_scalp_report_mode() -> str:
+    """include: 코인 통합, separate: 코인 본편+단타 별도, exclude: 단타 제외."""
+    mode = os.getenv("PERFORMANCE_REPORT_COIN_SCALP_MODE", "separate").strip().lower()
+    return mode if mode in {"include", "separate", "exclude"} else "separate"
 
 MARKET_LABEL = {
     "KOREA": "국장",
@@ -188,22 +195,84 @@ def _release(delivery_key: str) -> None:
         log.exception("delivery claim release failed key=%s", delivery_key)
 
 
+_FONT_LOCK = threading.Lock()
+_FONT_PATHS: dict[str, str] = {}
+_FONT_ERROR: str | None = None
+_FONT_DIR = Path("/tmp/bbangdol-fonts")
+_FONT_URLS = {
+    "regular": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
+    "bold": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Bold.otf",
+}
+
+
+def _prepare_korean_fonts() -> dict[str, str]:
+    """한글 폰트를 찾거나 공식 Noto CJK 저장소에서 /tmp로 준비한다."""
+    global _FONT_ERROR
+    if _FONT_PATHS.get("regular") and _FONT_PATHS.get("bold"):
+        return dict(_FONT_PATHS)
+    with _FONT_LOCK:
+        if _FONT_PATHS.get("regular") and _FONT_PATHS.get("bold"):
+            return dict(_FONT_PATHS)
+        system_candidates = {
+            "regular": [
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            ],
+            "bold": [
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Bold.otf",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+            ],
+        }
+        for weight, candidates in system_candidates.items():
+            for candidate in candidates:
+                if Path(candidate).exists():
+                    _FONT_PATHS[weight] = candidate
+                    break
+        try:
+            _FONT_DIR.mkdir(parents=True, exist_ok=True)
+            for weight, url in _FONT_URLS.items():
+                if _FONT_PATHS.get(weight):
+                    continue
+                target = _FONT_DIR / f"NotoSansCJKkr-{weight}.otf"
+                if not target.exists() or target.stat().st_size < 1_000_000:
+                    response = requests.get(url, timeout=45)
+                    response.raise_for_status()
+                    target.write_bytes(response.content)
+                # 실제 Pillow 로딩으로 파일 유효성 확인
+                ImageFont.truetype(str(target), 24)
+                _FONT_PATHS[weight] = str(target)
+            _FONT_ERROR = None
+        except Exception as exc:
+            _FONT_ERROR = str(exc)
+            log.exception("Korean font preparation failed")
+        if not (_FONT_PATHS.get("regular") and _FONT_PATHS.get("bold")):
+            raise RuntimeError(f"Korean font is not ready: {_FONT_ERROR or 'font not found'}")
+        return dict(_FONT_PATHS)
+
+
 def _font(size: int, bold: bool = False):
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
-        if bold else
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"
-        if bold else
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if bold else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for candidate in candidates:
-        if Path(candidate).exists():
-            return ImageFont.truetype(candidate, size)
-    return ImageFont.load_default()
+    paths = _prepare_korean_fonts()
+    return ImageFont.truetype(paths["bold" if bold else "regular"], size)
+
+
+def _font_status() -> dict[str, Any]:
+    try:
+        paths = _prepare_korean_fonts()
+        return {
+            "korean_font_ready": True,
+            "regular_font": Path(paths["regular"]).name,
+            "bold_font": Path(paths["bold"]).name,
+            "font_error": None,
+        }
+    except Exception as exc:
+        return {
+            "korean_font_ready": False,
+            "regular_font": None,
+            "bold_font": None,
+            "font_error": str(exc),
+        }
 
 
 def _duration(minutes: float | int | None) -> str:
@@ -220,6 +289,30 @@ def _duration(minutes: float | int | None) -> str:
     if mins or not parts:
         parts.append(f"{mins}분")
     return " ".join(parts)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _format_kst(value: Any, multiline: bool = False) -> str:
+    dt = _parse_datetime(value)
+    if dt is None:
+        return "-"
+    local = dt.astimezone(KST)
+    return local.strftime("%Y-%m-%d\\n%H:%M KST" if multiline else "%Y-%m-%d %H:%M KST")
 
 
 def _price(value: Any) -> str:
@@ -292,7 +385,7 @@ def _compress_candles(candles: list[dict[str, Any]], max_items: int = 150) -> li
 def _draw_candle_chart(draw, box, candles, entry_price, entry_points, exit_price):
     x0,y0,x1,y1=box
     if not candles:
-        draw.text((x0+20,y0+20), f"{candles[0].get('interval_minutes', 5) if candles else '선택'}분봉 데이터 없음 · 진입/청산 신호만 표시", font=_font(22), fill="#a5a6ad")
+        draw.text((x0+20,y0+20), f"{candles[0].get('interval_minutes', 5) if candles else '선택'}분봉 데이터 없음 · 매수/종료 신호만 표시", font=_font(22), fill="#a5a6ad")
         return None
     candles=_compress_candles(candles)
     hi=max(c["high"] for c in candles); lo=min(c["low"] for c in candles)
@@ -309,7 +402,7 @@ def _draw_candle_chart(draw, box, candles, entry_price, entry_points, exit_price
     draw.line((x0,py(entry_price),x1,py(entry_price)),fill="#ffc857",width=2)
     draw.text((x0+6,py(entry_price)-26),"평균 매수가",font=_font(17,True),fill="#ffc857")
     draw.line((x0,py(exit_price),x1,py(exit_price)),fill="#54e39a",width=2)
-    draw.text((x1-120,py(exit_price)-26),"청산",font=_font(17,True),fill="#54e39a")
+    draw.text((x1-120,py(exit_price)-26),"종료",font=_font(17,True),fill="#54e39a")
     return min(c["low"] for c in candles)
 
 def render_exit_image(
@@ -320,60 +413,63 @@ def render_exit_image(
 ) -> bytes:
     interval = _chart_interval(position["entry_group"])
     candles = load_candles(symbol, position["entry_first_time"], result["exit_time"], interval)
-    image, draw = _base_canvas(1540)
+    image, draw = _base_canvas(1700)
     white, blue, green, red, muted, gold = (
         "#f4f4f5", "#73cfff", "#54e39a", "#ff7f87", "#a5a6ad", "#ffc857"
     )
-    draw.text((60, 50), "타점 수익률 결과", font=_font(48, True), fill=white)
+    cycle_no = position.get("position_sequence") or position.get("cycle_no") or "-"
+    draw.text((60, 45), "타점 수익률 결과", font=_font(48, True), fill=white)
     draw.text(
-        (60, 120),
-        f"{MARKET_LABEL.get(market, market)} · {GROUP_LABEL.get(position['entry_group'], position['entry_group'])}",
-        font=_font(29, True),
-        fill=blue,
+        (60, 112),
+        f"{MARKET_LABEL.get(market, market)} · {GROUP_LABEL.get(position['entry_group'], position['entry_group'])} · 사이클 {cycle_no}",
+        font=_font(27, True), fill=blue,
     )
-    draw.text((60, 175), symbol, font=_font(44, True), fill=white)
+    draw.text((60, 165), symbol, font=_font(44, True), fill=white)
 
-    _rounded(draw, (45, 255, 1035, 515))
-    labels = [
-        ("최초 진입", position["entry_timeframe"]),
-        ("분할 진입", f"{position['entry_count']}회"),
-        ("평균 매수가", _price(position["entry_price"])),
-        ("매도 시간봉", result["exit_timeframe"]),
-        ("매도가", _price(result["exit_price"])),
+    # 매수/종료 시간과 가격을 가장 먼저 보이도록 4열 × 2행로 배치
+    _rounded(draw, (45, 240, 1035, 610))
+    fields = [
+        ("매수 시간봉", position.get("entry_timeframe") or "-"),
+        ("매수 시각", _format_kst(position.get("entry_first_time"), multiline=True)),
+        ("분할 매수", f"{position.get('entry_count', 0)}회"),
+        ("평균 매수가", _price(position.get("entry_price"))),
+        ("종료 시간봉", result.get("exit_timeframe") or "-"),
+        ("종료 시각", _format_kst(result.get("exit_time"), multiline=True)),
+        ("종료가", _price(result.get("exit_price"))),
         ("보유기간", result.get("holding_text") or _duration(result.get("holding_minutes"))),
     ]
-    for idx, (label, value) in enumerate(labels):
-        x = 75 + (idx % 3) * 320
-        y = 285 + (idx // 3) * 115
-        draw.text((x, y), label, font=_font(21, True), fill=blue)
-        draw.text((x, y + 38), str(value), font=_font(31, True), fill=white)
+    col_w = 235
+    for idx, (label, value) in enumerate(fields):
+        col = idx % 4
+        row = idx // 4
+        x = 70 + col * col_w
+        y = 275 + row * 165
+        draw.text((x, y), label, font=_font(19, True), fill=blue)
+        lines = str(value).split("\\n")
+        for line_idx, line in enumerate(lines):
+            draw.text((x, y + 38 + line_idx * 32), line, font=_font(24 if len(line) < 15 else 19, True), fill=white)
 
     return_pct = float(result.get("return_pct") or 0)
     candle_low = min((c["low"] for c in candles), default=None)
-    adverse_pct = ((candle_low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if candle_low is not None else float(result.get("signal_adverse_pct") or 0)
+    adverse_pct = (
+        (candle_low - float(position["entry_price"])) / float(position["entry_price"]) * 100
+        if candle_low is not None else float(result.get("signal_adverse_pct") or 0)
+    )
     adverse_basis = f"{interval}분봉 저가 기준" if candle_low is not None else "신호 가격 기준"
-    _rounded(draw, (45, 550, 1035, 765), outline=green if return_pct >= 0 else red)
-    draw.text((75, 585), "실현 가능 수익률", font=_font(27, True), fill=blue)
-    draw.text(
-        (75, 635),
-        f"{return_pct:+.3f}%",
-        font=_font(70, True),
-        fill=green if return_pct >= 0 else red,
-    )
-    draw.text((625, 590), "최대 손실폭", font=_font(23, True), fill=muted)
-    draw.text((625, 620), adverse_basis, font=_font(17), fill=muted)
-    draw.text((625, 635), f"{adverse_pct:+.3f}%", font=_font(40, True), fill=red)
+    _rounded(draw, (45, 645, 1035, 860), outline=green if return_pct >= 0 else red)
+    draw.text((75, 680), "실현 가능 수익률", font=_font(27, True), fill=blue)
+    draw.text((75, 730), f"{return_pct:+.3f}%", font=_font(68, True), fill=green if return_pct >= 0 else red)
+    draw.text((620, 684), "최대 손실폭", font=_font(24, True), fill=muted)
+    draw.text((620, 720), adverse_basis, font=_font(18), fill=muted)
+    draw.text((620, 758), f"{adverse_pct:+.3f}%", font=_font(39, True), fill=red)
 
-    _rounded(draw, (45, 800, 1035, 1370))
-    draw.text((75, 830), "TradingView 5분봉 캔들 흐름", font=_font(30, True), fill=white)
-    _draw_candle_chart(draw, (85, 900, 995, 1315), candles, float(position["entry_price"]), position.get("entry_points") or [], float(result["exit_price"]))
-
-    draw.text(
-        (60, 1435),
-        "※ TradingView 5분봉/신호 가격 기반이며 수수료·슬리피지는 포함하지 않습니다.",
-        font=_font(20),
-        fill=muted,
+    _rounded(draw, (45, 900, 1035, 1530))
+    draw.text((75, 930), f"TradingView 확정 {interval}분봉 압축 차트", font=_font(29, True), fill=white)
+    _draw_candle_chart(
+        draw, (85, 1000, 995, 1470), candles,
+        float(position["entry_price"]), position.get("entry_points") or [], float(result["exit_price"]),
     )
+    draw.text((60, 1595), "※ TradingView 확정 OHLC/신호 가격 기준이며 수수료·슬리피지는 포함하지 않습니다.", font=_font(19), fill=muted)
     return _png_bytes(image)
 
 
@@ -404,15 +500,20 @@ def render_cycle_summary_image(
     draw.text((60, 170), symbol, font=_font(44, True), fill=white)
 
     _rounded(draw, (45, 250, 1035, 475))
+    last_end_time = max((row.get("exit_time") for row in results if row.get("exit_time")), default=None)
     stats = [
-        ("매수 시간봉", position["entry_timeframe"]),
-        ("분할 진입", f"{position['entry_count']}회"),
-        ("평균 매수가", _price(position["entry_price"])),
+        ("매수 시간봉", position.get("entry_timeframe") or "-"),
+        ("매수 시각", _format_kst(position.get("entry_first_time"), multiline=True)),
+        ("분할 매수", f"{position.get('entry_count', 0)}회"),
+        ("평균 매수가", _price(position.get("entry_price"))),
+        ("최종 종료 시각", _format_kst(last_end_time, multiline=True)),
     ]
     for idx, (label, value) in enumerate(stats):
-        x = 75 + idx * 305
-        draw.text((x, 285), label, font=_font(22, True), fill=blue)
-        draw.text((x, 330), str(value), font=_font(35, True), fill=white)
+        x = 65 + idx * 192
+        draw.text((x, 280), label, font=_font(18, True), fill=blue)
+        lines = str(value).split("\n")
+        for line_idx, line in enumerate(lines):
+            draw.text((x, 320 + line_idx * 28), line, font=_font(20 if len(line) > 12 else 25, True), fill=white)
 
     _rounded(draw, (45, 520, 1035, 1020), fill="#111216")
     draw.text((70, 545), f"TradingView 확정 {interval}분봉 압축 차트", font=_font(27, True), fill=white)
@@ -423,7 +524,7 @@ def render_cycle_summary_image(
     )
     adverse = ((low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if low is not None else None
 
-    draw.text((60, 1060), "시간봉별 청산 결과", font=_font(32, True), fill=white)
+    draw.text((60, 1060), "시간봉별 종료 결과", font=_font(32, True), fill=white)
     y = 1125
     returns = []
     for result in results:
@@ -437,7 +538,7 @@ def render_cycle_summary_image(
         y += 98
 
     if returns:
-        draw.text((65, y + 25), "청산 평균", font=_font(24, True), fill=blue)
+        draw.text((65, y + 25), "종료 평균", font=_font(24, True), fill=blue)
         draw.text((250, y + 20), f"{sum(returns)/len(returns):+.3f}%", font=_font(34, True), fill=green)
         draw.text((550, y + 25), "최고 수익", font=_font(24, True), fill=blue)
         draw.text((735, y + 20), f"{max(returns):+.3f}%", font=_font(34, True), fill=green)
@@ -503,10 +604,10 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                     try:
                         png = render_exit_image(market, symbol, position, result)
                         caption = (
-                            f"📈 {symbol} {GROUP_LABEL.get(position['entry_group'])} "
-                            f"{result['exit_timeframe']} 청산\n"
-                            f"수익률 {float(result['return_pct']):+.3f}% · "
-                            f"보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
+                            f"📈 {symbol} · {GROUP_LABEL.get(position['entry_group'])}\n"
+                            f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
+                            f"종료 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
+                            f"수익률 {float(result['return_pct']):+.3f}% · 보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
                         )
                         _send_photo(chat_id, png, caption)
                         log.info(
@@ -535,7 +636,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                             values = [float(row["return_pct"]) for row in all_results]
                             caption = (
                                 f"✅ {symbol} {GROUP_LABEL.get(position['entry_group'])} 완료 사이클 종합\n"
-                                f"청산 {len(all_results)}개 · 평균 {sum(values)/len(values):+.3f}% · "
+                                f"종료 {len(all_results)}개 · 평균 {sum(values)/len(values):+.3f}% · "
                                 f"최고 {max(values):+.3f}%"
                             )
                             if send_allowed:
@@ -573,186 +674,214 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
     return observed_max
 
 
-def _period_bounds(kind: str, now_ny: datetime) -> tuple[datetime, datetime, str]:
+def _period_bounds(kind: str, now_local: datetime, tz: ZoneInfo) -> tuple[datetime, datetime, str]:
     if kind == "weekly":
-        end_ny = now_ny
-        start_ny = end_ny - timedelta(days=7)
-        label = f"{start_ny:%Y.%m.%d} ~ {end_ny:%Y.%m.%d}"
+        end_local = now_local
+        start_local = end_local - timedelta(days=7)
+        label = f"{start_local:%Y.%m.%d} ~ {end_local:%Y.%m.%d}"
     else:
-        start_ny = now_ny.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        if start_ny.month == 12:
-            next_month = start_ny.replace(year=start_ny.year + 1, month=1)
+        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start_local.month == 12:
+            next_month = start_local.replace(year=start_local.year + 1, month=1)
         else:
-            next_month = start_ny.replace(month=start_ny.month + 1)
-        end_ny = min(now_ny, next_month)
-        label = f"{start_ny:%Y년 %m월}"
-    return start_ny.astimezone(UTC), end_ny.astimezone(UTC), label
+            next_month = start_local.replace(month=start_local.month + 1)
+        end_local = min(now_local, next_month)
+        label = f"{start_local:%Y년 %m월}"
+    return start_local.astimezone(UTC), end_local.astimezone(UTC), label
 
 
-def _collect_period(kind: str, now_ny: datetime):
-    start_utc, end_utc, label = _period_bounds(kind, now_ny)
-    markets = {}
-    all_rows = []
-    for market in ("KOREA", "US", "COIN"):
-        data = group_analysis_market_data(market)
-        rows = []
-        symbols = set()
-        for symbol, symbol_data in data.get("symbol_data", {}).items():
-            for position in symbol_data.get("positions", []):
-                for result in position.get("exit_results") or []:
-                    try:
-                        exit_time = datetime.fromisoformat(result["exit_time"])
-                    except Exception:
-                        continue
-                    if start_utc <= exit_time <= end_utc:
-                        row = {
-                            "market": market,
-                            "symbol": symbol,
-                            "entry_group": position["entry_group"],
-                            "entry_timeframe": position["entry_timeframe"],
-                            **result,
-                        }
-                        rows.append(row)
-                        all_rows.append(row)
-                        symbols.add(symbol)
-        values = [float(row["return_pct"]) for row in rows]
-        markets[market] = {
-            "rows": rows,
-            "count": len(rows),
-            "symbol_count": len(symbols),
-            "average": sum(values) / len(values) if values else None,
-            "best": max(values) if values else None,
-            "win_rate": (
-                sum(1 for value in values if value > 0) / len(values) * 100
-                if values else None
-            ),
-            "average_holding": (
-                sum(float(row.get("holding_minutes") or 0) for row in rows) / len(rows)
-                if rows else None
-            ),
-        }
-    all_rows.sort(key=lambda row: float(row["return_pct"]), reverse=True)
-    return markets, all_rows, label
+def _report_target(report_market: str) -> tuple[str, set[str] | None, set[str] | None, ZoneInfo]:
+    if report_market == "COIN_SCALP":
+        return "COIN", {"SCALP"}, None, KST
+    if report_market == "COIN":
+        mode = _coin_scalp_report_mode()
+        exclude = {"SCALP"} if mode in {"separate", "exclude"} else None
+        return "COIN", None, exclude, KST
+    if report_market == "KOREA":
+        return "KOREA", None, None, KST
+    if report_market == "US":
+        return "US", None, None, NY
+    raise ValueError(f"unsupported report market: {report_market}")
 
 
-def render_period_report(kind: str, now_ny: datetime) -> tuple[bytes, str]:
-    markets, all_rows, label = _collect_period(kind, now_ny)
-    title = "주간 성과 리포트" if kind == "weekly" else "월간 성과 리포트"
-    image, draw = _base_canvas(1770)
+def _collect_period(kind: str, report_market: str, now_local: datetime):
+    market, include_groups, exclude_groups, tz = _report_target(report_market)
+    start_utc, end_utc, label = _period_bounds(kind, now_local, tz)
+    data = group_analysis_market_data(market)
+    rows: list[dict[str, Any]] = []
+    symbols: set[str] = set()
+    group_rows: dict[str, list[dict[str, Any]]] = {}
+    for symbol, symbol_data in data.get("symbol_data", {}).items():
+        for position in symbol_data.get("positions", []):
+            group = str(position.get("entry_group") or "")
+            if include_groups and group not in include_groups:
+                continue
+            if exclude_groups and group in exclude_groups:
+                continue
+            for result in position.get("exit_results") or []:
+                exit_time = _parse_datetime(result.get("exit_time"))
+                if exit_time is None or not (start_utc <= exit_time.astimezone(UTC) <= end_utc):
+                    continue
+                row = {
+                    "market": market,
+                    "symbol": symbol,
+                    "entry_group": group,
+                    "entry_timeframe": position.get("entry_timeframe"),
+                    "entry_time": position.get("entry_first_time"),
+                    **result,
+                }
+                rows.append(row)
+                group_rows.setdefault(group, []).append(row)
+                symbols.add(symbol)
+    values = [float(row.get("return_pct") or 0) for row in rows]
+    stats = {
+        "rows": rows,
+        "count": len(rows),
+        "symbol_count": len(symbols),
+        "average": sum(values) / len(values) if values else None,
+        "best": max(values) if values else None,
+        "worst": min(values) if values else None,
+        "win_rate": (sum(1 for value in values if value > 0) / len(values) * 100) if values else None,
+        "average_holding": (sum(float(row.get("holding_minutes") or 0) for row in rows) / len(rows)) if rows else None,
+    }
+    grouped = []
+    for group in MARKET_GROUPS.get(market, {}):
+        selected = group_rows.get(group, [])
+        if not selected:
+            continue
+        selected_values = [float(row.get("return_pct") or 0) for row in selected]
+        grouped.append({
+            "group": group,
+            "count": len(selected),
+            "average": sum(selected_values) / len(selected_values),
+            "best": max(selected_values),
+            "win_rate": sum(1 for value in selected_values if value > 0) / len(selected_values) * 100,
+            "average_holding": sum(float(row.get("holding_minutes") or 0) for row in selected) / len(selected),
+        })
+    rows.sort(key=lambda row: float(row.get("return_pct") or 0), reverse=True)
+    return stats, grouped, rows, label
+
+
+def _report_display_label(report_market: str) -> str:
+    return {"KOREA": "국장", "US": "미장", "COIN": "코인", "COIN_SCALP": "코인 단타"}[report_market]
+
+
+def render_period_report(kind: str, report_market: str, now_local: datetime) -> tuple[bytes, str]:
+    stats, grouped, rows, label = _collect_period(kind, report_market, now_local)
+    period_name = "주간" if kind == "weekly" else "월간"
+    market_label = _report_display_label(report_market)
+    title = f"{market_label} {period_name} 성과 리포트"
+    height = max(1500, 710 + len(grouped) * 180 + min(5, len(rows)) * 105)
+    image, draw = _base_canvas(height)
     white, blue, green, red, muted, gold = (
         "#f4f4f5", "#73cfff", "#54e39a", "#ff7f87", "#a5a6ad", "#ffc857"
     )
-    draw.text((55, 45), title, font=_font(50, True), fill=white)
-    draw.text((55, 115), label, font=_font(27, True), fill=blue)
-    draw.text((55, 165), "국장 · 미장 · 코인 현황 집계", font=_font(25), fill=muted)
+    draw.text((55, 45), title, font=_font(48, True), fill=white)
+    draw.text((55, 112), label, font=_font(27, True), fill=blue)
+    subtitle = "단타 제외 · 스윙/장기/인생타점" if report_market == "COIN" and _coin_scalp_report_mode() != "include" else "완료 결과 기준"
+    draw.text((55, 160), subtitle, font=_font(22), fill=muted)
 
-    y = 245
-    for market in ("KOREA", "US", "COIN"):
-        stat = markets[market]
-        _rounded(draw, (45, y, 1035, y + 230))
-        draw.text((75, y + 28), MARKET_LABEL[market], font=_font(34, True), fill=blue)
-        if stat["average"] is None:
-            draw.text((75, y + 95), "기간 내 완료 결과 없음", font=_font(28), fill=muted)
-        else:
-            draw.text(
-                (75, y + 90),
-                f"평균 {stat['average']:+.2f}%",
-                font=_font(39, True),
-                fill=green if stat["average"] >= 0 else red,
-            )
-            draw.text(
-                (430, y + 90),
-                f"최고 {stat['best']:+.2f}%",
-                font=_font(32, True),
-                fill=green,
-            )
-            draw.text(
-                (75, y + 155),
-                f"승률 {stat['win_rate']:.1f}% · 결과 {stat['count']}건 · 종목 {stat['symbol_count']}개",
-                font=_font(24),
-                fill=white,
-            )
-            draw.text(
-                (670, y + 155),
-                f"평균보유 {_duration(stat['average_holding'])}",
-                font=_font(21),
-                fill=muted,
-            )
-        y += 255
+    _rounded(draw, (45, 225, 1035, 495))
+    if stats["average"] is None:
+        draw.text((75, 305), "기간 내 완료 결과 없음", font=_font(32, True), fill=muted)
+    else:
+        metrics = [
+            ("평균 수익률", f"{stats['average']:+.2f}%", green if stats['average'] >= 0 else red),
+            ("최대 수익률", f"{stats['best']:+.2f}%", green),
+            ("최대 손실률", f"{stats['worst']:+.2f}%", red if stats['worst'] < 0 else green),
+            ("승률", f"{stats['win_rate']:.1f}%", white),
+            ("완료 결과", f"{stats['count']}건", white),
+            ("종목", f"{stats['symbol_count']}개", white),
+        ]
+        for idx, (metric, value, color) in enumerate(metrics):
+            x = 70 + (idx % 3) * 320
+            y = 260 + (idx // 3) * 115
+            draw.text((x, y), metric, font=_font(20, True), fill=blue)
+            draw.text((x, y + 38), value, font=_font(31, True), fill=color)
+        draw.text((705, 450), f"평균 보유 {_duration(stats['average_holding'])}", font=_font(19), fill=muted)
 
-    draw.text((55, y + 10), "TOP 5", font=_font(35, True), fill=gold)
-    y += 70
-    for rank, row in enumerate(all_rows[:5], 1):
-        _rounded(draw, (50, y, 1030, y + 100), fill="#15161a")
-        draw.text((75, y + 25), f"{rank}", font=_font(30, True), fill=gold)
-        draw.text((135, y + 22), row["symbol"], font=_font(28, True), fill=white)
-        draw.text(
-            (500, y + 24),
-            f"{GROUP_LABEL.get(row['entry_group'])} {row['entry_timeframe']} → {row['exit_timeframe']}",
-            font=_font(21),
-            fill=blue,
-        )
-        value = float(row["return_pct"])
-        draw.text(
-            (845, y + 18),
-            f"{value:+.2f}%",
-            font=_font(31, True),
-            fill=green if value >= 0 else red,
-        )
-        y += 112
+    y = 540
+    if grouped:
+        draw.text((55, y), "포지션별 성과", font=_font(31, True), fill=white)
+        y += 55
+        for item in grouped:
+            _rounded(draw, (50, y, 1030, y + 145), fill="#15161a")
+            draw.text((80, y + 20), GROUP_LABEL.get(item["group"], item["group"]), font=_font(27, True), fill=blue)
+            draw.text((300, y + 20), f"평균 {item['average']:+.2f}%", font=_font(27, True), fill=green if item['average'] >= 0 else red)
+            draw.text((600, y + 20), f"최대 {item['best']:+.2f}%", font=_font(25, True), fill=green)
+            draw.text((80, y + 82), f"승률 {item['win_rate']:.1f}% · 완료 {item['count']}건", font=_font(21), fill=white)
+            draw.text((650, y + 82), f"평균보유 {_duration(item['average_holding'])}", font=_font(19), fill=muted)
+            y += 165
 
-    if not all_rows:
-        draw.text((75, y + 20), "기간 내 완료된 청산 결과가 없습니다.", font=_font(27), fill=muted)
-
-    draw.text(
-        (55, 1690),
-        "※ 신호 가격 기준이며 수수료·슬리피지·세금은 포함하지 않습니다.",
-        font=_font(20),
-        fill=muted,
-    )
-    caption = f"📊 {title} · {label}\n국장·미장·코인 완료 결과 현황"
+    draw.text((55, y + 5), "TOP 5", font=_font(33, True), fill=gold)
+    y += 60
+    for rank, row in enumerate(rows[:5], 1):
+        _rounded(draw, (50, y, 1030, y + 90), fill="#15161a")
+        draw.text((75, y + 22), str(rank), font=_font(28, True), fill=gold)
+        draw.text((125, y + 20), row["symbol"], font=_font(25, True), fill=white)
+        draw.text((390, y + 23), f"매수 {row.get('entry_timeframe','-')} → 종료 {row.get('exit_timeframe','-')}", font=_font(19), fill=blue)
+        value = float(row.get("return_pct") or 0)
+        draw.text((830, y + 17), f"{value:+.2f}%", font=_font(30, True), fill=green if value >= 0 else red)
+        y += 102
+    if not rows:
+        draw.text((75, y + 10), "기간 내 완료된 종료 결과가 없습니다.", font=_font(25), fill=muted)
+    draw.text((55, height - 65), "※ 알람 신호 가격 기준이며 수수료·슬리피지·세금은 포함하지 않습니다.", font=_font(18), fill=muted)
+    caption = f"📊 {title} · {label}\\n{market_label} 완료 결과 현황"
     return _png_bytes(image), caption
 
 
-def _is_last_weekday_of_month(now_ny: datetime) -> bool:
-    """주말만 보정한 마지막 평일. 미국 휴장일 조기판정은 하지 않는다."""
-    tomorrow = (now_ny + timedelta(days=1)).date()
+def _is_last_weekday_of_month(now_local: datetime) -> bool:
+    tomorrow = (now_local + timedelta(days=1)).date()
     cursor = tomorrow
     while cursor.weekday() >= 5:
         cursor += timedelta(days=1)
-    return cursor.month != now_ny.month
+    return cursor.month != now_local.month
+
+
+def _send_period_report(chat_id: str, kind: str, report_market: str, now_local: datetime) -> None:
+    key = f"{kind}:{report_market}:{now_local:%Y-%m-%d}" if kind == "weekly" else f"{kind}:{report_market}:{now_local:%Y-%m}"
+    if not _claim(key, f"{kind.upper()}_REPORT", report_market, None, MEMBER_NOTICE_ENV):
+        return
+    try:
+        png, caption = render_period_report(kind, report_market, now_local)
+        _send_photo(chat_id, png, caption)
+        log.info("%s report sent market=%s key=%s", kind, report_market, key)
+    except Exception:
+        _release(key)
+        log.exception("%s report failed market=%s key=%s", kind, report_market, key)
 
 
 def process_scheduled_reports() -> None:
     chat_id = os.getenv(MEMBER_NOTICE_ENV, "").strip()
     if not chat_id:
         return
-
+    now_kst = datetime.now(KST)
     now_ny = datetime.now(NY)
 
-    # 금요일 미장 정규 종료 1시간 뒤: 17시부터 17시 59분 사이 한 번.
+    # 국장: 한국시간 금요일 15:30 장 종료 후 1시간, 16:30부터 1회
+    if now_kst.weekday() == 4 and now_kst.hour == 16 and now_kst.minute >= 30:
+        _send_period_report(chat_id, "weekly", "KOREA", now_kst)
+    # 미장: 뉴욕시간 금요일 정규장 종료 1시간 후 17시
     if now_ny.weekday() == 4 and now_ny.hour == 17:
-        key = f"weekly:{now_ny:%Y-%m-%d}"
-        if _claim(key, "WEEKLY_REPORT", None, None, MEMBER_NOTICE_ENV):
-            try:
-                png, caption = render_period_report("weekly", now_ny)
-                _send_photo(chat_id, png, caption)
-                log.info("weekly report sent key=%s", key)
-            except Exception:
-                _release(key)
-                log.exception("weekly report failed key=%s", key)
+        _send_period_report(chat_id, "weekly", "US", now_ny)
+    # 코인: 한국시간 일요일 21시. 단타는 기본적으로 별도 이미지
+    if now_kst.weekday() == 6 and now_kst.hour == 21:
+        _send_period_report(chat_id, "weekly", "COIN", now_kst)
+        if _coin_scalp_report_mode() == "separate":
+            _send_period_report(chat_id, "weekly", "COIN_SCALP", now_kst)
 
-    # 달의 마지막 평일 미장 종료 1시간 뒤.
-    if now_ny.hour == 17 and _is_last_weekday_of_month(now_ny):
-        key = f"monthly:{now_ny:%Y-%m}"
-        if _claim(key, "MONTHLY_REPORT", None, None, MEMBER_NOTICE_ENV):
-            try:
-                png, caption = render_period_report("monthly", now_ny)
-                _send_photo(chat_id, png, caption)
-                log.info("monthly report sent key=%s", key)
-            except Exception:
-                _release(key)
-                log.exception("monthly report failed key=%s", key)
+    # 월간 국장: 마지막 평일 16:30 KST
+    if _is_last_weekday_of_month(now_kst) and now_kst.hour == 16 and now_kst.minute >= 30:
+        _send_period_report(chat_id, "monthly", "KOREA", now_kst)
+    # 월간 미장: 마지막 평일 17:00 New York
+    if _is_last_weekday_of_month(now_ny) and now_ny.hour == 17:
+        _send_period_report(chat_id, "monthly", "US", now_ny)
+    # 월간 코인: 달력상 말일 21:00 KST
+    tomorrow_kst = now_kst + timedelta(days=1)
+    if tomorrow_kst.month != now_kst.month and now_kst.hour == 21:
+        _send_period_report(chat_id, "monthly", "COIN", now_kst)
+        if _coin_scalp_report_mode() == "separate":
+            _send_period_report(chat_id, "monthly", "COIN_SCALP", now_kst)
 
 
 def run_once() -> None:
@@ -824,6 +953,8 @@ def automation_status() -> dict[str, Any]:
         "no_backfill_mode": True,
         "collect_coin_scalp": os.getenv("PERFORMANCE_COLLECT_COIN_SCALP", "1"),
         "send_coin_scalp": os.getenv("PERFORMANCE_SEND_COIN_SCALP", "0"),
+        "coin_scalp_report_mode": _coin_scalp_report_mode(),
+        **_font_status(),
         "poll_seconds": POLL_SECONDS,
         "thread_started": _STARTED,
         "entry_destinations": {
@@ -836,29 +967,34 @@ def automation_status() -> dict[str, Any]:
     }
 
 
-def send_period_report_test(kind: str) -> dict[str, Any]:
-    """주간/월간 리포트를 회원 공지방으로 즉시 테스트 발송."""
+def send_period_report_test(kind: str, report_market: str | None = None) -> dict[str, Any]:
+    """회원 공지방으로 시장별 주간/월간 리포트를 즉시 테스트 발송."""
     kind = str(kind or "").strip().lower()
     if kind not in {"weekly", "monthly"}:
         raise ValueError("kind must be weekly or monthly")
     chat_id = os.getenv(MEMBER_NOTICE_ENV, "").strip()
     if not chat_id:
         raise RuntimeError(f"{MEMBER_NOTICE_ENV} is not configured")
-    png, caption = render_period_report(kind, datetime.now(NY))
-    _send_photo(chat_id, png, f"[관리자 테스트]\n{caption}")
-    return {
-        "ok": True,
-        "kind": kind,
-        "destination_env": MEMBER_NOTICE_ENV,
-        "caption": caption,
-    }
+    requested = str(report_market or "").strip().upper()
+    targets = [requested] if requested else ["KOREA", "US", "COIN"]
+    if not requested and _coin_scalp_report_mode() == "separate":
+        targets.append("COIN_SCALP")
+    sent = []
+    for target in targets:
+        if target not in {"KOREA", "US", "COIN", "COIN_SCALP"}:
+            raise ValueError("market must be KOREA, US, COIN, or COIN_SCALP")
+        now_local = datetime.now(NY if target == "US" else KST)
+        png, caption = render_period_report(kind, target, now_local)
+        _send_photo(chat_id, png, f"[관리자 테스트]\\n{caption}")
+        sent.append(target)
+    return {"ok": True, "kind": kind, "markets": sent, "destination_env": MEMBER_NOTICE_ENV}
 
 
 def send_latest_cycle_test(
     market: str | None = None,
     symbol: str | None = None,
 ) -> dict[str, Any]:
-    """최근 청산 결과 1건을 해당 기존 진입방으로 즉시 테스트 발송."""
+    """최근 종료 결과 1건을 해당 기존 매수 채널로 즉시 테스트 발송."""
     requested_market = str(market or "").strip().upper()
     requested_symbol = str(symbol or "").strip().upper()
     candidates: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
@@ -876,7 +1012,7 @@ def send_latest_cycle_test(
                     candidates.append((current_market, current_symbol, position, result))
 
     if not candidates:
-        raise RuntimeError("조건에 맞는 완료 청산 결과가 없습니다")
+        raise RuntimeError("조건에 맞는 완료 종료 결과가 없습니다")
 
     def sort_key(item):
         result = item[3]
@@ -885,15 +1021,15 @@ def send_latest_cycle_test(
     current_market, current_symbol, position, result = max(candidates, key=sort_key)
     env_name, chat_id = _entry_destination(current_market, position["entry_group"])
     if not env_name:
-        raise RuntimeError("해당 진입 그룹의 기존 알람방 환경변수 매핑이 없습니다")
+        raise RuntimeError("해당 매수 그룹의 기존 알람방 환경변수 매핑이 없습니다")
     if not chat_id:
         raise RuntimeError(f"{env_name} is not configured")
 
     png = render_exit_image(current_market, current_symbol, position, result)
     caption = (
-        f"[관리자 테스트]\n📈 {current_symbol} "
-        f"{GROUP_LABEL.get(position['entry_group'])} "
-        f"{result['exit_timeframe']} 청산\n"
+        f"[관리자 테스트]\n📈 {current_symbol} · {GROUP_LABEL.get(position['entry_group'])}\n"
+        f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
+        f"종료 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
         f"수익률 {float(result['return_pct']):+.3f}%"
     )
     _send_photo(chat_id, png, caption)

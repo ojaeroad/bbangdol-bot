@@ -735,7 +735,7 @@ def price_path_svg(position, width=960, height=360):
     ):
         points.append({
             "kind": "exit",
-            "label": f"청산 · {result.get('exit_timeframe')}",
+            "label": f"종료 · {result.get('exit_timeframe')}",
             "price": float(result.get("exit_price") or 0),
             "return_pct": float(result.get("return_pct") or 0),
         })
@@ -756,7 +756,7 @@ def price_path_svg(position, width=960, height=360):
     coords = [(xp(i), yp(p["price"])) for i, p in enumerate(points)]
     parts = [
         f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
-        f'aria-label="진입 및 청산 가격 생략 차트" '
+        f'aria-label="매수 및 종료 가격 생략 차트" '
         f'style="background:#101012;border:1px solid #303035;border-radius:14px">',
         f'<rect width="{width}" height="{height}" rx="14" fill="#101012"/>',
         '<text x="24" y="31" fill="#8bd0ff" font-size="16" font-weight="700">'
@@ -803,9 +803,9 @@ def promo_cycle_svg(position, title, width=1080, height=1080):
         f'<text x="75" y="225" fill="#8bd0ff" font-size="25">최초 {position.get("entry_timeframe")} · {position.get("entry_count")}회 진입 · 완료 사이클 #{position.get("position_sequence")}</text>'
         f'<svg x="75" y="270" width="930" height="440" viewBox="0 0 960 360">{inner}</svg>'
         '<rect x="75" y="745" width="440" height="210" rx="22" fill="#19191c" stroke="#3a3a3f"/>'
-        '<text x="105" y="800" fill="#aaaaaf" font-size="24">최고 청산 수익률</text>'
+        '<text x="105" y="800" fill="#aaaaaf" font-size="24">최고 종료 수익률</text>'
         f'<text x="105" y="885" fill="#55e69a" font-size="70" font-weight="900">{best.get("return_pct",0):+.2f}%</text>'
-        f'<text x="105" y="930" fill="#ffffff" font-size="24">{best.get("exit_timeframe","-")} 청산 · {best.get("holding_text","-")}</text>'
+        f'<text x="105" y="930" fill="#ffffff" font-size="24">{best.get("exit_timeframe","-")} 종료 · {best.get("holding_text","-")}</text>'
         '<rect x="545" y="745" width="460" height="210" rx="22" fill="#19191c" stroke="#6e5520"/>'
         '<text x="575" y="800" fill="#aaaaaf" font-size="24">최대 손실폭</text>'
         f'<text x="575" y="875" fill="#ff7878" font-size="56" font-weight="900">{position.get("signal_adverse_pct",0):.2f}%</text>'
@@ -1095,10 +1095,10 @@ def _format_iso_kst(value):
 
 def _entry_exit_timeframe_matrix(symbol_data, period_key="all"):
     """
-    진입 시간봉 × 매도 시간봉 조합별 실제 성과 집계.
+    매수 시간봉 × 매도 시간봉 조합별 실제 성과 집계.
 
     기준:
-    - 각 개별 매수(individual_results)을 해당 청산 고점의 시간봉과 연결한다.
+    - 각 개별 매수(individual_results)을 해당 종료 고점의 시간봉과 연결한다.
     - 평균수익률: 조합별 개별 결과의 산술평균
     - 누적수익률: 조합별 개별 수익률의 단순합
     - 승률: 수익률이 0보다 큰 결과 비율
@@ -1643,7 +1643,7 @@ def performance_latest():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 청산 ---
+# --- 성과 분석 엔진: 각 저점 진입 × 이후 모든 고점 종료 ---
 @app.route("/performance/analyze", methods=["GET", "POST"])
 @admin_required
 def performance_analyze():
@@ -1975,7 +1975,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="badges">
 <span class="badge">종목 {{selected.symbol_count}}</span>
 <span class="badge pos">완료 {{selected.completed_cycle_count}}</span>
-<span class="badge warn">청산 대기 {{selected.open_low_count}}</span>
+<span class="badge warn">종료 대기 {{selected.open_low_count}}</span>
 </div>
 </div>
 </div>
@@ -2006,7 +2006,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {{symbol_display(market_stats.best_symbol, market_stats.best_symbol_exchange)}} 최대
 {% set best_item = (best_ranking[0] if best_ranking else none) %}
 {% if best_item and best_item.member_stats.best_detail %}
-<br>{{best_item.member_stats.best_detail.entry_timeframe}} 진입 → {{best_item.member_stats.best_detail.exit_timeframe}} 청산
+<br>{{best_item.member_stats.best_detail.entry_timeframe}} 매수 → {{best_item.member_stats.best_detail.exit_timeframe}} 종료
 {% endif %}
 {% else %}완료 종목 없음{% endif %}
 </div>
@@ -2107,10 +2107,10 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 <details class="chart-section trust-method">
 <summary style="cursor:pointer;font-size:19px;font-weight:bold;color:var(--blue)">통계 계산 기준·신뢰 안내</summary>
 <div style="margin-top:12px;line-height:1.75;color:#d7d7da">
-<div>• <b>완료 사이클 1회</b>: 첫 진입부터 최초 유효 고점 청산까지입니다. 청산 후 다음 LOW부터 새 사이클입니다.</div>
+<div>• <b>완료 사이클 1회</b>: 첫 매수부터 최초 유효 고점 종료까지입니다. 종료 후 다음 LOW부터 새 사이클입니다.</div>
 <div>• <b>평균수익률</b>: 사이클마다 허용된 매도 시간봉 결과의 평균을 구한 뒤, 완료 사이클끼리 평균합니다.</div>
-<div>• <b>최고수익률</b>: 저장된 매도 시간봉 비교 결과 중 최고값이며, 해당 종목·진입 시간봉·매도 시간봉을 함께 표시합니다.</div>
-<div>• <b>최대 손실폭</b>: 전체 캔들 저가가 아니라 청산 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
+<div>• <b>최고수익률</b>: 저장된 매도 시간봉 비교 결과 중 최고값이며, 해당 종목·매수 시간봉·매도 시간봉을 함께 표시합니다.</div>
+<div>• <b>최대 손실폭</b>: 전체 캔들 저가가 아니라 종료 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
 <div>• 수수료·슬리피지·세금·실제 주문 체결 오차는 반영되지 않을 수 있습니다.</div>
 <div>• 발생 주기의 ‘근접/초과’는 과거 평균 간격 비교이며 다음 신호를 보장하지 않습니다.</div>
 </div>
@@ -2254,7 +2254,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 {% endif %}
 
 <div class="disclaimer">
-표시 수익률은 저장된 알람 신호를 가정 진입·청산 방식으로 계산한 통계이며,
+표시 수익률은 저장된 알람 신호를 가정 매수·종료 방식으로 계산한 통계이며,
 실제 체결가격·수수료·슬리피지·세금은 반영되지 않을 수 있습니다.
 </div>
 </body>
@@ -2429,7 +2429,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <div class="cycle-flow">
 {% for entry in position.entry_points %}<div class="flow-step"><strong>진입 {{loop.index}} · {{entry.timeframe}}</strong><div>{{entry.price}}</div><small>{{entry.time}}</small></div>{% endfor %}
 <div class="flow-step adverse"><strong>최대 손실폭</strong><div>{{'%.2f'|format(position.signal_adverse_pct)}}%</div><small>신호 가격 기준</small></div>
-{% for exit in position.exit_results %}<div class="flow-step exit"><strong>{{exit.exit_timeframe}} 청산</strong><div>{{'%.2f'|format(exit.return_pct)}}%</div><small>{{exit.holding_text}} · 회복 {{exit.recovery_text}}</small></div>{% endfor %}
+{% for exit in position.exit_results %}<div class="flow-step exit"><strong>{{exit.exit_timeframe}} 종료</strong><div>{{'%.2f'|format(exit.return_pct)}}%</div><small>{{exit.holding_text}} · 회복 {{exit.recovery_text}}</small></div>{% endfor %}
 </div>
 <p><a href="/performance/member/cycle-image?category={{category}}&symbol={{data.symbol}}&cycle={{position.position_sequence}}" target="_blank">이미지 열기·PNG 저장·공유 →</a></p>
 </details>
@@ -2456,7 +2456,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <details>
 <summary>최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
 <p><b>실제 매수 구성:</b> {{position.entry_source_summary}}<br>
-첫 진입: {{position.entry_first_time}}<br>
+첫 매수: {{position.entry_first_time}}<br>
 마지막 진입: {{position.entry_last_time}}</p>
 <div class="scroll"><table>
 <tr><th>매도 시간봉</th><th>종료 시각</th><th>매도가</th><th>보유기간</th><th>수익률</th></tr>
@@ -2464,7 +2464,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <tr><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
 <td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>
 {% else %}
-<tr><td colspan="5" class="muted">아직 유효한 청산 신호가 없습니다.</td></tr>
+<tr><td colspan="5" class="muted">아직 유효한 종료 신호가 없습니다.</td></tr>
 {% endfor %}
 </table></div>
 </details>
@@ -2534,7 +2534,7 @@ button,a.btn{border:1px solid #45454b;background:#202024;color:#fff;border-radiu
 </div>
 <div class="imagebox"><img id="cycleImage" src="{{svg_url}}" alt="사이클 성과 이미지"></div>
 <div class="note">
-통계 이미지는 저장된 진입·청산 신호 가격을 사용합니다. 중간 캔들은 생략되며,
+통계 이미지는 저장된 매수·종료 신호 가격을 사용합니다. 중간 캔들은 생략되며,
 수수료·슬리피지·세금은 실제 체결 결과와 다를 수 있습니다. 공유하기 버튼은 지원되는 모바일에서
 공유 메뉴를 열며 Telegram을 선택할 수 있습니다.
 </div>
@@ -2674,7 +2674,7 @@ a{color:var(--blue);text-decoration:none}.toolbar{max-width:1080px;margin:auto a
 <div class="hero">
 <div class="chartbox">
 <div style="font-size:28px;font-weight:bold">{{symbol_display(top.symbol, top.exchange)}}</div>
-<div class="sub">진입 ①②③ → 청산 구간 시각화 예시</div>
+<div class="sub">진입 ①②③ → 종료 구간 시각화 예시</div>
 {% set completed_positions = top.group_analysis.positions|selectattr('cycle_closed')|list %}
 {% if completed_positions %}
 {{price_path_svg(completed_positions[-1])|safe}}
@@ -2812,7 +2812,7 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 </div>
 
 <div class="grid">
-<div class="metric"><div class="label">청산 결과 수</div><div class="value">{{chart.curve|length}}건</div></div>
+<div class="metric"><div class="label">종료 결과 수</div><div class="value">{{chart.curve|length}}건</div></div>
 <div class="metric"><div class="label">단순 누적 수익률</div><div class="value {{'pos' if chart.final_cumulative_pct is not none and chart.final_cumulative_pct >= 0 else 'neg'}}">
 {% if chart.final_cumulative_pct is not none %}{{'%.2f'|format(chart.final_cumulative_pct)}}%{% else %}결과 대기{% endif %}
 </div></div>
@@ -2830,7 +2830,7 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 <polyline points="{{chart.curve_polyline}}" class="curve"/>
 <text x="38" y="20" fill="#aaa" font-size="15">최고 {{'%.2f'|format(chart.curve_max)}}%</text>
 <text x="38" y="260" fill="#aaa" font-size="15">최저 {{'%.2f'|format(chart.curve_min)}}%</text>
-<text x="820" y="260" fill="#aaa" font-size="15">청산 결과 {{chart.curve|length}}건</text>
+<text x="820" y="260" fill="#aaa" font-size="15">종료 결과 {{chart.curve|length}}건</text>
 </svg>
 </div>
 {% else %}
@@ -2839,7 +2839,7 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 </div>
 
 <div class="panel">
-<h2>진입 시간봉별 평균수익률</h2>
+<h2>매수 시간봉별 평균수익률</h2>
 {% if chart.timeframes %}
 {% for row in chart.timeframes %}
 <div class="bar-row">
@@ -2855,11 +2855,11 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 </div>
 
 <div class="panel">
-<h2>진입 시간봉별 승률·수익률 상세</h2>
+<h2>매수 시간봉별 승률·수익률 상세</h2>
 {% if chart.timeframes %}
 <div style="overflow-x:auto">
 <table>
-<tr><th>진입 시간봉</th><th>결과 수</th><th>승률</th><th>평균수익</th><th>최고수익</th><th>최저수익</th></tr>
+<tr><th>매수 시간봉</th><th>결과 수</th><th>승률</th><th>평균수익</th><th>최고수익</th><th>최저수익</th></tr>
 {% for row in chart.timeframes %}
 <tr>
 <td>{{row.timeframe}}</td>
@@ -2926,7 +2926,8 @@ def performance_automation_status():
 @admin_required
 def performance_debug_send_weekly():
     try:
-        result = send_period_report_test("weekly")
+        market = request.values.get("market", "").strip().upper() or None
+        result = send_period_report_test("weekly", report_market=market)
         return jsonify(result), 200
     except Exception as exc:
         log.exception("Weekly performance test send failed")
@@ -2937,7 +2938,8 @@ def performance_debug_send_weekly():
 @admin_required
 def performance_debug_send_monthly():
     try:
-        result = send_period_report_test("monthly")
+        market = request.values.get("market", "").strip().upper() or None
+        result = send_period_report_test("monthly", report_market=market)
         return jsonify(result), 200
     except Exception as exc:
         log.exception("Monthly performance test send failed")
@@ -2986,7 +2988,7 @@ def performance_export_csv():
                 "카테고리",
                 "종목",
                 "기간",
-                "진입 시간봉",
+                "매수 시간봉",
                 "결과 수",
                 "승률(%)",
                 "평균수익률(%)",
@@ -3315,7 +3317,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="category-summary">
 <span class="badge">종목 {{selected.symbol_count}}</span>
 <span class="badge ok">완료 Cycle {{selected.completed_cycle_count}}</span>
-<span class="badge warn">청산 대기 {{selected.open_low_count}}</span>
+<span class="badge warn">종료 대기 {{selected.open_low_count}}</span>
 </div>
 </div>
 
@@ -3407,7 +3409,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 <div class="summary" style="margin-top:12px;margin-bottom:0">
 <span class="badge ok">완료 {{s.completed_cycle_count}}</span>
-<span class="badge warn">청산대기 {{s.open_low_count}}</span>
+<span class="badge warn">종료대기 {{s.open_low_count}}</span>
 </div>
 </a>
 {% endfor %}
@@ -3423,7 +3425,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <span class="badge">저점 {{s.low_count}}</span>
 <span class="badge">고점 {{s.high_count}}</span>
 <span class="badge ok">완료 사이클 {{s.completed_cycle_count}}</span>
-<span class="badge warn">청산 대기 저점 {{s.open_low_count}}</span>
+<span class="badge warn">종료 대기 저점 {{s.open_low_count}}</span>
 <span class="badge">진입 전 고점 {{s.high_only_count}}</span>
 </div>
 
@@ -3475,7 +3477,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </details>
 
 <details>
-<summary>실제 사이클별 진입·청산 가격 차트</summary>
+<summary>실제 사이클별 매수·종료 가격 차트</summary>
 {% for position in s.group_analysis.positions|reverse %}
 {% if position.cycle_closed and position.exit_results %}
 <div class="card">
@@ -3501,7 +3503,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 <div class="metric">
 <div class="title">수익률 · 보유시간</div>
-<div class="value warn">청산 고점 대기</div>
+<div class="value warn">종료 고점 대기</div>
 <div class="small">고점 신호가 발생하면 자동 계산</div>
 </div>
 </div>
@@ -3534,7 +3536,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 
 {% for c in s.completed_cycles %}
 <details>
-<summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 청산후보 {{c.exit_count}}회</summary>
+<summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 종료후보 {{c.exit_count}}회</summary>
 
 <div class="grid">
 <div class="metric">
@@ -3606,13 +3608,13 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% for r in c.exit_results %}
 <details>
 <summary>
-상세 보기 · 청산 {{r.exit.timeframe}} · {{r.exit.price}} ·
+상세 보기 · 종료 {{r.exit.timeframe}} · {{r.exit.price}} ·
 최대TF <span class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</span> ·
 전체분할 <span class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%</span>
 </summary>
 
 <table>
-<tr><th>청산 신호</th><th>청산 관계</th><th>최대TF 수익률</th><th>최대TF 보유</th><th>전체분할 수익률</th><th>전체분할 보유</th></tr>
+<tr><th>종료 신호</th><th>종료 관계</th><th>최대TF 수익률</th><th>최대TF 보유</th><th>전체분할 수익률</th><th>전체분할 보유</th></tr>
 <tr>
 <td>{{r.exit.signal_no}} / {{r.exit.timeframe}} / {{r.exit.price}}</td>
 <td>{{r.relation_to_max_entry}}</td>
@@ -3638,7 +3640,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <details>
 <summary>각 개별 매수 결과 {{r.individual_results|length}}건</summary>
 <table>
-<tr><th>진입 신호</th><th>시간봉</th><th>진입가</th><th>수익률</th><th>보유시간</th></tr>
+<tr><th>진입 신호</th><th>시간봉</th><th>매수가</th><th>수익률</th><th>보유시간</th></tr>
 {% for item in r.individual_results %}
 <tr>
 <td>{{item.entry.signal_no}}</td><td>{{item.entry.timeframe}}</td><td>{{item.entry.price}}</td>
@@ -3798,14 +3800,14 @@ summary{cursor:pointer;font-weight:bold}
 <details>
 <summary>최초 {{position.entry_timeframe}} 포지션 · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
 <p><b>실제 매수 구성:</b> {{position.entry_source_summary}}<br>
-첫 진입 {{position.entry_first_time}}<br>마지막 진입 {{position.entry_last_time}}<br>
+첫 매수 {{position.entry_first_time}}<br>마지막 진입 {{position.entry_last_time}}<br>
 상태: {{'3회 진입 완료' if position.entry_complete else '유효 진입만 계산'}}</p>
 <div class="scroll"><table>
 <tr><th>매도 그룹</th><th>매도 시간봉</th><th>종료 시각</th><th>매도가</th><th>보유기간</th><th>수익률</th></tr>
 {% for exit in position.exit_results %}
 <tr><td>{{exit.exit_group_label}}</td><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
 <td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>
-{% else %}<tr><td colspan="6">아직 유효한 첫 고점 청산이 없습니다.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="6">아직 유효한 첫 고점 종료이 없습니다.</td></tr>{% endfor %}
 </table></div>
 </details>
 {% else %}<p class="muted">생성된 매수 포지션이 없습니다.</p>{% endfor %}
@@ -4096,7 +4098,7 @@ def _risk_or_default(name: str) -> str:
 
 STATE = {
     "global_mode": "BOTH",    # BOTH | LONG_ONLY | SHORT_ONLY
-    "split_enabled": True,    # 분할 진입 on/off
+    "split_enabled": True,    # 분할 매수 on/off
     "pairs": {}               # "BTCUSDT.P": {...}
 }
 
