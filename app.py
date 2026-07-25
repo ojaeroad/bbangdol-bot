@@ -624,6 +624,9 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
                 "entry_price": position.get("entry_price"),
                 "exit_price": row.get("exit_price"),
                 "signal_adverse_pct": row.get("signal_adverse_pct"),
+                "entry_time": _format_iso_kst(position.get("entry_first_time")),
+                "exit_time": _format_iso_kst(row.get("exit_time")),
+                "entry_group": position.get("entry_group"),
             }
             if best_detail is None or candidate["return_pct"] > best_detail["return_pct"]:
                 best_detail = candidate
@@ -744,25 +747,45 @@ def _format_minutes_compact(value):
 
 
 def _aggregate_market_group_stats(ranked_symbols, category_key):
-    groups={}
+    market_type = _member_market_type(category_key)
+    allowed_groups = sorted(
+        ENTRY_GROUP_TIMEFRAMES[market_type],
+        key=lambda key: ENTRY_GROUP_ORDER[key],
+    )
+    groups = {
+        key: {
+            "group_key": key,
+            "group_label": ENTRY_GROUP_LABELS[key],
+            "returns": [], "wins": [], "holding": [],
+            "adverse": [], "recovery": [], "cycles": 0,
+        }
+        for key in allowed_groups
+    }
     for symbol in ranked_symbols:
-        for group in symbol.get("member_stats",{}).get("entry_groups",[]):
-            if not group.get("has_results"): continue
-            bucket=groups.setdefault(group["group_key"], {
-                "group_key":group["group_key"],"group_label":group["group_label"],
-                "returns":[],"wins":[],"holding":[],"adverse":[],"recovery":[],"cycles":0,
-            })
-            cycles=int(group.get("result_count") or 0); bucket["cycles"]+=cycles
-            if group.get("average_return_pct") is not None: bucket["returns"].extend([float(group["average_return_pct"])]*max(cycles,1))
-            if group.get("win_rate_pct") is not None: bucket["wins"].extend([float(group["win_rate_pct"])]*max(cycles,1))
-            if group.get("average_holding_minutes") is not None: bucket["holding"].extend([float(group["average_holding_minutes"])]*max(cycles,1))
-            if group.get("average_signal_adverse_pct") is not None: bucket["adverse"].extend([float(group["average_signal_adverse_pct"])]*max(cycles,1))
-            if group.get("average_recovery_minutes") is not None: bucket["recovery"].extend([float(group["average_recovery_minutes"])]*max(cycles,1))
+        for group in symbol.get("member_stats", {}).get("entry_groups", []):
+            key = group.get("group_key")
+            if key not in groups or not group.get("has_results"):
+                continue
+            bucket = groups[key]
+            cycles = int(group.get("result_count") or 0)
+            bucket["cycles"] += cycles
+            weight = max(cycles, 1)
+            if group.get("average_return_pct") is not None:
+                bucket["returns"].extend([float(group["average_return_pct"])] * weight)
+            if group.get("win_rate_pct") is not None:
+                bucket["wins"].extend([float(group["win_rate_pct"])] * weight)
+            if group.get("average_holding_minutes") is not None:
+                bucket["holding"].extend([float(group["average_holding_minutes"])] * weight)
+            if group.get("average_signal_adverse_pct") is not None:
+                bucket["adverse"].extend([float(group["average_signal_adverse_pct"])] * weight)
+            if group.get("average_recovery_minutes") is not None:
+                bucket["recovery"].extend([float(group["average_recovery_minutes"])] * weight)
     ordered=[]
-    for key in sorted(groups,key=lambda x:ENTRY_GROUP_ORDER[x]):
+    for key in allowed_groups:
         b=groups[key]
         ordered.append({
             "group_key":key,"group_label":b["group_label"],"cycles":b["cycles"],
+            "has_results": bool(b["cycles"]),
             "average_return_pct":sum(b["returns"])/len(b["returns"]) if b["returns"] else None,
             "win_rate_pct":sum(b["wins"])/len(b["wins"]) if b["wins"] else None,
             "average_holding_minutes":sum(b["holding"])/len(b["holding"]) if b["holding"] else None,
@@ -865,7 +888,7 @@ def promo_cycle_svg(position, title, width=1080, height=1080):
         f'<text x="105" y="885" fill="#55e69a" font-size="70" font-weight="900">{best.get("return_pct",0):+.2f}%</text>'
         f'<text x="105" y="930" fill="#ffffff" font-size="24">{best.get("exit_timeframe","-")} 종료 · {best.get("holding_text","-")}</text>'
         '<rect x="545" y="745" width="460" height="210" rx="22" fill="#19191c" stroke="#6e5520"/>'
-        '<text x="575" y="800" fill="#aaaaaf" font-size="24">최대 손실폭</text>'
+        '<text x="575" y="800" fill="#aaaaaf" font-size="24">최대 하락폭</text>'
         f'<text x="575" y="875" fill="#ff7878" font-size="56" font-weight="900">{position.get("signal_adverse_pct",0):.2f}%</text>'
         '<text x="575" y="930" fill="#aaaaaf" font-size="20">중간 캔들이 아닌 저장 LOW 신호 기준</text>'
         '<text x="75" y="1010" fill="#77777e" font-size="18">실제 체결가·수수료·슬리피지·세금은 반영되지 않을 수 있습니다.</text>'
@@ -1990,18 +2013,18 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0 20px}
 .metric,.symbol{display:block;color:#f5f5f5;text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
 .title{color:var(--blue);font-weight:bold;margin-bottom:8px}.value{font-size:25px;font-weight:bold}
-.pos{color:var(--green)}.warn{color:var(--yellow)}.muted{color:#aaa}.metric-sub{margin-top:8px;color:#aaa;font-size:13px}.group-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px}.group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.trust-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:0 0 20px}.trust-card{background:#171719;border:1px solid #353539;border-radius:14px;padding:16px}.trust-card.life{border-color:#9d7b1f;background:linear-gradient(145deg,#211b0b,#171719)}.trust-title{font-size:20px;font-weight:800;color:var(--blue);display:flex;justify-content:space-between}.trust-card.life .trust-title{color:var(--yellow)}.trust-value{font-size:28px;font-weight:900;color:var(--green);margin:12px 0}.trust-meta{display:grid;grid-template-columns:1fr 1fr;gap:7px;color:#bbb;font-size:13px}.life-hero{border:1px solid #92751d;background:linear-gradient(145deg,#211c0d,#151517);border-radius:17px;padding:20px;margin-bottom:20px}.life-hero h3{margin:0;color:var(--yellow);font-size:25px}.cycle-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}.flow-step{background:#101012;border:1px solid #303035;border-radius:12px;padding:12px}.flow-step strong{display:block;color:var(--blue);margin-bottom:7px}.flow-step.adverse{border-color:#6b3434}.flow-step.adverse strong{color:var(--red)}.flow-step.exit{border-color:#285b43}.flow-step.exit strong{color:var(--green)}.status-DUE{color:#ffcf55}.status-NEAR{color:#7ed2ff}.status-EARLY{color:#aaa}.status-WAIT{color:#888}
+.pos{color:var(--green)}.warn{color:var(--yellow)}.muted{color:#aaa}.metric-sub{margin-top:8px;color:#aaa;font-size:13px}.group-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px}.group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.trust-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:0 0 20px}.trust-card{display:block;color:#f5f5f5;text-decoration:none;background:#171719;border:1px solid #353539;border-radius:14px;padding:16px}.trust-card.life{border-color:#9d7b1f;background:linear-gradient(145deg,#211b0b,#171719)}.trust-title{font-size:20px;font-weight:800;color:var(--blue);display:flex;justify-content:space-between}.trust-card.life .trust-title{color:var(--yellow)}.trust-value{font-size:28px;font-weight:900;color:var(--green);margin:12px 0}.trust-meta{display:grid;grid-template-columns:1fr 1fr;gap:7px;color:#bbb;font-size:13px}.life-hero{border:1px solid #92751d;background:linear-gradient(145deg,#211c0d,#151517);border-radius:17px;padding:20px;margin-bottom:20px}.life-hero h3{margin:0;color:var(--yellow);font-size:25px}.cycle-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}.flow-step{background:#101012;border:1px solid #303035;border-radius:12px;padding:12px}.flow-step strong{display:block;color:var(--blue);margin-bottom:7px}.flow-step.adverse{border-color:#6b3434}.flow-step.adverse strong{color:var(--red)}.flow-step.exit{border-color:#285b43}.flow-step.exit strong{color:var(--green)}.status-DUE{color:#ffcf55}.status-NEAR{color:#7ed2ff}.status-EARLY{color:#aaa}.status-WAIT{color:#888}
 .ranking-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px;margin:0 0 20px}
 .ranking{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px;min-width:0}
 .ranking h3{margin:0 0 12px;color:var(--blue);font-size:18px}
-.rank-row{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 0;border-bottom:1px solid #2c2c30}
+.rank-row{display:grid;color:#f5f5f5;text-decoration:none;grid-template-columns:28px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 0;border-bottom:1px solid #2c2c30}
 .rank-row:last-child{border-bottom:0}
 .rank-no{width:25px;height:25px;border-radius:50%;background:#2b2b2f;display:flex;align-items:center;justify-content:center;font-size:12px}
 .rank-symbol{font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rank-value{font-weight:bold;color:var(--green);white-space:nowrap}
 .chart-section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:20px}
 .chart-section h3{margin:0 0 14px;color:var(--blue)}
-.bar-row{display:grid;grid-template-columns:110px minmax(100px,1fr) 75px;gap:10px;align-items:center;margin:11px 0}
+.bar-row{display:grid;color:#f5f5f5;text-decoration:none;grid-template-columns:110px minmax(100px,1fr) 75px;gap:10px;align-items:center;margin:11px 0}
 .bar-name{font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar-track{height:18px;border-radius:999px;background:#101012;overflow:hidden;border:1px solid #2d2d31}
 .bar-fill{height:100%;min-width:3px;border-radius:999px;background:linear-gradient(90deg,#2495c7,#55e69a)}
@@ -2158,55 +2181,57 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% if ranked_symbols %}
 <div class="trust-grid">
 {% for group in market_group_stats %}
-<div class="trust-card {{'life' if group.group_key == 'LIFE' else ''}}">
+<a class="trust-card {{'life' if group.group_key == 'LIFE' else ''}}" href="/performance/member/group?category={{selected_category}}&group={{group.group_key}}&period={{period_key}}">
 <div class="trust-title"><span>{{group.group_label}}</span><span>{{group.cycles}}사이클</span></div>
 <div class="trust-value">{% if group.average_return_pct is not none %}{{'%.2f'|format(group.average_return_pct)}}%{% else %}-{% endif %}</div>
 <div class="trust-meta">
-<span>승률 {{'%.1f'|format(group.win_rate_pct)}}%</span>
+<span>승률 {% if group.win_rate_pct is not none %}{{'%.1f'|format(group.win_rate_pct)}}%{% else %}-{% endif %}</span>
 <span>보유 {{format_minutes_compact(group.average_holding_minutes)}}</span>
-<span>최대 손실폭 {% if group.average_signal_adverse_pct is not none %}{{'%.2f'|format(group.average_signal_adverse_pct)}}%{% else %}-{% endif %}</span>
-<span>회복 {{format_minutes_compact(group.average_recovery_minutes)}}</span>
-</div></div>
+<span>최대 하락폭 {% if group.average_signal_adverse_pct is not none %}{{'%.2f'|format(group.average_signal_adverse_pct)}}%{% else %}-{% endif %}</span>
+<span>수익 전환 소요시간 {{format_minutes_compact(group.average_recovery_minutes)}}</span>
+</div>
+<div class="metric-sub">클릭하면 종목별 매수·종료 시각을 확인할 수 있습니다.</div>
+</a>
 {% endfor %}
 </div>
 {% set life = market_group_stats|selectattr('group_key','equalto','LIFE')|list %}
 <div class="life-hero">
 <h3>★ 인생타점 집중 보기</h3>
-{% if life %}
-<p>평균 {{'%.2f'|format(life[0].average_return_pct)}}% · 승률 {{'%.1f'|format(life[0].win_rate_pct)}}% · 평균 보유 {{format_minutes_compact(life[0].average_holding_minutes)}} · 평균 최대 손실폭 {{'%.2f'|format(life[0].average_signal_adverse_pct)}}%</p>
+{% if life and life[0].has_results %}
+<p>평균 {{'%.2f'|format(life[0].average_return_pct)}}% · 승률 {{'%.1f'|format(life[0].win_rate_pct)}}% · 평균 보유 {{format_minutes_compact(life[0].average_holding_minutes)}} · 평균 최대 하락폭 {% if life[0].average_signal_adverse_pct is not none %}{{'%.2f'|format(life[0].average_signal_adverse_pct)}}%{% else %}-{% endif %}</p>
 {% else %}<p class="muted">인생타점 완료 사이클이 쌓이면 이곳에 최우선으로 표시됩니다.</p>{% endif %}
 </div>
 <div class="ranking-wrap">
 <div class="ranking">
 <h3>평균수익률 TOP 5</h3>
 {% for s in average_ranking %}
-<div class="rank-row">
+<a class="rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <span class="rank-no">{{loop.index}}</span>
-<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}</span>
+<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}<small class="muted" style="display:block">상세 매수·종료 기록 보기</small></span>
 <span class="rank-value">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</span>
-</div>
+</a>
 {% endfor %}
 </div>
 
 <div class="ranking">
 <h3>최고수익률 TOP 5</h3>
 {% for s in best_ranking %}
-<div class="rank-row">
+<a class="rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <span class="rank-no">{{loop.index}}</span>
-<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}</span>
+<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}{% if s.member_stats.best_detail %}<small class="muted" style="display:block">매수 {{s.member_stats.best_detail.entry_timeframe}} {{s.member_stats.best_detail.entry_time}} → 종료 {{s.member_stats.best_detail.exit_timeframe}} {{s.member_stats.best_detail.exit_time}}</small>{% endif %}</span>
 <span class="rank-value">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
-</div>
+</a>
 {% endfor %}
 </div>
 
 <div class="ranking">
 <h3>승률 TOP 5</h3>
 {% for s in win_rate_ranking %}
-<div class="rank-row">
+<a class="rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <span class="rank-no">{{loop.index}}</span>
-<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}</span>
+<span class="rank-symbol">{{symbol_display(s.symbol, s.exchange)}}<small class="muted" style="display:block">{{s.member_stats.completed_cycle_count}}개 완료 사이클</small></span>
 <span class="rank-value">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</span>
-</div>
+</a>
 {% endfor %}
 </div>
 </div>
@@ -2215,14 +2240,14 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <h3>종목별 평균수익률 비교</h3>
 {% for s in ranked_symbols|sort(attribute='symbol') %}
 {% set avg = s.member_stats.average_return_pct %}
-<div class="bar-row">
+<a class="bar-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <div class="bar-name">{{symbol_display(s.symbol, s.exchange)}}</div>
 <div class="bar-track">
 <div class="bar-fill {{'negbar' if avg < 0 else ''}}"
 style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 </div>
 <div class="bar-value {{'pos' if avg >= 0 else ''}}">{{'%.2f'|format(avg)}}%</div>
-</div>
+</a>
 {% endfor %}
 </div>
 
@@ -2234,7 +2259,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 <div>• <b>완료 사이클 1회</b>: 첫 매수부터 최초 유효 고점 종료까지입니다. 종료 후 다음 LOW부터 새 사이클입니다.</div>
 <div>• <b>평균수익률</b>: 사이클마다 허용된 매도 시간봉 결과의 평균을 구한 뒤, 완료 사이클끼리 평균합니다.</div>
 <div>• <b>최고수익률</b>: 저장된 매도 시간봉 비교 결과 중 최고값이며, 해당 종목·매수 시간봉·매도 시간봉을 함께 표시합니다.</div>
-<div>• <b>최대 손실폭</b>: 전체 캔들 저가가 아니라 종료 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
+<div>• <b>최대 하락폭</b>: 전체 캔들 저가가 아니라 종료 전 저장된 LOW 신호 가격 중 최저값 기준입니다.</div>
 <div>• 수수료·슬리피지·세금·실제 주문 체결 오차는 반영되지 않을 수 있습니다.</div>
 <div>• 발생 주기의 ‘근접/초과’는 과거 평균 간격 비교이며 다음 신호를 보장하지 않습니다.</div>
 </div>
@@ -2407,6 +2432,75 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 
 
 
+
+def _group_detail_rows(category: str, group_key: str, period_key: str):
+    category_market = {"KOREA_1Q": "KOREA", "US_1Q": "US", "COIN": "COIN"}
+    market = category_market.get(category, "KOREA")
+    start_at = _period_start(period_key)
+    analysis = group_analysis_market_data(market)
+    rows = []
+    for symbol, symbol_data in (analysis.get("symbol_data") or {}).items():
+        exchange = "KRX" if market == "KOREA" else market
+        for position in symbol_data.get("positions") or []:
+            if str(position.get("entry_group") or "").upper() != group_key:
+                continue
+            for result in position.get("exit_results") or []:
+                exit_dt = _parse_iso_datetime(result.get("exit_time"))
+                if start_at is not None and (exit_dt is None or exit_dt < start_at):
+                    continue
+                rows.append({
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "symbol_name": symbol_display(symbol, exchange),
+                    "entry_timeframe": position.get("entry_timeframe") or "-",
+                    "entry_time": _format_iso_kst(position.get("entry_first_time")),
+                    "exit_timeframe": result.get("exit_timeframe") or "-",
+                    "exit_time": _format_iso_kst(result.get("exit_time")),
+                    "return_pct": float(result.get("return_pct") or 0),
+                    "holding_text": result.get("holding_text") or "-",
+                    "cycle": position.get("position_sequence"),
+                })
+    rows.sort(key=lambda r: (r["symbol_name"], -r["return_pct"]))
+    return rows
+
+
+def _render_group_detail(category: str, group_key: str, period_key: str, admin: bool = False):
+    allowed_categories = {"KOREA_1Q", "US_1Q", "COIN"}
+    if category not in allowed_categories:
+        category = "KOREA_1Q"
+    market_type = _member_market_type(category)
+    allowed_groups = ENTRY_GROUP_TIMEFRAMES[market_type]
+    if group_key not in allowed_groups:
+        group_key = next(iter(allowed_groups))
+    if period_key not in {"today", "7d", "30d", "all"}:
+        period_key = "all"
+    rows = _group_detail_rows(category, group_key, period_key)
+    return render_template_string("""
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{group_label}} 상세 성과</title><style>
+body{margin:0;background:#0e0e0f;color:#f4f4f4;font-family:Arial,"Noto Sans KR",sans-serif;padding:18px}a{color:#78ceff}.card{background:#1b1b1d;border:1px solid #36363a;border-radius:14px;padding:16px;margin:14px 0}.summary{display:flex;gap:10px;flex-wrap:wrap}.pill{background:#29292d;border-radius:999px;padding:8px 12px}.row{display:grid;grid-template-columns:minmax(130px,1.2fr) 85px 150px 85px 150px 90px 110px;gap:8px;align-items:center;padding:11px 0;border-bottom:1px solid #303034}.head{color:#7ed2ff;font-weight:bold}.pos{color:#55e69a;font-weight:bold}.neg{color:#ff7878;font-weight:bold}.muted{color:#aaa}@media(max-width:850px){.row{grid-template-columns:1fr 1fr}.head{display:none}.row span:before{color:#7ed2ff;font-size:12px;display:block}.row span:nth-child(2):before{content:'매수 시간봉'}.row span:nth-child(3):before{content:'매수 시각'}.row span:nth-child(4):before{content:'종료 시간봉'}.row span:nth-child(5):before{content:'종료 시각'}.row span:nth-child(6):before{content:'수익률'}.row span:nth-child(7):before{content:'보유기간'}}
+</style></head><body>
+<a href="{{back_url}}">← 이전 화면</a><h1>{{group_label}} 종목별 실제 성과</h1>
+<div class="summary"><span class="pill">완료 결과 {{rows|length}}건</span><span class="pill">매수·종료 시각 KST</span></div>
+<div class="card"><div class="row head"><span>종목</span><span>매수 시간봉</span><span>매수 시각</span><span>종료 시간봉</span><span>종료 시각</span><span>수익률</span><span>보유기간</span></div>
+{% for row in rows %}<a class="row" style="color:#f4f4f4;text-decoration:none" href="{{symbol_base}}?category={{category}}&symbol={{row.symbol}}">
+<span><b>{{row.symbol_name}}</b><small class="muted" style="display:block">사이클 #{{row.cycle}}</small></span><span>{{row.entry_timeframe}}</span><span>{{row.entry_time}}</span><span>{{row.exit_timeframe}}</span><span>{{row.exit_time}}</span><span class="{{'pos' if row.return_pct >= 0 else 'neg'}}">{{'%+.3f'|format(row.return_pct)}}%</span><span>{{row.holding_text}}</span></a>
+{% else %}<p class="muted">선택 기간에는 완료 결과가 없습니다. 포지션 칸은 유지되며 결과가 쌓이면 자동 표시됩니다.</p>{% endfor %}</div>
+</body></html>""", rows=rows, category=category, group_label=ENTRY_GROUP_LABELS[group_key], back_url=(f"/performance/dashboard?category={category}" if admin else f"/performance/member?category={category}&period={period_key}"), symbol_base=("/performance/dashboard" if admin else "/performance/member/symbol"))
+
+
+@app.get("/performance/member/group")
+@member_required
+def performance_member_group():
+    return _render_group_detail(request.args.get("category", "KOREA_1Q").strip().upper(), request.args.get("group", "SWING").strip().upper(), request.args.get("period", "all").strip().lower(), False)
+
+
+@app.get("/performance/dashboard/group")
+@admin_required
+def performance_dashboard_group():
+    return _render_group_detail(request.args.get("category", "KOREA_1Q").strip().upper(), request.args.get("group", "SWING").strip().upper(), request.args.get("period", "all").strip().lower(), True)
+
+
 @app.get("/performance/member/symbol")
 @member_required
 def performance_member_symbol():
@@ -2484,11 +2578,11 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <div class="trust-mini"><span>완료 사이클</span><b>{{member_stats.completed_cycle_count}}회</b></div>
 <div class="trust-mini"><span>평균 수익률</span><b class="pos">{% if member_stats.average_return_pct is not none %}{{'%.2f'|format(member_stats.average_return_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="trust-mini"><span>승률</span><b>{% if member_stats.win_rate_pct is not none %}{{'%.1f'|format(member_stats.win_rate_pct)}}%{% else %}-{% endif %}</b></div>
-<div class="trust-mini"><span>평균 최대 손실폭</span><b class="neg">{% if member_stats.average_signal_adverse_pct is not none %}{{'%.2f'|format(member_stats.average_signal_adverse_pct)}}%{% else %}-{% endif %}</b></div>
+<div class="trust-mini"><span>평균 최대 하락폭</span><b class="neg">{% if member_stats.average_signal_adverse_pct is not none %}{{'%.2f'|format(member_stats.average_signal_adverse_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="trust-mini"><span>평균 보유시간</span><b>{{format_minutes_compact(member_stats.average_holding_minutes)}}</b></div>
 <div class="trust-mini"><span>최대 수익률</span><b class="pos">{% if member_stats.best_detail %}{{'%.2f'|format(member_stats.best_detail.return_pct)}}%{% else %}-{% endif %}</b>{% if member_stats.best_detail %}<small>매수 {{member_stats.best_detail.entry_timeframe}} → 매도 {{member_stats.best_detail.exit_timeframe}}</small>{% endif %}</div>
 </div>
-<p class="muted">※ 최대 손실폭은 캔들 데이터가 없는 과거 사이클의 경우 저장된 신호 가격을 기준으로 계산합니다.</p>
+<p class="muted">※ 최대 하락폭은 캔들 데이터가 없는 과거 사이클의 경우 저장된 신호 가격을 기준으로 계산합니다.</p>
 </div>
 
 <div class="card">
@@ -2547,15 +2641,15 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 
 <div class="card">
 <h2>사이클별 체감 흐름</h2>
-<p class="muted">매수 → 최대 손실폭 → 매도 시간봉별 결과를 한눈에 비교합니다.</p>
+<p class="muted">매수 → 최대 하락폭 → 매도 시간봉별 결과를 한눈에 비교합니다.</p>
 {% for position in data.positions|reverse %}
 {% if position.cycle_closed and position.exit_results %}
 <details>
 <summary>사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입</summary>
 <div class="cycle-flow">
 {% for entry in position.entry_points %}<div class="flow-step"><strong>진입 {{loop.index}} · {{entry.timeframe}}</strong><div>{{entry.price}}</div><small>{{entry.time}}</small></div>{% endfor %}
-<div class="flow-step adverse"><strong>최대 손실폭</strong><div>{{'%.2f'|format(position.signal_adverse_pct)}}%</div><small>신호 가격 기준</small></div>
-{% for exit in position.exit_results %}<div class="flow-step exit"><strong>{{exit.exit_timeframe}} 종료</strong><div>{{'%.2f'|format(exit.return_pct)}}%</div><small>{{exit.holding_text}} · 회복 {{exit.recovery_text}}</small></div>{% endfor %}
+<div class="flow-step adverse"><strong>최대 하락폭</strong><div>{{'%.2f'|format(position.signal_adverse_pct)}}%</div><small>신호 가격 기준</small></div>
+{% for exit in position.exit_results %}<div class="flow-step exit"><strong>{{exit.exit_timeframe}} 종료</strong><div>{{'%.2f'|format(exit.return_pct)}}%</div><small>{{exit.holding_text}} · 수익 전환까지 {{exit.recovery_text}}</small></div>{% endfor %}
 </div>
 <p><a href="/performance/member/cycle-image?category={{category}}&symbol={{data.symbol}}&cycle={{position.position_sequence}}" target="_blank">이미지 열기·PNG 저장·공유 →</a></p>
 </details>
@@ -2894,7 +2988,7 @@ h1{margin:0;font-size:32px}.muted{color:#aaa}
 .chartbox{background:#111113;border:1px solid #2f2f33;border-radius:12px;padding:10px;overflow-x:auto}
 .chartbox svg{width:100%;min-width:700px;height:280px;display:block}
 .axis{stroke:#3f3f44;stroke-width:1}.curve{fill:none;stroke:#55e69a;stroke-width:4;stroke-linejoin:round;stroke-linecap:round}
-.bar-row{display:grid;grid-template-columns:110px minmax(100px,1fr) 80px 70px;gap:10px;align-items:center;margin:12px 0}
+.bar-row{display:grid;color:#f5f5f5;text-decoration:none;grid-template-columns:110px minmax(100px,1fr) 80px 70px;gap:10px;align-items:center;margin:12px 0}
 .bar-name{font-weight:bold}
 .bar-track{height:18px;border-radius:999px;background:#101012;border:1px solid #2d2d31;overflow:hidden}
 .bar-fill{height:100%;min-width:3px;background:linear-gradient(90deg,#2495c7,#55e69a);border-radius:999px}
@@ -3237,6 +3331,10 @@ def performance_dashboard():
                     analysis,
                     "all",
                 )
+                enriched["member_stats"]["entry_groups"] = _group_entry_timeframe_stats(
+                    selected_category,
+                    enriched["member_stats"].get("entry_timeframes") or [],
+                )
                 enriched_symbols.append(enriched)
 
             selected = dict(selected)
@@ -3486,6 +3584,15 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="value">{{market_stats.result_symbol_count}} / {{selected.symbol_count}}</div>
 </div>
 </div>
+
+<div class="card"><h2>포지션별 성과</h2><div class="grid">
+{% set admin_groups = (selected.symbols|map(attribute='member_stats')|list) %}
+{% for group_key in (['SCALP','SWING','LONG','LIFE'] if selected_category == 'COIN' else ['SWING','LONG','LIFE']) %}
+<a class="metric" style="color:#f4f4f4;text-decoration:none" href="/performance/dashboard/group?category={{selected_category}}&group={{group_key}}&period=all">
+<div class="title">{{ {'SCALP':'단타','SWING':'스윙','LONG':'장기','LIFE':'인생타점'}[group_key] }}</div>
+<div class="value">상세 종목·시각 보기</div><div class="small">결과가 없더라도 칸을 유지합니다.</div></a>
+{% endfor %}
+</div></div>
 
 {% if selected.symbol_count == 0 %}
 <div class="card"><div class="empty-note">

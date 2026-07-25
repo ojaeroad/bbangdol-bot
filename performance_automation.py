@@ -459,7 +459,7 @@ def render_exit_image(
     _rounded(draw, (45, 645, 1035, 860), outline=green if return_pct >= 0 else red)
     draw.text((75, 680), "실현 가능 수익률", font=_font(27, True), fill=blue)
     draw.text((75, 730), f"{return_pct:+.3f}%", font=_font(68, True), fill=green if return_pct >= 0 else red)
-    draw.text((620, 684), "최대 손실폭", font=_font(24, True), fill=muted)
+    draw.text((620, 684), "최대 하락폭", font=_font(24, True), fill=muted)
     draw.text((620, 720), adverse_basis, font=_font(18), fill=muted)
     draw.text((620, 758), f"{adverse_pct:+.3f}%", font=_font(39, True), fill=red)
 
@@ -543,7 +543,7 @@ def render_cycle_summary_image(
         draw.text((550, y + 25), "최고 수익", font=_font(24, True), fill=blue)
         draw.text((735, y + 20), f"{max(returns):+.3f}%", font=_font(34, True), fill=green)
         if adverse is not None:
-            draw.text((65, y + 78), "최대 손실폭", font=_font(22, True), fill=blue)
+            draw.text((65, y + 78), "최대 하락폭", font=_font(22, True), fill=blue)
             draw.text((250, y + 72), f"{adverse:+.3f}%", font=_font(30, True), fill=red)
             draw.text((470, y + 80), f"{interval}분봉 저가 기준", font=_font(19), fill=muted)
 
@@ -762,16 +762,40 @@ def _collect_period(kind: str, report_market: str, now_local: datetime):
     return stats, grouped, rows, label
 
 
+
+KRX_REPORT_NAMES = {
+    "005930":"삼성전자","000660":"SK하이닉스","005380":"현대차","032830":"삼성생명",
+    "373220":"LG에너지솔루션","207940":"삼성바이오로직스","000270":"기아","068270":"셀트리온",
+    "105560":"KB금융","055550":"신한지주","035420":"NAVER","035720":"카카오",
+    "012450":"한화에어로스페이스","034020":"두산에너빌리티","086520":"에코프로",
+    "247540":"에코프로비엠","006400":"삼성SDI","051910":"LG화학","005490":"POSCO홀딩스",
+    "028260":"삼성물산","012330":"현대모비스","066570":"LG전자","003670":"포스코퓨처엠",
+    "009150":"삼성전기","042700":"한미반도체","000810":"삼성화재","329180":"HD현대중공업"
+}
+
+def _report_symbol_name(market: str, symbol: str) -> str:
+    code = str(symbol or "").upper().split(":")[-1].replace(".KS","").replace(".KQ","")
+    return f"{KRX_REPORT_NAMES.get(code, code)}({code})" if market == "KOREA" and code.isdigit() else code
+
+def _distinct_best_rows(rows):
+    best = {}
+    for row in rows:
+        symbol = row.get("symbol")
+        if symbol not in best or float(row.get("return_pct") or 0) > float(best[symbol].get("return_pct") or 0):
+            best[symbol] = row
+    return sorted(best.values(), key=lambda r: float(r.get("return_pct") or 0), reverse=True)
+
 def _report_display_label(report_market: str) -> str:
     return {"KOREA": "국장", "US": "미장", "COIN": "코인", "COIN_SCALP": "코인 단타"}[report_market]
 
 
 def render_period_report(kind: str, report_market: str, now_local: datetime) -> tuple[bytes, str]:
     stats, grouped, rows, label = _collect_period(kind, report_market, now_local)
+    top_rows = _distinct_best_rows(rows)
     period_name = "주간" if kind == "weekly" else "월간"
     market_label = _report_display_label(report_market)
     title = f"{market_label} {period_name} 성과 리포트"
-    height = max(1500, 710 + len(grouped) * 180 + min(5, len(rows)) * 105)
+    height = max(1500, 710 + len(grouped) * 180 + min(5, len(top_rows)) * 150)
     image, draw = _base_canvas(height)
     white, blue, green, red, muted, gold = (
         "#f4f4f5", "#73cfff", "#54e39a", "#ff7f87", "#a5a6ad", "#ffc857"
@@ -788,7 +812,7 @@ def render_period_report(kind: str, report_market: str, now_local: datetime) -> 
         metrics = [
             ("평균 수익률", f"{stats['average']:+.2f}%", green if stats['average'] >= 0 else red),
             ("최대 수익률", f"{stats['best']:+.2f}%", green),
-            ("최대 손실률", f"{stats['worst']:+.2f}%", red if stats['worst'] < 0 else green),
+            ("최저 수익률", f"{stats['worst']:+.2f}%", red if stats['worst'] < 0 else green),
             ("승률", f"{stats['win_rate']:.1f}%", white),
             ("완료 결과", f"{stats['count']}건", white),
             ("종목", f"{stats['symbol_count']}개", white),
@@ -815,15 +839,16 @@ def render_period_report(kind: str, report_market: str, now_local: datetime) -> 
 
     draw.text((55, y + 5), "TOP 5", font=_font(33, True), fill=gold)
     y += 60
-    for rank, row in enumerate(rows[:5], 1):
-        _rounded(draw, (50, y, 1030, y + 90), fill="#15161a")
+    for rank, row in enumerate(top_rows[:5], 1):
+        _rounded(draw, (50, y, 1030, y + 135), fill="#15161a")
         draw.text((75, y + 22), str(rank), font=_font(28, True), fill=gold)
-        draw.text((125, y + 20), row["symbol"], font=_font(25, True), fill=white)
-        draw.text((390, y + 23), f"매수 {row.get('entry_timeframe','-')} → 종료 {row.get('exit_timeframe','-')}", font=_font(19), fill=blue)
+        draw.text((125, y + 18), _report_symbol_name("KOREA" if report_market == "KOREA" else report_market, row["symbol"]), font=_font(24, True), fill=white)
+        draw.text((390, y + 18), f"매수 {row.get('entry_timeframe','-')} → 종료 {row.get('exit_timeframe','-')}", font=_font(19), fill=blue)
+        draw.text((125, y + 67), f"매수 {_format_kst(row.get('entry_time'))}  |  종료 {_format_kst(row.get('exit_time'))}", font=_font(17), fill=muted)
         value = float(row.get("return_pct") or 0)
         draw.text((830, y + 17), f"{value:+.2f}%", font=_font(30, True), fill=green if value >= 0 else red)
-        y += 102
-    if not rows:
+        y += 147
+    if not top_rows:
         draw.text((75, y + 10), "기간 내 완료된 종료 결과가 없습니다.", font=_font(25), fill=muted)
     draw.text((55, height - 65), "※ 알람 신호 가격 기준이며 수수료·슬리피지·세금은 포함하지 않습니다.", font=_font(18), fill=muted)
     caption = f"📊 {title} · {label}\\n{market_label} 완료 결과 현황"
