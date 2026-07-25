@@ -126,6 +126,17 @@ CREATE TABLE IF NOT EXISTS performance_candles_5m (
 CREATE INDEX IF NOT EXISTS idx_performance_candles_5m_symbol_time
     ON performance_candles_5m(symbol, bar_time);
 
+CREATE TABLE IF NOT EXISTS performance_page_visits (
+    id BIGSERIAL PRIMARY KEY,
+    page_path VARCHAR(200) NOT NULL,
+    visitor_hash VARCHAR(64) NOT NULL,
+    visited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_performance_page_visits_time
+    ON performance_page_visits(visited_at);
+CREATE INDEX IF NOT EXISTS idx_performance_page_visits_hash_time
+    ON performance_page_visits(visitor_hash, visited_at);
+
 CREATE TABLE IF NOT EXISTS performance_cycle_chart_archive (
     archive_key VARCHAR(300) PRIMARY KEY,
     market VARCHAR(20),
@@ -551,3 +562,63 @@ def finish_candle_watch(symbol: str, through_time: str | datetime) -> int:
             (symbol, end),
         ).fetchall()
     return len(deleted_1m) + len(deleted_5m)
+
+
+def record_page_visit(page_path: str, visitor_hash: str) -> None:
+    """회원 페이지 방문을 익명 해시로 기록한다.
+
+    같은 방문자가 짧은 시간 새로고침해도 조회수가 과도하게 증가하지 않도록
+    30분 내 동일 page_path 방문은 1회로 계산한다.
+    """
+    try:
+        ensure_schema()
+        with _connect() as conn:
+            exists = conn.execute(
+                """
+                SELECT 1
+                FROM performance_page_visits
+                WHERE page_path=%s AND visitor_hash=%s
+                  AND visited_at >= NOW() - INTERVAL '30 minutes'
+                LIMIT 1
+                """,
+                (str(page_path or '/performance/member')[:200], str(visitor_hash)[:64]),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO performance_page_visits(page_path, visitor_hash) VALUES (%s, %s)",
+                    (str(page_path or '/performance/member')[:200], str(visitor_hash)[:64]),
+                )
+    except Exception:
+        log.exception("Performance page visit save failed")
+
+
+def page_visit_summary() -> dict[str, int]:
+    """회원페이지 누적·오늘 방문자 수를 반환한다."""
+    try:
+        ensure_schema()
+        with _connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_views,
+                    COUNT(*) FILTER (
+                        WHERE visited_at >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Seoul')
+                            AT TIME ZONE 'Asia/Seoul'
+                    ) AS today_views,
+                    COUNT(DISTINCT visitor_hash) AS total_visitors,
+                    COUNT(DISTINCT visitor_hash) FILTER (
+                        WHERE visited_at >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Seoul')
+                            AT TIME ZONE 'Asia/Seoul'
+                    ) AS today_visitors
+                FROM performance_page_visits
+                """
+            ).fetchone()
+        return {
+            "total_views": int(row[0] or 0),
+            "today_views": int(row[1] or 0),
+            "total_visitors": int(row[2] or 0),
+            "today_visitors": int(row[3] or 0),
+        }
+    except Exception:
+        log.exception("Performance page visit summary failed")
+        return {"total_views": 0, "today_views": 0, "total_visitors": 0, "today_visitors": 0}
