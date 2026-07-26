@@ -2376,7 +2376,7 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 .trust-pair{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.trust-pair>div{background:#111113;border-radius:10px;padding:10px}.trust-pair small{display:block;color:#aaa;font-size:12px}.trust-pair b{display:block;color:var(--green);font-size:21px;margin-top:5px}.trust-preview{background:#101012;border:1px solid #303035;border-radius:10px;padding:10px;color:#bbb;font-size:12px;line-height:1.55}.trust-preview strong{color:var(--green);font-size:15px}.empty-position{height:112px;display:flex;align-items:center;justify-content:center;color:#666;font-size:30px}.recent-grid{display:grid;gap:8px}.recent-row{display:grid;grid-template-columns:minmax(150px,1fr) minmax(260px,2fr) 90px;gap:12px;align-items:center;color:#f5f5f5;text-decoration:none;background:#111113;border:1px solid #2e2e33;border-radius:11px;padding:11px}.recent-row small{display:block;color:#999;margin-top:3px}.recent-row>div:last-child{text-align:right;font-size:18px;font-weight:bold}
 .metric,.symbol{display:block;color:#f5f5f5;text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
 .title{color:var(--blue);font-weight:bold;margin-bottom:8px}.value{font-size:25px;font-weight:bold}
-.pos{color:var(--green)}.warn{color:var(--yellow)}.muted{color:#aaa}.metric-sub{margin-top:8px;color:#aaa;font-size:13px}.group-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px}.group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.trust-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:0 0 20px}.trust-card{display:block;color:#f5f5f5;text-decoration:none;background:#171719;border:1px solid #353539;border-radius:14px;padding:16px}.trust-card.life{border-color:#9d7b1f;background:linear-gradient(145deg,#211b0b,#171719)}.trust-title{font-size:20px;font-weight:800;color:var(--blue);display:flex;justify-content:space-between}.trust-card.life .trust-title{color:var(--yellow)}.trust-value{font-size:28px;font-weight:900;color:var(--green);margin:12px 0}.trust-meta{display:grid;grid-template-columns:1fr 1fr;gap:7px;color:#bbb;font-size:13px}.life-hero{border:1px solid #92751d;background:linear-gradient(145deg,#211c0d,#151517);border-radius:17px;padding:20px;margin-bottom:20px}.life-hero h3{margin:0;color:var(--yellow);font-size:25px}.cycle-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}.flow-step{background:#101012;border:1px solid #303035;border-radius:12px;padding:12px}.flow-step strong{display:block;color:var(--blue);margin-bottom:7px}.flow-step.adverse{border-color:#6b3434}.flow-step.adverse strong{color:var(--red)}.flow-step.exit{border-color:#285b43}.flow-step.exit strong{color:var(--green)}.status-DUE{color:#ffcf55}.status-NEAR{color:#7ed2ff}.status-EARLY{color:#aaa}.status-WAIT{color:#888}
+.pos{color:var(--green)!important;font-weight:bold}.neg{color:var(--red)!important;font-weight:bold}.warn{color:var(--yellow)}.muted{color:#aaa}.metric-sub{margin-top:8px;color:#aaa;font-size:13px}.group-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px}.group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.trust-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:0 0 20px}.trust-card{display:block;color:#f5f5f5;text-decoration:none;background:#171719;border:1px solid #353539;border-radius:14px;padding:16px}.trust-card.life{border-color:#9d7b1f;background:linear-gradient(145deg,#211b0b,#171719)}.trust-title{font-size:20px;font-weight:800;color:var(--blue);display:flex;justify-content:space-between}.trust-card.life .trust-title{color:var(--yellow)}.trust-value{font-size:28px;font-weight:900;color:var(--green);margin:12px 0}.trust-meta{display:grid;grid-template-columns:1fr 1fr;gap:7px;color:#bbb;font-size:13px}.life-hero{border:1px solid #92751d;background:linear-gradient(145deg,#211c0d,#151517);border-radius:17px;padding:20px;margin-bottom:20px}.life-hero h3{margin:0;color:var(--yellow);font-size:25px}.cycle-flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}.flow-step{background:#101012;border:1px solid #303035;border-radius:12px;padding:12px}.flow-step strong{display:block;color:var(--blue);margin-bottom:7px}.flow-step.adverse{border-color:#6b3434}.flow-step.adverse strong{color:var(--red)}.flow-step.exit{border-color:#285b43}.flow-step.exit strong{color:var(--green)}.status-DUE{color:#ffcf55}.status-NEAR{color:#7ed2ff}.status-EARLY{color:#aaa}.status-WAIT{color:#888}
 .ranking-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px;margin:0 0 20px}
 .ranking{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px;min-width:0}
 .ranking h3{margin:0 0 12px;color:var(--blue);font-size:18px}
@@ -2415,7 +2415,7 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 @media(max-width:1100px){.ranking-wrap{grid-template-columns:1fr}.summary{grid-template-columns:repeat(2,1fr)}.segment-wrap{grid-template-columns:1fr}.recent-row{grid-template-columns:1fr 1fr}.recent-row>div:last-child{grid-column:2;text-align:left}}
 @media(max-width:760px){.values{grid-template-columns:repeat(2,minmax(0,1fr))}.bar-row{grid-template-columns:85px minmax(80px,1fr) 65px}}
 @media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}.symbols{grid-template-columns:1fr}.bar-row{grid-template-columns:72px minmax(60px,1fr) 58px;font-size:13px}}
-.member-alpha-table{display:grid;gap:2px}.member-alpha-head,.member-alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}.member-alpha-head{color:var(--blue);font-weight:800;border-bottom:1px solid #343438}.member-alpha-row{color:#f5f5f5;text-decoration:none;background:#131315;border-radius:8px}.member-alpha-row:hover{background:#1c1c20}.life-section{border-color:#8c6b20!important;box-shadow:0 0 0 1px rgba(255,200,87,.12)}
+.member-alpha-table{display:grid;gap:2px}.member-alpha-head,.member-alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}.member-alpha-head{color:var(--blue);font-weight:800;border-bottom:1px solid #343438}.member-alpha-row{color:#f5f5f5;text-decoration:none;background:#131315;border-radius:8px}.member-alpha-row:hover{background:#1c1c20}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:1px solid #c89b2b!important;background:linear-gradient(145deg,#211b0b,#141416)!important}
 </style>
 </head>
 <body>
@@ -2767,7 +2767,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="mini"><span>평균수익</span><b class="{{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'neg' if s.member_stats.average_return_pct is not none else 'muted'}}">
 {% if s.member_stats.average_return_pct is not none %}{{'%.2f'|format(s.member_stats.average_return_pct)}}%{% else %}대기{% endif %}
 </b></div>
-<div class="mini"><span>승률</span><b>
+<div class="mini"><span>승률</span><b class="{{'pos' if s.member_stats.win_rate_pct is not none and s.member_stats.win_rate_pct >= 50 else 'neg' if s.member_stats.win_rate_pct is not none else 'muted'}}">
 {% if s.member_stats.win_rate_pct is not none %}{{'%.1f'|format(s.member_stats.win_rate_pct)}}%{% else %}대기{% endif %}
 </b></div>
 <div class="mini"><span>평균 보유</span><b>
@@ -3911,7 +3911,7 @@ summary{cursor:pointer;font-weight:bold}
 .position-pair small{display:block;color:#aaa}.position-pair b{display:block;color:var(--green);font-size:19px;margin-top:5px}
 .position-preview{background:#101012;border:1px solid #303035;border-radius:9px;padding:10px;line-height:1.55;font-size:12px}.position-preview strong{color:var(--green);font-size:15px}
 .position-meta{display:flex;justify-content:space-between;gap:10px;margin-top:8px;font-size:12px}.position-empty{height:150px;display:flex;align-items:center;justify-content:center;color:#666;font-size:28px}
-.ranking-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.admin-rank-row{display:flex;justify-content:space-between;gap:12px;padding:10px;border-bottom:1px solid #333;text-decoration:none;color:#f4f4f4}
+.ranking-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.admin-ranking{background:#171719;border:1px solid #3b3b40;border-radius:14px;padding:16px;min-width:0}.admin-ranking h3{margin:0 0 12px;color:var(--blue);font-size:20px}.admin-rank-row{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:9px;align-items:center;padding:11px 0;border-bottom:1px solid #333;text-decoration:none;color:#f4f4f4}.admin-rank-row:last-child{border-bottom:0}.admin-rank-no{width:27px;height:27px;border-radius:50%;background:#2b2b2f;display:flex;align-items:center;justify-content:center;font-size:12px}.admin-rank-symbol{font-weight:bold;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.admin-rank-symbol small{display:block;color:#aaa;font-weight:normal;margin-top:3px;overflow:hidden;text-overflow:ellipsis}.admin-rank-value{font-size:18px;font-weight:bold;white-space:nowrap}
 .alpha-table{display:grid;gap:2px}.alpha-head,.alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}
 .alpha-head{color:var(--blue);font-weight:bold;border-bottom:1px solid #444}.alpha-row{color:#f4f4f4;text-decoration:none;background:#151517;border-radius:7px}.alpha-row:hover{background:#202024}
 .matrix-wrap{overflow-x:auto;margin-top:12px}
@@ -3930,7 +3930,7 @@ summary{cursor:pointer;font-weight:bold}
 @media(max-width:900px){.market-performance{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:650px){.market-performance,.symbol-result-grid{grid-template-columns:1fr}}
 @media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:10px}h1{font-size:27px}}
-.group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.life-section{border-color:#8c6b20!important;box-shadow:0 0 0 1px rgba(255,200,87,.12)}
+.group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:1px solid #c89b2b!important;background:linear-gradient(145deg,#211b0b,#141416)!important}
 </style>
 </head>
 <body>
@@ -4011,17 +4011,29 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% if admin_average_ranking or admin_best_ranking or admin_win_rate_ranking %}
 <details class="card collapsible-block" open><summary class="section-title">수익률·승률 TOP 5</summary>
 <div class="ranking-grid" style="margin-top:14px">
-<div><h3>평균 수익률 TOP 5</h3>
+<div class="admin-ranking"><h3>평균 수익률 TOP 5</h3>
 {% for s in admin_average_ranking %}
-<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><b class="{{'pos' if s.member_stats.average_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</b></a>
+<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<span class="admin-rank-no">{{loop.index}}</span>
+<span class="admin-rank-symbol">{{symbol_display(s.symbol, s.exchange)}}{% if s.member_stats.best_detail %}<small>대표 최고 · 매수 {{s.member_stats.best_detail.entry_timeframe}} {{s.member_stats.best_detail.entry_time}} → 종료 {{s.member_stats.best_detail.exit_timeframe}} {{s.member_stats.best_detail.exit_time}}</small>{% endif %}</span>
+<b class="admin-rank-value {{'pos' if s.member_stats.average_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</b>
+</a>
 {% endfor %}</div>
-<div><h3>최고 수익률 TOP 5</h3>
+<div class="admin-ranking"><h3>최고 수익률 TOP 5</h3>
 {% for s in admin_best_ranking %}
-<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><b class="{{'pos' if s.member_stats.best_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</b></a>
+<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<span class="admin-rank-no">{{loop.index}}</span>
+<span class="admin-rank-symbol">{{symbol_display(s.symbol, s.exchange)}}{% if s.member_stats.best_detail %}<small>매수 {{s.member_stats.best_detail.entry_timeframe}} {{s.member_stats.best_detail.entry_time}} → 종료 {{s.member_stats.best_detail.exit_timeframe}} {{s.member_stats.best_detail.exit_time}}</small>{% endif %}</span>
+<b class="admin-rank-value {{'pos' if s.member_stats.best_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</b>
+</a>
 {% endfor %}</div>
-<div><h3>승률 TOP 5</h3>
+<div class="admin-ranking"><h3>승률 TOP 5</h3>
 {% for s in admin_win_rate_ranking %}
-<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><b class="pos">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</b></a>
+<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<span class="admin-rank-no">{{loop.index}}</span>
+<span class="admin-rank-symbol">{{symbol_display(s.symbol, s.exchange)}}<small>검증 {{s.member_stats.completed_cycle_count}}사이클{% if s.member_stats.best_detail %} · 대표 매수 {{s.member_stats.best_detail.entry_timeframe}} → 종료 {{s.member_stats.best_detail.exit_timeframe}}{% endif %}</small></span>
+<b class="admin-rank-value {{'pos' if s.member_stats.win_rate_pct >= 50 else 'neg'}}">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</b>
+</a>
 {% endfor %}</div>
 </div></details>
 {% endif %}
@@ -4123,18 +4135,18 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 </div>
 <div class="symbol-result">
-<div class="label">평균 보유</div>
-<div class="number">
-{% if s.member_stats.average_holding_minutes is not none %}
-{{format_minutes_compact(s.member_stats.average_holding_minutes)}}
+<div class="label">승률</div>
+<div class="number {{'pos' if s.member_stats.win_rate_pct is not none and s.member_stats.win_rate_pct >= 50 else 'neg' if s.member_stats.win_rate_pct is not none else 'muted'}}">
+{% if s.member_stats.win_rate_pct is not none %}
+{{'%.1f'|format(s.member_stats.win_rate_pct)}}%
 {% else %}대기{% endif %}
 </div>
 </div>
 <div class="symbol-result">
-<div class="label">승률</div>
-<div class="number {{'pos' if s.member_stats.win_rate_pct is not none and s.member_stats.win_rate_pct >= 50 else 'neg'}}">
-{% if s.member_stats.win_rate_pct is not none %}
-{{'%.1f'|format(s.member_stats.win_rate_pct)}}%
+<div class="label">평균 보유</div>
+<div class="number">
+{% if s.member_stats.average_holding_minutes is not none %}
+{{format_minutes_compact(s.member_stats.average_holding_minutes)}}
 {% else %}대기{% endif %}
 </div>
 </div>
