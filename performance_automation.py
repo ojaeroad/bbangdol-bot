@@ -431,6 +431,10 @@ def render_exit_image(
         ("보유기간", result.get("holding_text") or _duration(result.get("holding_minutes"))),
     ]
     col_w = 235
+    # 표처럼 한눈에 구분되도록 열·행 구분선을 추가한다.
+    for xline in (292, 527, 762):
+        draw.line((xline, 260, xline, 590), fill="#34363c", width=2)
+    draw.line((65, 420, 1015, 420), fill="#34363c", width=2)
     for idx, (label, value) in enumerate(fields):
         col = idx % 4
         row = idx // 4
@@ -451,7 +455,7 @@ def render_exit_image(
     _rounded(draw, (45, 645, 1035, 860), outline=green if return_pct >= 0 else red)
     draw.text((75, 680), "실현 가능 수익률", font=_font(27, True), fill=blue)
     draw.text((75, 730), f"{return_pct:+.3f}%", font=_font(68, True), fill=green if return_pct >= 0 else red)
-    draw.text((620, 684), "최대 하락폭", font=_font(24, True), fill=muted)
+    draw.text((620, 684), "최대 손절폭", font=_font(24, True), fill=muted)
     draw.text((620, 720), adverse_basis, font=_font(18), fill=muted)
     draw.text((620, 758), f"{adverse_pct:+.3f}%", font=_font(39, True), fill=red)
 
@@ -507,6 +511,8 @@ def render_cycle_summary_image(
         ("평균 매수가", _price(position.get("entry_price"))),
         ("최종 종료 시각", _format_kst(last_end_time, multiline=True)),
     ]
+    for xline in (257, 449, 641, 833):
+        draw.line((xline, 270, xline, 455), fill="#34363c", width=2)
     for idx, (label, value) in enumerate(stats):
         x = 65 + idx * 192
         draw.text((x, 280), label, font=_font(18, True), fill=blue)
@@ -529,9 +535,13 @@ def render_cycle_summary_image(
             final_exit,
         )
         low = None
-    adverse = ((low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if low is not None else None
+    adverse = (
+        ((low - float(position["entry_price"])) / float(position["entry_price"]) * 100)
+        if low is not None
+        else float(position.get("signal_adverse_pct") or 0)
+    )
 
-    draw.text((60, 1060), "시간봉별 종료 결과", font=_font(32, True), fill=white)
+    draw.text((60, 1060), "매수·종료 시간봉별 종합 결과", font=_font(32, True), fill=white)
     y = 1125
     returns = []
     for result in results:
@@ -550,7 +560,7 @@ def render_cycle_summary_image(
         draw.text((550, y + 25), "최고 수익", font=_font(24, True), fill=blue)
         draw.text((735, y + 20), f"{max(returns):+.3f}%", font=_font(34, True), fill=green)
         if adverse is not None:
-            draw.text((65, y + 78), "최대 하락폭", font=_font(22, True), fill=blue)
+            draw.text((65, y + 78), "최대 손절폭", font=_font(22, True), fill=blue)
             draw.text((250, y + 72), f"{adverse:+.3f}%", font=_font(30, True), fill=red)
             draw.text((470, y + 80), f"{interval}분봉 저가 기준", font=_font(19), fill=muted)
 
