@@ -3481,7 +3481,7 @@ def performance_dashboard():
             )[:5]
             admin_symbol_rows = sorted(
                 selected["symbols"],
-                key=lambda item: symbol_display_name(item.get("symbol"), item.get("exchange")),
+                key=lambda item: symbol_display(item.get("symbol"), item.get("exchange")),
             )
 
             average_values = [
