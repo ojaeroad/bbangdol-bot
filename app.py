@@ -579,6 +579,7 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
     positions = analysis_data.get("positions") or []
     completed = []
     cycle_avg_returns = []
+    cycle_summaries = []
     cycle_avg_holding = []
     cycle_adverse = []
     recovery_values = []
@@ -606,7 +607,20 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
         adverse = [float(row["signal_adverse_pct"]) for row in exits if row.get("signal_adverse_pct") is not None]
         recoveries = [float(row["recovery_minutes"]) for row in exits if row.get("recovery_minutes") is not None]
         if returns:
-            cycle_avg_returns.append(sum(returns) / len(returns))
+            cycle_average = sum(returns) / len(returns)
+            cycle_avg_returns.append(cycle_average)
+            latest_exit = max(
+                exits,
+                key=lambda row: _parse_iso_datetime(row.get("exit_time")) or datetime.min.replace(tzinfo=timezone.utc),
+            )
+            cycle_summaries.append({
+                "return_pct": cycle_average,
+                "exit_time_iso": latest_exit.get("exit_time"),
+                "entry_timeframe": position.get("entry_timeframe"),
+                "exit_timeframe": latest_exit.get("exit_timeframe"),
+                "entry_time": _format_iso_kst(position.get("entry_first_time")),
+                "exit_time": _format_iso_kst(latest_exit.get("exit_time")),
+            })
             all_results.extend(exits)
         if holdings:
             cycle_avg_holding.append(sum(holdings) / len(holdings))
@@ -722,6 +736,18 @@ def _member_group_engine_statistics(analysis_data, period_key="all"):
         "recent5_max_average_pct": (
             sum(detail["return_pct"] for detail in recent5_details_global) / len(recent5_details_global)
             if recent5_details_global else None
+        ),
+        "latest_cycle_return_pct": (
+            max(
+                cycle_summaries,
+                key=lambda row: _parse_iso_datetime(row.get("exit_time_iso")) or datetime.min.replace(tzinfo=timezone.utc),
+            ).get("return_pct") if cycle_summaries else None
+        ),
+        "latest_cycle_detail": (
+            max(
+                cycle_summaries,
+                key=lambda row: _parse_iso_datetime(row.get("exit_time_iso")) or datetime.min.replace(tzinfo=timezone.utc),
+            ) if cycle_summaries else None
         ),
         "entry_timeframes": entry_timeframes, "entry_timeframes_1h_plus": [], "exit_timeframes": [],
     }
@@ -1665,6 +1691,146 @@ def _build_member_chart_data(selected_category_data, period_key="all"):
     }
 
 
+
+
+def _build_group_engine_chart_data(category_key, period_key="all"):
+    """현재 그룹 분석 엔진의 완료 포지션으로 차트·시간봉·조합 성과를 만든다."""
+    market_key = {"KOREA_1Q": "KOREA", "US_1Q": "US", "COIN": "COIN"}.get(category_key, "KOREA")
+    market_analysis = group_analysis_market_data(market_key)
+    start_at = _period_start(period_key)
+    timeframe_map = {}
+    combination_map = {}
+    period_group_map = {}
+    symbol_rows = []
+
+    for symbol, analysis in (market_analysis.get("symbol_data") or {}).items():
+        stats = _member_group_engine_statistics(analysis, period_key)
+        if stats.get("has_results"):
+            symbol_rows.append({
+                "symbol": symbol,
+                "exchange": analysis.get("exchange"),
+                "average_return_pct": stats.get("average_return_pct"),
+                "best_return_pct": stats.get("best_return_pct"),
+                "win_rate_pct": stats.get("win_rate_pct"),
+                "result_count": stats.get("result_count", 0),
+            })
+
+        for position in analysis.get("positions") or []:
+            if not position.get("cycle_closed"):
+                continue
+            entry_tf = str(position.get("entry_timeframe") or "").strip()
+            if not entry_tf or entry_tf.lower() == "unknown":
+                continue
+            valid_exits = []
+            for result in position.get("exit_results") or []:
+                exit_tf = str(result.get("exit_timeframe") or "").strip()
+                exit_time = _parse_iso_datetime(result.get("exit_time"))
+                if not exit_tf or exit_tf.lower() == "unknown" or not exit_time:
+                    continue
+                if start_at is not None and exit_time < start_at:
+                    continue
+                if result.get("return_pct") is None:
+                    continue
+                valid_exits.append((result, exit_time))
+            if not valid_exits:
+                continue
+
+            cycle_returns = [float(result.get("return_pct")) for result, _ in valid_exits]
+            cycle_average = sum(cycle_returns) / len(cycle_returns)
+            cycle_holdings = [float(result.get("holding_minutes")) for result, _ in valid_exits if result.get("holding_minutes") is not None]
+            tf_bucket = timeframe_map.setdefault(entry_tf, {
+                "timeframe": entry_tf,
+                "timeframe_minutes": TIMEFRAME_ORDER_MINUTES.get(entry_tf, 999999),
+                "returns": [], "holding": [],
+            })
+            tf_bucket["returns"].append(cycle_average)
+            if cycle_holdings:
+                tf_bucket["holding"].append(sum(cycle_holdings) / len(cycle_holdings))
+
+            entry_group = _entry_group_key(category_key, entry_tf)
+            for result, exit_time in valid_exits:
+                exit_tf = str(result.get("exit_timeframe"))
+                value = float(result.get("return_pct"))
+                combo = combination_map.setdefault((entry_tf, exit_tf), {
+                    "entry_timeframe": entry_tf,
+                    "exit_timeframe": exit_tf,
+                    "entry_minutes": TIMEFRAME_ORDER_MINUTES.get(entry_tf, 999999),
+                    "exit_minutes": TIMEFRAME_ORDER_MINUTES.get(exit_tf, 999999),
+                    "returns": [],
+                })
+                combo["returns"].append(value)
+
+            if entry_group:
+                latest_exit_time = max(exit_time for _, exit_time in valid_exits)
+                local_time = latest_exit_time.astimezone(timezone(timedelta(hours=9)))
+                day_key = local_time.strftime("%Y-%m-%d")
+                iso_year, iso_week, _ = local_time.isocalendar()
+                week_key = f"{iso_year}-W{iso_week:02d}"
+                month_key = local_time.strftime("%Y-%m")
+                for unit, label in (("day", day_key), ("week", week_key), ("month", month_key)):
+                    bucket = period_group_map.setdefault((unit, label, entry_group), {
+                        "unit": unit, "period": label, "group_key": entry_group,
+                        "group_label": ENTRY_GROUP_LABELS.get(entry_group, entry_group), "returns": [],
+                    })
+                    bucket["returns"].append(cycle_average)
+
+    timeframe_rows = []
+    for bucket in sorted(timeframe_map.values(), key=lambda row: row["timeframe_minutes"]):
+        values = bucket.pop("returns")
+        holdings = bucket.pop("holding")
+        wins = [v for v in values if v > 0]
+        bucket.update({
+            "result_count": len(values),
+            "average_return_pct": sum(values)/len(values) if values else None,
+            "best_return_pct": max(values) if values else None,
+            "worst_return_pct": min(values) if values else None,
+            "win_rate_pct": len(wins)/len(values)*100 if values else None,
+            "average_holding_minutes": sum(holdings)/len(holdings) if holdings else None,
+        })
+        timeframe_rows.append(bucket)
+
+    combination_rows = []
+    for combo in combination_map.values():
+        values = combo.pop("returns")
+        wins = [v for v in values if v > 0]
+        combo.update({
+            "result_count": len(values),
+            "average_return_pct": sum(values)/len(values) if values else None,
+            "best_return_pct": max(values) if values else None,
+            "worst_return_pct": min(values) if values else None,
+            "win_rate_pct": len(wins)/len(values)*100 if values else None,
+        })
+        combination_rows.append(combo)
+    combination_rows.sort(key=lambda row: (row["entry_minutes"], row["exit_minutes"]))
+
+    period_group_rows = []
+    unit_order = {"day": 0, "week": 1, "month": 2}
+    for bucket in period_group_map.values():
+        values = bucket.pop("returns")
+        if not values:
+            continue
+        bucket.update({
+            "result_count": len(values),
+            "average_return_pct": sum(values)/len(values),
+            "win_rate_pct": len([v for v in values if v > 0])/len(values)*100,
+            "best_return_pct": max(values),
+            "worst_return_pct": min(values),
+        })
+        period_group_rows.append(bucket)
+    period_group_rows.sort(key=lambda row: (unit_order.get(row["unit"], 9), row["period"], ENTRY_GROUP_ORDER.get(row["group_key"], 9)), reverse=True)
+
+    symbol_rows.sort(key=lambda row: row.get("average_return_pct") if row.get("average_return_pct") is not None else float("-inf"), reverse=True)
+    tf_abs = [abs(row["average_return_pct"]) for row in timeframe_rows if row.get("average_return_pct") is not None]
+    symbol_abs = [abs(row["average_return_pct"]) for row in symbol_rows if row.get("average_return_pct") is not None]
+    return {
+        "period_groups": period_group_rows,
+        "timeframes": timeframe_rows,
+        "combinations": combination_rows,
+        "symbols": symbol_rows,
+        "max_abs_timeframe_return": max(tf_abs) if tf_abs else 1.0,
+        "max_symbol_return": max(symbol_abs) if symbol_abs else 1.0,
+    }
+
 # =========================================================
 # 회원용 / 관리자용 성과 화면 접근 제어
 # =========================================================
@@ -2223,9 +2389,9 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 .chart-section h3{margin:0 0 14px;color:var(--blue)}
 .bar-row{display:grid;color:#f5f5f5;text-decoration:none;grid-template-columns:110px minmax(100px,1fr) 75px;gap:10px;align-items:center;margin:11px 0}
 .bar-name{font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bar-track{height:18px;border-radius:999px;background:#101012;overflow:hidden;border:1px solid #2d2d31}
-.bar-fill{height:100%;min-width:3px;border-radius:999px;background:linear-gradient(90deg,#2495c7,#55e69a)}
-.bar-fill.negbar{background:linear-gradient(90deg,#a63b4a,#ff7878)}
+.bar-track{position:relative;height:18px;border-radius:999px;background:#101012;overflow:hidden;border:1px solid #2d2d31}.bar-track:after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:#555;z-index:2}
+.bar-fill{position:absolute;left:50%;top:0;height:100%;min-width:3px;border-radius:0 999px 999px 0;background:linear-gradient(90deg,#2495c7,#55e69a)}
+.bar-fill.negbar{left:auto;right:50%;border-radius:999px 0 0 999px;background:linear-gradient(90deg,#a63b4a,#ff7878)}
 .bar-value{text-align:right;font-weight:bold;white-space:nowrap}
 .symbols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:13px}
 .symbol{min-width:0}
@@ -2478,7 +2644,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="bar-name">{{symbol_display(s.symbol, s.exchange)}}</div>
 <div class="bar-track">
 <div class="bar-fill {{'negbar' if avg < 0 else ''}}"
-style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
+style="width:{{(avg|abs / chart_scale * 50) if chart_scale else 0}}%"></div>
 </div>
 <div class="bar-value {{'pos' if avg >= 0 else ''}}">{{'%.2f'|format(avg)}}%</div>
 </a>
@@ -3169,7 +3335,7 @@ def performance_member_charts():
             None,
         )
 
-        chart = _build_member_chart_data(selected, period_key)
+        chart = _build_group_engine_chart_data(selected_category, period_key)
 
         return render_template_string(
             """
@@ -3201,8 +3367,8 @@ h1{margin:0;font-size:32px}.muted{color:#aaa}
 .axis{stroke:#3f3f44;stroke-width:1}.curve{fill:none;stroke:#55e69a;stroke-width:4;stroke-linejoin:round;stroke-linecap:round}
 .bar-row{display:grid;color:#f5f5f5;text-decoration:none;grid-template-columns:110px minmax(100px,1fr) 80px 70px;gap:10px;align-items:center;margin:12px 0}
 .bar-name{font-weight:bold}
-.bar-track{height:18px;border-radius:999px;background:#101012;border:1px solid #2d2d31;overflow:hidden}
-.bar-fill{height:100%;min-width:3px;background:linear-gradient(90deg,#2495c7,#55e69a);border-radius:999px}
+.bar-track{position:relative;height:18px;border-radius:999px;background:#101012;border:1px solid #2d2d31;overflow:hidden}.bar-track:after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:#555;z-index:2}
+.bar-fill{position:absolute;left:50%;top:0;height:100%;min-width:3px;background:linear-gradient(90deg,#2495c7,#55e69a);border-radius:0 999px 999px 0}.bar-fill.red{left:auto;right:50%;background:linear-gradient(90deg,#b33b4b,#ff7878);border-radius:999px 0 0 999px}
 .bar-fill.red{background:linear-gradient(90deg,#a63b4a,#ff7878)}
 .value{text-align:right;font-weight:bold}.count{text-align:right;color:#aaa}
 table{width:100%;border-collapse:collapse;min-width:760px}
@@ -3321,7 +3487,7 @@ href="/performance/member/charts?category={{category.category_key}}&period={{per
 {% for row in chart.symbols %}
 <div class="bar-row">
 <div class="bar-name">{{symbol_display(row.symbol, row.exchange)}}</div>
-<div class="bar-track"><div class="bar-fill {{'red' if row.average_return_pct < 0 else ''}}" style="width:{{(row.average_return_pct|abs / chart.max_symbol_return * 100) if chart.max_symbol_return else 0}}%"></div></div>
+<div class="bar-track"><div class="bar-fill {{'red' if row.average_return_pct < 0 else ''}}" style="width:{{(row.average_return_pct|abs / chart.max_symbol_return * 50) if chart.max_symbol_return else 0}}%"></div></div>
 <div class="value {{'pos' if row.average_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(row.average_return_pct)}}%</div>
 <div class="count">{{row.result_count}}건</div>
 </div>
@@ -3940,14 +4106,14 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <details class="card collapsible-block">
 <summary class="section-title">종목별 수익률 현황</summary>
 <div class="collapsible-content">
-<div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률 기준은 추후 확정</div>
+<div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률은 가장 최근에 완료된 사이클의 평균 수익률입니다.</div>
 <div class="alpha-table">
 <div class="alpha-head"><span>종목</span><span>누적 평균 수익률</span><span>최근 수익률</span><span>완료 사이클</span><span>평균 보유시간</span></div>
 {% for s in admin_symbol_rows %}
 <a class="alpha-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
 <span>{{symbol_display(s.symbol, s.exchange)}}</span>
 <span class="{{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'muted'}}">{% if s.member_stats.average_return_pct is not none %}{{'%.2f'|format(s.member_stats.average_return_pct)}}%{% else %}-{% endif %}</span>
-<span class="muted">기준 보류</span>
+<span class="{{'pos' if s.member_stats.latest_cycle_return_pct is not none and s.member_stats.latest_cycle_return_pct >= 0 else 'neg'}}">{% if s.member_stats.latest_cycle_return_pct is not none %}{{'%.2f'|format(s.member_stats.latest_cycle_return_pct)}}%{% else %}-{% endif %}</span>
 <span>{{s.member_stats.completed_cycle_count}}</span>
 <span>{{format_minutes_compact(s.member_stats.average_holding_minutes)}}</span>
 </a>
