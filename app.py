@@ -2477,11 +2477,11 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="segment-mini"><span>성과 종목</span><b>{{segment.result_symbol_count}}개</b></div>
 <div class="segment-mini"><span>평균 수익률</span><b class="{{'pos' if segment.average_return_pct is not none and segment.average_return_pct >= 0 else ''}}">{% if segment.average_return_pct is not none %}{{'%.2f'|format(segment.average_return_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="segment-mini"><span>승률</span><b>{% if segment.win_rate_pct is not none %}{{'%.1f'|format(segment.win_rate_pct)}}%{% else %}-{% endif %}</b></div>
-<div class="segment-mini"><span>최대 수익률</span><b class="pos">{% if segment.best_return_pct is not none %}{{'%.2f'|format(segment.best_return_pct)}}%{% else %}-{% endif %}</b></div>
+<div class="segment-mini"><span>최고 수익률</span><b class="pos">{% if segment.best_return_pct is not none %}{{'%.2f'|format(segment.best_return_pct)}}%{% else %}-{% endif %}</b></div>
 <div class="segment-mini"><span>평균 보유시간</span><b>{{format_minutes_compact(segment.average_holding_minutes)}}</b></div>
 </div>
 {% if segment.ranking %}
-<div class="segment-top"><b>최대 수익 TOP 5</b>
+<div class="segment-top"><b>최고 수익률 TOP 5</b>
 {% for s in segment.ranking %}
 {% set ss = s[segment.stats_key] %}
 <div class="segment-rank"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><small>{% if ss.best_detail %}매수 {{ss.best_detail.entry_timeframe}} → 종료 {{ss.best_detail.exit_timeframe}}{% endif %}</small><b class="pos">{{'%.2f'|format(ss.best_return_pct)}}%</b></div>
@@ -2578,27 +2578,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </a>
 {% endfor %}
 </div></details>
-{% set life = market_group_stats|selectattr('group_key','equalto','LIFE')|list %}
-<div class="life-hero">
-<h3>★ 인생타점 집중 보기</h3>
-{% if life and life[0].has_results %}
-<p>평균 {{'%.2f'|format(life[0].average_return_pct)}}% · 승률 {{'%.1f'|format(life[0].win_rate_pct)}}% · 평균 보유 {{format_minutes_compact(life[0].average_holding_minutes)}} · 평균 가격 변동폭 {% if life[0].average_signal_adverse_pct is not none %}{{'%.2f'|format(life[0].average_signal_adverse_pct)}}%{% else %}-{% endif %}</p>
-{% else %}<p class="muted">인생타점 완료 사이클이 쌓이면 이곳에 최우선으로 표시됩니다.</p>{% endif %}
-</div>
-{% if market_stats.recent_completed %}
-<details class="chart-section collapsible-block" open>
-<summary class="section-title">최근 완료 5건</summary>
-<div class="recent-grid" style="margin-top:14px">
-{% for detail in market_stats.recent_completed %}
-<a class="recent-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{detail.symbol}}">
-<div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><small>사이클 #{{detail.cycle}}</small></div>
-<div>매수 {{detail.entry_timeframe}} · {{detail.entry_time}}<br>종료 {{detail.exit_timeframe}} · {{detail.exit_time}}</div>
-<div class="{{'pos' if detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(detail.return_pct)}}%</div>
-</a>
-{% endfor %}
-</div>
-</details>
-{% endif %}
+
 <details class="titled-section collapsible-block" open><summary class="section-title">수익률·승률 TOP 5</summary><div class="ranking-wrap" style="margin-top:14px">
 <div class="ranking">
 <h3>평균 수익률 TOP 5</h3>
@@ -2632,6 +2612,61 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </a>
 {% endfor %}
 </div>
+</div>
+</details>
+
+{% if market_stats.recent_completed %}
+<details class="chart-section collapsible-block" open>
+<summary class="section-title">최근 완료 5건</summary>
+<div class="recent-grid" style="margin-top:14px">
+{% for detail in market_stats.recent_completed %}
+<a class="recent-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{detail.symbol}}">
+<div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><small>사이클 #{{detail.cycle}}</small></div>
+<div>매수 {{detail.entry_timeframe}} · {{detail.entry_time}}<br>종료 {{detail.exit_timeframe}} · {{detail.exit_time}}</div>
+<div class="{{'pos' if detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(detail.return_pct)}}%</div>
+</a>
+{% endfor %}
+</div>
+</details>
+{% endif %}
+
+<details class="chart-section">
+<summary class="section-title life-title">
+인생타점 상세 성과
+</summary>
+<div style="margin-top:14px">
+{% set life_ns = namespace(has_any=false) %}
+{% for s in ranked_symbols|sort(attribute='symbol') %}
+{% for group in s.member_stats.entry_groups %}
+{% if group.group_key == 'LIFE' and group.has_results %}
+{% set life_ns.has_any = true %}
+<div class="group-card life" style="margin-bottom:10px">
+<div class="group-title">
+<span>{{symbol_display(s.symbol, s.exchange)}} · 인생타점</span>
+<span class="{{'pos' if group.average_return_pct is not none and group.average_return_pct >= 0 else ''}}">
+평균 {{'%.2f'|format(group.average_return_pct)}}%
+</span>
+</div>
+<div class="tf-row tf-head">
+<span>시간봉</span><span>사이클</span><span>승률</span><span>평균수익</span><span>최고수익</span><span>보유</span>
+</div>
+{% for stat in group.details %}
+<div class="tf-row">
+<span>{{stat.timeframe}}</span>
+<span>{{stat.result_count}}</span>
+<span>{{'%.1f'|format(stat.win_rate_pct)}}%</span>
+<span class="{{'pos' if stat.average_return_pct >= 0 else ''}}">{{'%.2f'|format(stat.average_return_pct)}}%</span>
+<span class="{{'pos' if stat.best_return_pct >= 0 else ''}}">{{'%.2f'|format(stat.best_return_pct)}}%</span>
+<span>{% if stat.average_holding_minutes is not none %}{{format_minutes_compact(stat.average_holding_minutes)}}{% else %}-{% endif %}</span>
+</div>
+{% endfor %}
+</div>
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% if not life_ns.has_any %}
+<div class="notice">선택 기간에는 인생타점 완료 성과가 아직 없습니다.</div>
+{% endif %}
 </div>
 </details>
 
@@ -2672,9 +2707,6 @@ style="width:{{(avg|abs / chart_scale * 50) if chart_scale else 0}}%"></div>
 </div>
 </div>
 </details>
-
-
-
 
 <details class="chart-section">
 <summary class="section-title">
@@ -2718,51 +2750,6 @@ style="width:{{(avg|abs / chart_scale * 50) if chart_scale else 0}}%"></div>
 {% endfor %}
 </div>
 </details>
-{% endfor %}
-</div>
-</details>
-
-<details class="chart-section">
-<summary class="section-title life-title">
-인생타점 상세 성과
-</summary>
-<div style="margin-top:14px">
-{% set life_ns = namespace(has_any=false) %}
-{% for s in ranked_symbols|sort(attribute='symbol') %}
-{% for group in s.member_stats.entry_groups %}
-{% if group.group_key == 'LIFE' and group.has_results %}
-{% set life_ns.has_any = true %}
-<div class="group-card life" style="margin-bottom:10px">
-<div class="group-title">
-<span>{{symbol_display(s.symbol, s.exchange)}} · 인생타점</span>
-<span class="{{'pos' if group.average_return_pct is not none and group.average_return_pct >= 0 else ''}}">
-평균 {{'%.2f'|format(group.average_return_pct)}}%
-</span>
-</div>
-<div class="tf-row tf-head">
-<span>시간봉</span><span>사이클</span><span>승률</span><span>평균수익</span><span>최고수익</span><span>보유</span>
-</div>
-{% for stat in group.details %}
-<div class="tf-row">
-<span>{{stat.timeframe}}</span>
-<span>{{stat.result_count}}</span>
-<span>{{'%.1f'|format(stat.win_rate_pct)}}%</span>
-<span class="{{'pos' if stat.average_return_pct >= 0 else ''}}">{{'%.2f'|format(stat.average_return_pct)}}%</span>
-<span class="{{'pos' if stat.best_return_pct >= 0 else ''}}">{{'%.2f'|format(stat.best_return_pct)}}%</span>
-<span>{% if stat.average_holding_minutes is not none %}{{format_minutes_compact(stat.average_holding_minutes)}}{% else %}-{% endif %}</span>
-</div>
-{% endfor %}
-</div>
-{% endif %}
-{% endfor %}
-{% endfor %}
-{% if not life_ns.has_any %}
-<div class="notice">선택 기간에는 인생타점 완료 성과가 아직 없습니다.</div>
-{% endif %}
-</div>
-</details>
-
-{% endif %}
 
 <details class="chart-section collapsible-block"><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbols">
 {% for s in selected.symbols %}
@@ -2976,7 +2963,7 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 <table>
 <tr>
 <th>매수 시간봉</th><th>최근 매수 시각</th><th>종료 시간봉</th><th>최근 종료 시각</th><th>완료 횟수</th><th>평균 수익률</th>
-<th>최대 수익률</th><th>최저 수익률</th><th>승률</th><th>평균 보유기간</th>
+<th>최고 수익률</th><th>최저 수익률</th><th>승률</th><th>평균 보유기간</th>
 </tr>
 {% for row in data.performance_summary %}
 <tr>
@@ -3034,41 +3021,6 @@ summary{cursor:pointer;font-weight:bold}.trust-summary{display:grid;grid-templat
 {% else %}<p class="muted">완료 사이클이 없습니다.</p>{% endfor %}
 </div>
 
-<div class="card">
-<h2>실제 신호 가격 차트</h2>
-<p class="muted">매수가와 각 종료 시간봉 가격을 표시하며, 캔들 데이터가 없는 과거 구간은 중간 과정을 생략합니다.</p>
-{% for position in data.positions|reverse %}
-{% if position.cycle_closed and position.exit_results %}
-<details>
-<summary>사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입</summary>
-{{price_path_svg(position)|safe}}
-</details>
-{% endif %}
-{% else %}<p class="muted">완료 사이클이 아직 없습니다.</p>{% endfor %}
-</div>
-
-<div class="card">
-<h2>실제 매수·종료 시각</h2>
-{% for position in data.positions|reverse %}
-<details>
-<summary>최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입 · 평균가 {{position.entry_price}}</summary>
-<p><b>실제 매수 구성:</b> {{position.entry_source_summary}}<br>
-첫 매수: {{position.entry_first_time}}<br>
-마지막 진입: {{position.entry_last_time}}</p>
-<div class="scroll"><table>
-<tr><th>종료 시간봉</th><th>종료 시각</th><th>매도가</th><th>보유기간</th><th>수익률</th></tr>
-{% for exit in position.exit_results %}
-<tr><td>{{exit.exit_timeframe}}</td><td>{{exit.exit_time}}</td><td>{{exit.exit_price}}</td>
-<td>{{exit.holding_text}}</td><td class="{{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(exit.return_pct)}}%</td></tr>
-{% else %}
-<tr><td colspan="5" class="muted">아직 유효한 종료 신호가 없습니다.</td></tr>
-{% endfor %}
-</table></div>
-</details>
-{% else %}
-<p class="muted">생성된 진입 포지션이 없습니다.</p>
-{% endfor %}
-</div>
 </body>
 </html>
 """, data=data, category=category, member_stats=member_stats), 200
@@ -4022,8 +3974,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="metric"><div class="title">평균 수익률</div><div class="value {{'pos' if market_stats.average_return_pct is not none and market_stats.average_return_pct >= 0 else 'muted'}}">{% if market_stats.average_return_pct is not none %}{{'%.2f'|format(market_stats.average_return_pct)}}%{% else %}-{% endif %}</div><div class="small">{{market_stats.result_symbol_count}}개 종목의 완료 사이클 평균</div></div>
 <a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.best_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.best_detail.symbol}}&period={{period_key}}{% else %}#{% endif %}"><div class="title">최고 수익률</div><div class="value pos">{% if market_stats.best_return_pct is not none %}{{'%.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.best_detail %}<div class="small">{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}}<br>매수 {{market_stats.best_detail.entry_timeframe}} · {{market_stats.best_detail.entry_time}}<br>종료 {{market_stats.best_detail.exit_timeframe}} · {{market_stats.best_detail.exit_time}}</div>{% endif %}</a>
 <a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.worst_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.worst_detail.symbol}}&period={{period_key}}{% else %}#{% endif %}"><div class="title">최저 수익률</div><div class="value {{'pos' if market_stats.worst_return_pct is not none and market_stats.worst_return_pct >= 0 else 'neg'}}">{% if market_stats.worst_return_pct is not none %}{{'%.2f'|format(market_stats.worst_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.worst_detail %}<div class="small">{{symbol_display(market_stats.worst_detail.symbol, market_stats.worst_detail.exchange)}}<br>매수 {{market_stats.worst_detail.entry_timeframe}} · {{market_stats.worst_detail.entry_time}}<br>종료 {{market_stats.worst_detail.exit_timeframe}} · {{market_stats.worst_detail.exit_time}}</div>{% endif %}</a>
-<div class="metric"><div class="title">평균 보유시간</div><div class="value">{% if market_stats.average_holding_minutes is not none %}{{format_minutes_compact(market_stats.average_holding_minutes)}}{% else %}-{% endif %}</div></div>
 <div class="metric"><div class="title">승률</div><div class="value {{'pos' if market_stats.win_rate_pct is not none and market_stats.win_rate_pct >= 50 else 'neg'}}">{% if market_stats.win_rate_pct is not none %}{{'%.1f'|format(market_stats.win_rate_pct)}}%{% else %}-{% endif %}</div></div>
+<div class="metric"><div class="title">평균 보유시간</div><div class="value">{% if market_stats.average_holding_minutes is not none %}{{format_minutes_compact(market_stats.average_holding_minutes)}}{% else %}-{% endif %}</div></div>
 </div>
 
 <details class="card collapsible-block" open><summary class="section-title">포지션별 성과</summary><div class="grid position-grid" style="margin-top:14px">
@@ -4049,42 +4001,6 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endfor %}
 </div></details>
 
-{% if market_stats.recent_completed %}
-<details class="card collapsible-block" open><summary class="section-title">최근 완료 5건</summary><div style="margin-top:14px">
-{% for detail in market_stats.recent_completed %}
-<a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/dashboard?category={{selected_category}}&symbol={{detail.symbol}}&period={{period_key}}">
-<div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><div class="small">사이클 #{{detail.cycle}}</div></div>
-<div class="small">매수 {{detail.entry_timeframe}} · {{detail.entry_time}}<br>종료 {{detail.exit_timeframe}} · {{detail.exit_time}}</div>
-<div class="{{'pos' if detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(detail.return_pct)}}%</div>
-</a>
-{% endfor %}
-</div></details>
-{% endif %}
-
-
-<details class="card collapsible-block" open>
-<summary class="section-title">매수·종료 시간봉별 상세 성과</summary>
-<div class="collapsible-content">
-{% for s in selected.symbols|sort(attribute='symbol') %}
-{% if s.member_stats.has_results %}
-<details class="detail-symbol"><summary>{{symbol_display(s.symbol, s.exchange)}}</summary>
-<div class="grid position-grid">
-{% for group in s.member_stats.entry_groups %}
-<div class="metric"><div class="title">{{group.group_label}}</div>
-{% if group.details %}{% for stat in group.details %}<div class="detail-line"><span>매수 {{stat.timeframe}}</span><span>{{stat.result_count}}건</span><b class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">평균 {{'%.2f'|format(stat.average_return_pct)}}%</b><span>보유 {{format_minutes_compact(stat.average_holding_minutes)}}</span></div>{% endfor %}{% else %}<div class="muted">결과 대기</div>{% endif %}
-</div>{% endfor %}
-</div></details>
-{% endif %}{% endfor %}
-</div></details>
-
-<details class="card collapsible-block life-block" open>
-<summary class="section-title life-title">인생타점 상세 성과</summary>
-<div class="collapsible-content">
-{% set life_ns = namespace(has_any=false) %}
-{% for s in selected.symbols|sort(attribute='symbol') %}{% for group in s.member_stats.entry_groups %}{% if group.group_key == 'LIFE' and group.details %}{% set life_ns.has_any = true %}<div class="metric"><div class="title">{{symbol_display(s.symbol, s.exchange)}} · 인생타점</div>{% for stat in group.details %}<div class="detail-line"><span>매수 {{stat.timeframe}}</span><span>{{stat.result_count}}건</span><b class="pos">평균 {{'%.2f'|format(stat.average_return_pct)}}%</b><span>보유 {{format_minutes_compact(stat.average_holding_minutes)}}</span></div>{% endfor %}</div>{% endif %}{% endfor %}{% endfor %}
-{% if not life_ns.has_any %}<div class="muted">완료 결과 없음</div>{% endif %}
-</div></details>
-
 {% if admin_average_ranking or admin_best_ranking or admin_win_rate_ranking %}
 <details class="card collapsible-block" open><summary class="section-title">수익률·승률 TOP 5</summary>
 <div class="ranking-grid" style="margin-top:14px">
@@ -4103,25 +4019,56 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 {% endif %}
 
+{% if market_stats.recent_completed %}
+<details class="card collapsible-block" open><summary class="section-title">최근 완료 5건</summary><div style="margin-top:14px">
+{% for detail in market_stats.recent_completed %}
+<a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/dashboard?category={{selected_category}}&symbol={{detail.symbol}}&period={{period_key}}">
+<div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><div class="small">사이클 #{{detail.cycle}}</div></div>
+<div class="small">매수 {{detail.entry_timeframe}} · {{detail.entry_time}}<br>종료 {{detail.exit_timeframe}} · {{detail.exit_time}}</div>
+<div class="{{'pos' if detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(detail.return_pct)}}%</div>
+</a>
+{% endfor %}
+</div></details>
+{% endif %}
+
+<details class="card collapsible-block life-block" open>
+<summary class="section-title life-title">인생타점 상세 성과</summary>
+<div class="collapsible-content">
+{% set life_ns = namespace(has_any=false) %}
+{% for s in selected.symbols|sort(attribute='symbol') %}{% for group in s.member_stats.entry_groups %}{% if group.group_key == 'LIFE' and group.details %}{% set life_ns.has_any = true %}<div class="metric"><div class="title">{{symbol_display(s.symbol, s.exchange)}} · 인생타점</div>{% for stat in group.details %}<div class="detail-line"><span>매수 {{stat.timeframe}}</span><span>{{stat.result_count}}건</span><b class="pos">평균 {{'%.2f'|format(stat.average_return_pct)}}%</b><span>보유 {{format_minutes_compact(stat.average_holding_minutes)}}</span></div>{% endfor %}</div>{% endif %}{% endfor %}{% endfor %}
+{% if not life_ns.has_any %}<div class="muted">완료 결과 없음</div>{% endif %}
+</div></details>
+
 <details class="card collapsible-block">
 <summary class="section-title">종목별 수익률 현황</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률은 가장 최근에 완료된 사이클의 평균 수익률입니다.</div>
 <div class="alpha-table">
-<div class="alpha-head"><span>종목</span><span>누적 평균 수익률</span><span>최근 수익률</span><span>완료 사이클</span><span>평균 보유시간</span></div>
+<div class="alpha-head"><span>종목</span><span>누적 평균 수익률</span><span>최근 수익률</span><span>완료 사이클</span><span>승률</span></div>
 {% for s in admin_symbol_rows %}
 <a class="alpha-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
 <span>{{symbol_display(s.symbol, s.exchange)}}</span>
 <span class="{{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'muted'}}">{% if s.member_stats.average_return_pct is not none %}{{'%.2f'|format(s.member_stats.average_return_pct)}}%{% else %}-{% endif %}</span>
 <span class="{{'pos' if s.member_stats.latest_cycle_return_pct is not none and s.member_stats.latest_cycle_return_pct >= 0 else 'neg'}}">{% if s.member_stats.latest_cycle_return_pct is not none %}{{'%.2f'|format(s.member_stats.latest_cycle_return_pct)}}%{% else %}-{% endif %}</span>
 <span>{{s.member_stats.completed_cycle_count}}</span>
-<span>{{format_minutes_compact(s.member_stats.average_holding_minutes)}}</span>
+<span>{% if s.member_stats.win_rate_pct is not none %}{{'%.1f'|format(s.member_stats.win_rate_pct)}}%{% else %}-{% endif %}</span>
 </a>
 {% endfor %}
 </div></div>
 </div></details>
-{% endif %}
 
+<details class="card collapsible-block" open>
+<summary class="section-title">매수·종료 시간봉별 상세 성과</summary>
+<div class="collapsible-content">
+{% for s in selected.symbols|sort(attribute='symbol') %}
+{% if s.member_stats.has_results %}
+<details class="detail-symbol"><summary>{{symbol_display(s.symbol, s.exchange)}}</summary>
+<div class="grid position-grid">
+{% for group in s.member_stats.entry_groups %}
+<div class="metric"><div class="title">{{group.group_label}}</div>
+{% if group.details %}{% for stat in group.details %}<div class="detail-line"><span>매수 {{stat.timeframe}}</span><span>{{stat.result_count}}건</span><b class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">평균 {{'%.2f'|format(stat.average_return_pct)}}%</b><span>보유 {{format_minutes_compact(stat.average_holding_minutes)}}</span></div>{% endfor %}{% else %}<div class="muted">결과 대기</div>{% endif %}
+</div>{% endfor %}
+</div></details>
 {% if selected.symbol_count == 0 %}
 <div class="card"><div class="empty-note">
 현재 저장된 {{selected.category_label}} 신호가 없습니다.
@@ -4192,30 +4139,14 @@ class="{{'active-category' if category.category_key == selected_category else ''
 
 {% if s.performance_summary.has_results %}
 <div class="grid">
-<div class="metric">
-<div class="title">종목 승률</div>
-<div class="value {{'pos' if s.member_stats.win_rate_pct >= 50 else 'neg'}}">
-{{'%.1f'|format(s.member_stats.win_rate_pct)}}%
+<div class="metric"><div class="title">완료 사이클</div><div class="value">{{s.member_stats.completed_cycle_count}}회</div></div>
+<div class="metric"><div class="title">평균 수익률</div><div class="value {{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'neg'}}">{% if s.member_stats.average_return_pct is not none %}{{'%.2f'|format(s.member_stats.average_return_pct)}}%{% else %}-{% endif %}</div></div>
+<div class="metric"><div class="title">최고 수익률</div><div class="value pos">{% if s.member_stats.best_return_pct is not none %}{{'%.2f'|format(s.member_stats.best_return_pct)}}%{% else %}-{% endif %}</div>{% if s.member_stats.best_detail %}<div class="small">매수 {{s.member_stats.best_detail.entry_timeframe}} · {{s.member_stats.best_detail.entry_time}}<br>종료 {{s.member_stats.best_detail.exit_timeframe}} · {{s.member_stats.best_detail.exit_time}}</div>{% endif %}</div>
+<div class="metric"><div class="title">최저 수익률</div><div class="value {{'pos' if s.member_stats.worst_return_pct is not none and s.member_stats.worst_return_pct >= 0 else 'neg'}}">{% if s.member_stats.worst_return_pct is not none %}{{'%.2f'|format(s.member_stats.worst_return_pct)}}%{% else %}-{% endif %}</div>{% if s.member_stats.worst_detail %}<div class="small">매수 {{s.member_stats.worst_detail.entry_timeframe}} · {{s.member_stats.worst_detail.entry_time}}<br>종료 {{s.member_stats.worst_detail.exit_timeframe}} · {{s.member_stats.worst_detail.exit_time}}</div>{% endif %}</div>
 </div>
-<div class="small">승 {{s.member_stats.win_count}} · 패 {{s.member_stats.loss_count}}</div>
-</div>
-<div class="metric">
-<div class="title">최대 / 최저 수익률</div>
-<div class="value">
-<span class="pos">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</span>
-<span class="small"> / </span>
-<span class="{{'pos' if s.performance_summary.worst_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.worst_return_pct)}}%</span>
-</div>
-</div>
-<div class="metric">
-<div class="title">완료 사이클</div>
-<div class="value">{{s.member_stats.completed_cycle_count}}회</div>
-</div>
-</div>
-
 
 <details open>
-<summary>매수 · 종료 시간봉별 완료 성과</summary>
+<summary>매수 · 종료 시간봉별 상세 성과</summary>
 <div class="analysis-note">
 관리자 설정의 분할 매수 최대 횟수로 평균 매수가를 계산합니다.
 최초 유효 매도 신호로 사이클이 종료되며, 다음 매수 신호부터 새 사이클로 계산합니다.
@@ -4223,7 +4154,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 {% if entry_exit_matrix.has_results %}
 <table>
-<tr><th>매수 시간봉</th><th>최근 매수 시각</th><th>종료 시간봉</th><th>최근 종료 시각</th><th>완료 횟수</th><th>평균 수익률</th><th>최대 수익률</th><th>최저 수익률</th><th>승률</th><th>평균 보유시간</th></tr>
+<tr><th>매수 시간봉</th><th>최근 매수 시각</th><th>종료 시간봉</th><th>최근 종료 시각</th><th>완료 횟수</th><th>평균 수익률</th><th>최고 수익률</th><th>최저 수익률</th><th>승률</th><th>평균 보유시간</th></tr>
 {% for stat in entry_exit_matrix.rows %}
 <tr>
 <td>{{stat.entry_timeframe}}</td><td>{{stat.latest_entry_time or '-'}}</td><td>{{stat.exit_timeframe}}</td><td>{{stat.latest_exit_time or '-'}}</td><td>{{stat.trade_count}}회</td>
@@ -4237,184 +4168,16 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% else %}<div class="empty-note">완료된 사이클이 아직 없습니다.</div>{% endif %}
 </details>
 
-<details>
-<summary>실제 사이클별 매수·종료 가격 차트</summary>
-{% for position in s.group_analysis.positions|reverse %}
-{% if position.cycle_closed and position.exit_results %}
 <div class="card">
-<div class="small">사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · 평균 매수가 {{position.entry_price}}</div>
-{{price_path_svg(position)|safe}}
+<h2>타점 발생 주기</h2>
+<p class="small">발생 상태는 최근 N회 또는 누적 평균 간격 대비 마지막 발생 후 경과시간을 비교한 참고값이며, 다음 신호를 보장하지 않습니다.</p>
+<div style="overflow-x:auto"><table><tr><th>그룹</th><th>시간봉</th><th>누적 발생</th><th>누적 평균</th><th>최근 평균</th><th>최단</th><th>최장</th><th>마지막 발생 후</th><th>현재 상태</th></tr>
+{% for row in s.group_analysis.occurrence_stats %}<tr><td>{{row.group_label}}</td><td>{{row.timeframe}}</td><td>{{row.occurrence_count}}회</td><td>{{row.overall_average_text}}</td><td>{{row.recent_average_text}}</td><td>{{row.minimum_text}}</td><td>{{row.maximum_text}}</td><td>{{row.elapsed_text}}</td><td>{{row.readiness_label}}</td></tr>{% else %}<tr><td colspan="9" class="small">발생 주기 데이터가 아직 없습니다.</td></tr>{% endfor %}</table></div>
 </div>
-{% endif %}
-{% else %}<div class="empty-note">표시할 완료 사이클이 없습니다.</div>{% endfor %}
-</details>
-
-{% if s.open_cycle_preview %}
-<div class="mode-title">현재 진행 중인 매수 진행 구간</div>
-<div class="grid">
-<div class="metric">
-<div class="title">최대시간봉 매수 후보</div>
-<div class="value">{{s.open_cycle_preview.max_timeframe_entry.timeframe}} · {{s.open_cycle_preview.max_timeframe_entry.price}}</div>
-<div class="small">{{s.open_cycle_preview.max_timeframe_entry.signal_no}}</div>
+<div class="card">
+<h2>사이클별 체감 흐름</h2><p class="small">매수 → 최대 손절폭 → 종료 시간봉별 결과를 한눈에 비교합니다.</p>
+{% for position in s.group_analysis.positions|reverse %}{% if position.cycle_closed and position.exit_results %}<details><summary>사이클 #{{position.position_sequence}} · 최초 {{position.entry_timeframe}} · {{position.entry_count}}회 진입</summary><div class="grid">{% for entry in position.entry_points %}<div class="metric"><div class="title">진입 {{loop.index}} · {{entry.timeframe}}</div><div class="value">{{entry.price}}</div><div class="small">{{entry.time}}</div></div>{% endfor %}<div class="metric"><div class="title">최대 손절폭</div><div class="value neg">{{'%.2f'|format(position.signal_adverse_pct)}}%</div><div class="small">LOW 신호 가격 기준</div></div>{% for exit in position.exit_results %}<div class="metric"><div class="title">{{exit.exit_timeframe}} 종료</div><div class="value {{'pos' if exit.return_pct >= 0 else 'neg'}}">{{'%.2f'|format(exit.return_pct)}}%</div><div class="small">{{exit.holding_text}} · 수익 전환까지 {{exit.recovery_text}}</div></div>{% endfor %}</div></details>{% endif %}{% else %}<div class="empty-note">완료 사이클이 없습니다.</div>{% endfor %}
 </div>
-<div class="metric">
-<div class="title">전체 분할매수 평균가</div>
-<div class="value">{{s.open_cycle_preview.all_split_average_price}}</div>
-<div class="small">총 {{s.open_cycle_preview.entry_count}}회 분할</div>
-</div>
-<div class="metric">
-<div class="title">수익률 · 보유시간</div>
-<div class="value warn">종료 고점 대기</div>
-<div class="small">고점 신호가 발생하면 자동 계산</div>
-</div>
-</div>
-
-<details>
-<summary>시간봉별 분할매수 평균가</summary>
-<table>
-<tr><th>시간봉</th><th>매수 횟수</th><th>평균 매수가</th><th>마지막 매수 시각</th></tr>
-{% for tf in s.open_cycle_preview.timeframe_splits %}
-<tr>
-<td>{{tf.timeframe}}</td>
-<td>{{tf.entry_count}}</td>
-<td>{{tf.average_entry_price}}</td>
-<td>{{tf.last_entry_time}}</td>
-</tr>
-{% endfor %}
-</table>
-</details>
-
-<details>
-<summary>개별 매수 {{s.open_cycle_preview.entry_count}}건</summary>
-<table>
-<tr><th>신호번호</th><th>시간봉</th><th>가격</th><th>시각</th></tr>
-{% for e in s.open_cycle_preview.individual_entries %}
-<tr><td>{{e.signal_no}}</td><td>{{e.timeframe}}</td><td>{{e.price}}</td><td>{{e.time}}</td></tr>
-{% endfor %}
-</table>
-</details>
-{% endif %}
-
-{% for c in s.completed_cycles %}
-<details>
-<summary>완료 사이클 {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 종료후보 {{c.exit_count}}회</summary>
-
-<div class="grid">
-<div class="metric">
-<div class="title">최대시간봉 진입</div>
-<div class="value">{{c.entry_preview.max_timeframe_entry.timeframe}} · {{c.entry_preview.max_timeframe_entry.price}}</div>
-</div>
-<div class="metric">
-<div class="title">전체 분할매수 평균가</div>
-<div class="value">{{c.entry_preview.all_split_average_price}}</div>
-<div class="small">{{c.entry_preview.entry_count}}회 분할</div>
-</div>
-<div class="metric">
-<div class="title">매도 후보</div>
-<div class="value">{{c.exit_count}}건</div>
-</div>
-</div>
-
-<div class="mode-title">매도 후보별 진입 방식 비교</div>
-<div style="overflow-x:auto">
-<table>
-<tr>
-<th>종료 시간봉</th>
-<th>매도가</th>
-<th>TF 관계</th>
-<th>최대TF</th>
-<th>전체분할</th>
-<th>시간봉별 분할</th>
-<th>개별 평균</th>
-<th>개별 최고</th>
-<th>개별 최저</th>
-<th>평균 보유</th>
-</tr>
-{% for r in c.exit_results %}
-<tr>
-<td>{{r.exit.timeframe}}</td>
-<td>{{r.exit.price}}</td>
-<td>{{r.relation_to_max_entry}}</td>
-<td class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">
-{{'%.3f'|format(r.max_timeframe_return_pct)}}%
-</td>
-<td class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">
-{{'%.3f'|format(r.all_split_return_pct)}}%
-</td>
-<td>
-{% for tf in r.timeframe_split_results %}
-<div>
-<span class="blue">{{tf.timeframe}}</span>
-<span class="{{'pos' if tf.return_pct >= 0 else 'neg'}}">
-{{'%.3f'|format(tf.return_pct)}}%
-</span>
-</div>
-{% endfor %}
-</td>
-<td class="{{'pos' if r.individual_summary.average_return_pct >= 0 else 'neg'}}">
-{{'%.3f'|format(r.individual_summary.average_return_pct)}}%
-</td>
-<td class="{{'pos' if r.individual_summary.maximum_return_pct >= 0 else 'neg'}}">
-{{'%.3f'|format(r.individual_summary.maximum_return_pct)}}%
-</td>
-<td class="{{'pos' if r.individual_summary.minimum_return_pct >= 0 else 'neg'}}">
-{{'%.3f'|format(r.individual_summary.minimum_return_pct)}}%
-</td>
-<td>{{'%.0f'|format(r.individual_summary.average_holding_minutes)}}분</td>
-</tr>
-{% endfor %}
-</table>
-</div>
-
-{% for r in c.exit_results %}
-<details>
-<summary>
-상세 보기 · 종료 {{r.exit.timeframe}} · {{r.exit.price}} ·
-최대TF <span class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</span> ·
-전체분할 <span class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%</span>
-</summary>
-
-<table>
-<tr><th>종료 신호</th><th>종료 관계</th><th>최대TF 수익률</th><th>최대TF 보유</th><th>전체분할 수익률</th><th>전체분할 보유</th></tr>
-<tr>
-<td>{{r.exit.signal_no}} / {{r.exit.timeframe}} / {{r.exit.price}}</td>
-<td>{{r.relation_to_max_entry}}</td>
-<td class="{{'pos' if r.max_timeframe_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.max_timeframe_return_pct)}}%</td>
-<td>{{r.max_timeframe_holding_minutes}}분</td>
-<td class="{{'pos' if r.all_split_return_pct >= 0 else 'neg'}}">{{'%.3f'|format(r.all_split_return_pct)}}%</td>
-<td>{{r.all_split_holding_minutes}}분</td>
-</tr>
-</table>
-
-<div class="mode-title">시간봉별 분할진입 결과</div>
-<table>
-<tr><th>시간봉</th><th>매수 횟수</th><th>평균가</th><th>수익률</th><th>보유시간</th></tr>
-{% for tf in r.timeframe_split_results %}
-<tr>
-<td>{{tf.timeframe}}</td><td>{{tf.entry_count}}</td><td>{{tf.average_entry_price}}</td>
-<td class="{{'pos' if tf.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(tf.return_pct)}}%</td>
-<td>{{tf.holding_minutes}}분</td>
-</tr>
-{% endfor %}
-</table>
-
-<details>
-<summary>각 개별 매수 결과 {{r.individual_results|length}}건</summary>
-<table>
-<tr><th>진입 신호</th><th>시간봉</th><th>매수가</th><th>수익률</th><th>보유시간</th></tr>
-{% for item in r.individual_results %}
-<tr>
-<td>{{item.entry.signal_no}}</td><td>{{item.entry.timeframe}}</td><td>{{item.entry.price}}</td>
-<td class="{{'pos' if item.return_pct >= 0 else 'neg'}}">{{'%.3f'|format(item.return_pct)}}%</td>
-<td>{{item.holding_minutes}}분</td>
-</tr>
-{% endfor %}
-</table>
-</details>
-</details>
-{% endfor %}
-</details>
-{% endfor %}
 
 {% if s.high_only %}
 <details>
