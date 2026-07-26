@@ -363,6 +363,40 @@ def _chart_interval(entry_group: str) -> int:
 def _telegram_send_allowed(market: str, exit_group: str) -> bool:
     return exit_group in {"SWING", "LONG", "LIFE"}
 
+def _draw_signal_flow_fallback(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    entry_points: list[dict[str, Any]],
+    exit_price: float,
+) -> None:
+    """캔들이 없을 때 실제 매수·종료 신호 가격 흐름을 표시한다."""
+    left, top, right, bottom = box
+    values = []
+    for item in entry_points or []:
+        try:
+            values.append(float(item.get("price")))
+        except (TypeError, ValueError):
+            pass
+    values.append(float(exit_price))
+    low, high = min(values), max(values)
+    span = max(high - low, abs(high) * 0.001, 1e-9)
+    count = max(2, len(values))
+    coords = []
+    for index, value in enumerate(values):
+        x = left + 40 + (right - left - 80) * index / (count - 1)
+        y = bottom - 50 - (bottom - top - 100) * (value - low) / span
+        coords.append((x, y))
+    if len(coords) > 1:
+        draw.line(coords, fill="#54e39a", width=5)
+    for index, (x, y) in enumerate(coords):
+        is_exit = index == len(coords) - 1
+        color = "#54e39a" if is_exit else "#ffc857"
+        r = 9 if is_exit else 7
+        draw.ellipse((x-r, y-r, x+r, y+r), fill=color)
+        draw.text((x-25, y+15), "종료" if is_exit else f"매수 {index+1}", font=_font(17, True), fill=color)
+    draw.text((left+18, top+12), "과거 캔들 없음 · 실제 매수/종료 신호 가격 흐름", font=_font(20, True), fill="#a5a6ad")
+
+
 def render_exit_image(
     market: str,
     symbol: str,
@@ -423,10 +457,17 @@ def render_exit_image(
 
     _rounded(draw, (45, 900, 1035, 1530))
     draw.text((75, 930), f"TradingView 확정 {interval}분봉 압축 차트", font=_font(29, True), fill=white)
-    _draw_candle_chart(
-        draw, (85, 1000, 995, 1470), candles,
-        float(position["entry_price"]), position.get("entry_points") or [], float(result["exit_price"]),
-    )
+    if candles:
+        _draw_candle_chart(
+            draw, (85, 1000, 995, 1470), candles,
+            float(position["entry_price"]), position.get("entry_points") or [], float(result["exit_price"]),
+        )
+    else:
+        _draw_signal_flow_fallback(
+            draw, (85, 1000, 995, 1470),
+            position.get("entry_points") or [],
+            float(result["exit_price"]),
+        )
     draw.text((60, 1595), "※ TradingView 확정 OHLC/신호 가격 기준이며 수수료·슬리피지는 포함하지 않습니다.", font=_font(19), fill=muted)
     return _png_bytes(image)
 
@@ -476,10 +517,18 @@ def render_cycle_summary_image(
     _rounded(draw, (45, 520, 1035, 1020), fill="#111216")
     draw.text((70, 545), f"TradingView 확정 {interval}분봉 압축 차트", font=_font(27, True), fill=white)
     final_exit = float(results[-1]["exit_price"]) if results else float(position["entry_price"])
-    low = _draw_candle_chart(
-        draw, (80, 610, 1000, 975), candles, float(position["entry_price"]),
-        position.get("entry_points") or [], final_exit,
-    )
+    if candles:
+        low = _draw_candle_chart(
+            draw, (80, 610, 1000, 975), candles, float(position["entry_price"]),
+            position.get("entry_points") or [], final_exit,
+        )
+    else:
+        _draw_signal_flow_fallback(
+            draw, (80, 610, 1000, 975),
+            position.get("entry_points") or [],
+            final_exit,
+        )
+        low = None
     adverse = ((low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if low is not None else None
 
     draw.text((60, 1060), "시간봉별 종료 결과", font=_font(32, True), fill=white)

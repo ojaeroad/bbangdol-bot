@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort, Response
 import requests
 
-# 회원 운영용 성과 분석 DB (기존 텔레그램/자동매매와 독립)
+# 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
     queue_signal_save, queue_candle_save, health_summary, latest_signals,
     record_page_visit, page_visit_summary,
@@ -307,7 +307,7 @@ def health():
 def routes_dump():
     return jsonify({"routes": ROUTE_TO_CHAT})
 
-# --- 회원 운영용 성과 분석 DB 상태 (민감정보는 노출하지 않음) ---
+# --- 관리자 성과 분석 DB 상태 (민감정보는 노출하지 않음) ---
 
 
 # =========================================================
@@ -783,13 +783,22 @@ def _aggregate_segment_stats(items, stats_key):
 
 
 def _format_minutes_compact(value):
-    if value is None: return "-"
-    total=max(0,int(round(float(value)))); d,rem=divmod(total,1440); h,m=divmod(rem,60)
-    parts=[]
-    if d: parts.append(f"{d}일")
-    if h: parts.append(f"{h}시간")
-    if m or not parts: parts.append(f"{m}분")
-    return " ".join(parts)
+    """사람이 바로 이해할 수 있는 보유기간 형식."""
+    if value is None:
+        return "-"
+    total = max(0, int(round(float(value))))
+    days, remainder = divmod(total, 1440)
+    hours, minutes = divmod(remainder, 60)
+    if days:
+        if minutes >= 30:
+            hours += 1
+            if hours >= 24:
+                days += 1
+                hours = 0
+        return f"{days}일 {hours}시간" if hours else f"{days}일"
+    if hours:
+        return f"{hours}시간 {minutes}분" if minutes else f"{hours}시간"
+    return f"{minutes}분"
 
 
 def _aggregate_market_group_stats(ranked_symbols, category_key):
@@ -2147,8 +2156,8 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 <body>
 <div class="header">
 <div>
-<h1>회원용 성과 리포트</h1>
-<div class="muted">공개용 요약 화면</div>
+<h1>회원 성과 분석</h1>
+<div class="muted">종목별 타점 성과 현황</div>
 <div class="visitor-line">
 <span class="visitor-pill">누적 방문 {{visit_stats.total_views}}</span>
 <span class="visitor-pill">오늘 방문 {{visit_stats.today_views}}</span>
@@ -2271,7 +2280,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="title">평균 보유시간</div>
 <div class="value">
 {% if market_stats.average_holding_minutes is not none %}
-{{'%.0f'|format(market_stats.average_holding_minutes)}}분
+{{format_minutes_compact(market_stats.average_holding_minutes)}}
 {% else %}결과 대기{% endif %}
 </div>
 </div>
@@ -2288,7 +2297,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% if group.has_results %}
 <div class="trust-pair">
 <div><small>누적 평균 수익률</small><b>{{'%.2f'|format(group.average_return_pct)}}%</b></div>
-<div><small>최근 5사이클 최고수익 평균</small><b>{% if group.recent5_max_average_pct is not none %}{{'%.2f'|format(group.recent5_max_average_pct)}}%{% else %}-{% endif %}</b></div>
+<div><small>최근 5사이클 최고 수익률 평균</small><b>{% if group.recent5_max_average_pct is not none %}{{'%.2f'|format(group.recent5_max_average_pct)}}%{% else %}-{% endif %}</b></div>
 </div>
 {% if group.best_detail %}
 <div class="trust-preview">
@@ -2328,7 +2337,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% endif %}
 <div class="ranking-wrap">
 <div class="ranking">
-<h3>평균수익률 TOP 5</h3>
+<h3>평균 수익률 TOP 5</h3>
 {% for s in average_ranking %}
 <a class="rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <span class="rank-no">{{loop.index}}</span>
@@ -2339,7 +2348,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 
 <div class="ranking">
-<h3>최고수익률 TOP 5</h3>
+<h3>최고 수익률 TOP 5</h3>
 {% for s in best_ranking %}
 <a class="rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <span class="rank-no">{{loop.index}}</span>
@@ -2362,7 +2371,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 
 <div class="chart-section">
-<h3>종목별 평균수익률 비교</h3>
+<h3>종목별 수익률 현황</h3>
 {% for s in ranked_symbols|sort(attribute='symbol') %}
 {% set avg = s.member_stats.average_return_pct %}
 <a class="bar-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
@@ -2390,32 +2399,12 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 </div>
 </details>
 
-<a class="chart-section promo-preview-link"
-   href="/performance/member/image-preview?category={{selected_category}}&period={{period_key}}"
-   style="display:block;text-decoration:none;color:#fff;border-color:#6f5a20;background:linear-gradient(145deg,#211c0e,#171719)">
-<div style="display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap">
-<div>
-<div style="color:var(--yellow);font-size:15px;font-weight:bold">홍보 이미지 자동 생성 미리보기</div>
-<div style="font-size:25px;font-weight:bold;margin-top:7px">결과로 증명하는 타점 알람</div>
-<div class="muted" style="margin-top:7px">현재 수익률·승률·보유기간이 들어간 이미지형 화면을 바로 확인합니다.</div>
-</div>
-<div style="font-size:42px;font-weight:900;color:var(--green)">
-{% if market_stats.best_return_pct is not none %}+{{'%.2f'|format(market_stats.best_return_pct)}}%{% else %}미리보기{% endif %}
-</div>
-</div>
-<div style="margin-top:16px;height:90px;border-radius:12px;background:linear-gradient(165deg,transparent 44%,rgba(86,230,155,.30) 45%,rgba(86,230,155,.30) 49%,transparent 50%),#111113;position:relative;overflow:hidden">
-<div style="position:absolute;left:10%;top:63%;width:12px;height:12px;border-radius:50%;background:#ffd24d"></div>
-<div style="position:absolute;left:35%;top:50%;width:12px;height:12px;border-radius:50%;background:#ffd24d"></div>
-<div style="position:absolute;left:60%;top:36%;width:12px;height:12px;border-radius:50%;background:#ffd24d"></div>
-<div style="position:absolute;right:10%;top:18%;width:14px;height:14px;border-radius:50%;background:#56e69b"></div>
-</div>
-<div style="margin-top:10px;color:var(--blue);font-weight:bold">클릭해서 전체 이미지 디자인 보기 →</div>
-</a>
+
 
 
 <details class="chart-section">
 <summary style="cursor:pointer;font-size:20px;font-weight:bold;color:var(--blue)">
-포지션별·세부 시간봉별 수익률 보기
+매수·종료 시간봉별 상세 성과
 </summary>
 <div style="margin-top:14px">
 {% for s in ranked_symbols|sort(attribute='symbol') %}
@@ -2461,7 +2450,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 
 <details class="chart-section">
 <summary style="cursor:pointer;font-size:20px;font-weight:bold;color:var(--yellow)">
-인생타점 성과만 별도로 보기
+인생타점 상세 성과
 </summary>
 <div style="margin-top:14px">
 {% set life_ns = namespace(has_any=false) %}
@@ -2516,7 +2505,7 @@ style="width:{{(avg|abs / chart_scale * 100) if chart_scale else 0}}%"></div>
 {% if s.member_stats.win_rate_pct is not none %}{{'%.1f'|format(s.member_stats.win_rate_pct)}}%{% else %}대기{% endif %}
 </b></div>
 <div class="mini"><span>평균 보유</span><b>
-{% if s.member_stats.average_holding_minutes is not none %}{{'%.0f'|format(s.member_stats.average_holding_minutes)}}분{% else %}대기{% endif %}
+{% if s.member_stats.average_holding_minutes is not none %}{{format_minutes_compact(s.member_stats.average_holding_minutes)}}{% else %}대기{% endif %}
 </b></div>
 </div>
 </a>
@@ -3400,6 +3389,10 @@ def performance_dashboard():
         if selected_category not in allowed_categories:
             selected_category = "KOREA_1Q"
 
+        period_key = request.args.get("period", "all").strip().lower()
+        if period_key not in {"today", "7d", "30d", "all"}:
+            period_key = "all"
+
         data = _sort_performance_categories(visual_cycle_data(limit))
         selected = next(
             (
@@ -3409,6 +3402,11 @@ def performance_dashboard():
             ),
             None,
         )
+
+        admin_average_ranking = []
+        admin_best_ranking = []
+        admin_win_rate_ranking = []
+        admin_symbol_rows = []
 
         market_stats = {
             "has_results": False,
@@ -3443,7 +3441,7 @@ def performance_dashboard():
                 enriched["group_analysis"] = analysis
                 enriched["member_stats"] = _member_group_engine_statistics(
                     analysis,
-                    "all",
+                    period_key,
                 )
                 enriched["member_stats"]["entry_groups"] = _group_entry_timeframe_stats(
                     selected_category,
@@ -3459,6 +3457,32 @@ def performance_dashboard():
                 for item in enriched_symbols
                 if item["member_stats"]["has_results"]
             ]
+
+            admin_average_ranking = sorted(
+                result_symbols,
+                key=lambda item: item["member_stats"]["average_return_pct"]
+                if item["member_stats"]["average_return_pct"] is not None else float("-inf"),
+                reverse=True,
+            )[:5]
+            admin_best_ranking = sorted(
+                result_symbols,
+                key=lambda item: item["member_stats"]["best_return_pct"]
+                if item["member_stats"]["best_return_pct"] is not None else float("-inf"),
+                reverse=True,
+            )[:5]
+            admin_win_rate_ranking = sorted(
+                result_symbols,
+                key=lambda item: (
+                    item["member_stats"]["win_rate_pct"]
+                    if item["member_stats"]["win_rate_pct"] is not None else float("-inf"),
+                    item["member_stats"]["completed_cycle_count"],
+                ),
+                reverse=True,
+            )[:5]
+            admin_symbol_rows = sorted(
+                selected["symbols"],
+                key=lambda item: symbol_display_name(item.get("symbol"), item.get("exchange")),
+            )
 
             average_values = [
                 item["member_stats"]["average_return_pct"]
@@ -3557,7 +3581,7 @@ def performance_dashboard():
             }
 
         admin_group_stats = _aggregate_market_group_stats(
-            [item for item in (selected.get("symbols") or []) if item.get("member_stats", {}).get("has_results")],
+            selected.get("symbols") or [],
             selected_category,
         ) if selected else []
 
@@ -3602,7 +3626,7 @@ def performance_dashboard():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>회원 운영용 성과 분석</title>
+<title>관리자 성과 분석</title>
 <style>
 :root{--bg:#0e0e0f;--card:#1b1b1d;--line:#333;--blue:#8bd0ff;--green:#5ee39a;--yellow:#ffc857;--red:#ff7676}
 *{box-sizing:border-box}
@@ -3641,6 +3665,16 @@ summary{cursor:pointer;font-weight:bold}
 .symbol-result .label{font-size:12px;color:#aaa;margin-bottom:5px}
 .symbol-result .number{font-size:18px;font-weight:bold}
 .back-link{display:inline-block;margin:4px 0 14px;padding:8px 12px;border-radius:999px;background:#242427;text-decoration:none}
+.period-nav{margin-top:-10px}
+.position-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.position-card{min-height:230px}.position-title{display:flex;justify-content:space-between;color:var(--blue);font-size:18px;font-weight:bold}
+.position-pair{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.position-pair>div{background:#111113;border-radius:9px;padding:10px}
+.position-pair small{display:block;color:#aaa}.position-pair b{display:block;color:var(--green);font-size:19px;margin-top:5px}
+.position-preview{background:#101012;border:1px solid #303035;border-radius:9px;padding:10px;line-height:1.55;font-size:12px}.position-preview strong{color:var(--green);font-size:15px}
+.position-meta{display:flex;justify-content:space-between;gap:10px;margin-top:8px;font-size:12px}.position-empty{height:150px;display:flex;align-items:center;justify-content:center;color:#666;font-size:28px}
+.ranking-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.admin-rank-row{display:flex;justify-content:space-between;gap:12px;padding:10px;border-bottom:1px solid #333;text-decoration:none;color:#f4f4f4}
+.alpha-table{display:grid;gap:2px}.alpha-head,.alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}
+.alpha-head{color:var(--blue);font-weight:bold;border-bottom:1px solid #444}.alpha-row{color:#f4f4f4;text-decoration:none;background:#151517;border-radius:7px}.alpha-row:hover{background:#202024}
 .matrix-wrap{overflow-x:auto;margin-top:12px}
 .tf-matrix{border-collapse:separate;border-spacing:5px;min-width:760px}
 .tf-matrix th{background:#121214;border:none;text-align:center;position:sticky;top:0}
@@ -3657,7 +3691,7 @@ summary{cursor:pointer;font-weight:bold}
 </style>
 </head>
 <body>
-<h1>회원 운영용 성과 분석</h1>
+<h1>관리자 성과 분석</h1>
 <div class="toplinks">
 <a href="/performance/health">DB 상태</a> ·
 <a href="/performance/latest">최근 신호</a> ·
@@ -3673,12 +3707,19 @@ summary{cursor:pointer;font-weight:bold}
 <div class="category-nav">
 {% for category in data.categories %}
 <a
-href="/performance/dashboard?category={{category.category_key}}"
+href="/performance/dashboard?category={{category.category_key}}&period={{period_key}}"
 class="{{'active-category' if category.category_key == selected_category else ''}}"
 >
 {{category.category_label}} · 종목 {{category.symbol_count}}
 </a>
 {% endfor %}
+</div>
+
+<div class="category-nav period-nav">
+<a href="/performance/dashboard?category={{selected_category}}&period=today" class="{{'active-category' if period_key == 'today' else ''}}">오늘</a>
+<a href="/performance/dashboard?category={{selected_category}}&period=7d" class="{{'active-category' if period_key == '7d' else ''}}">최근 7일</a>
+<a href="/performance/dashboard?category={{selected_category}}&period=30d" class="{{'active-category' if period_key == '30d' else ''}}">최근 30일</a>
+<a href="/performance/dashboard?category={{selected_category}}&period=all" class="{{'active-category' if period_key == 'all' else ''}}">전체</a>
 </div>
 
 {% if selected %}
@@ -3687,30 +3728,39 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <h2>{{selected.category_label}}</h2>
 <div class="category-summary">
 <span class="badge">종목 {{selected.symbol_count}}</span>
-<span class="badge ok">완료 Cycle {{selected.completed_cycle_count}}</span>
+<span class="badge ok">완료 사이클 {{selected.completed_cycle_count}}</span>
 <span class="badge warn">종료 대기 {{selected.open_low_count}}</span>
 </div>
 </div>
 
 {% if not selected_symbol %}
 <div class="market-performance">
-<div class="metric"><div class="title">시장 평균수익</div><div class="value {{'pos' if market_stats.average_return_pct is not none and market_stats.average_return_pct >= 0 else 'muted'}}">{% if market_stats.average_return_pct is not none %}{{'%.2f'|format(market_stats.average_return_pct)}}%{% else %}-{% endif %}</div><div class="small">{{market_stats.result_symbol_count}}개 종목의 완료 사이클 평균</div></div>
-<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.best_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.best_detail.symbol}}{% else %}#{% endif %}"><div class="title">시장 최고수익</div><div class="value pos">{% if market_stats.best_return_pct is not none %}{{'%.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.best_detail %}<div class="small">{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}}<br>매수 {{market_stats.best_detail.entry_timeframe}} · {{market_stats.best_detail.entry_time}}<br>종료 {{market_stats.best_detail.exit_timeframe}} · {{market_stats.best_detail.exit_time}}</div>{% endif %}</a>
-<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.worst_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.worst_detail.symbol}}{% else %}#{% endif %}"><div class="title">시장 최저수익</div><div class="value {{'pos' if market_stats.worst_return_pct is not none and market_stats.worst_return_pct >= 0 else 'neg'}}">{% if market_stats.worst_return_pct is not none %}{{'%.2f'|format(market_stats.worst_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.worst_detail %}<div class="small">{{symbol_display(market_stats.worst_detail.symbol, market_stats.worst_detail.exchange)}}<br>매수 {{market_stats.worst_detail.entry_timeframe}} · {{market_stats.worst_detail.entry_time}}<br>종료 {{market_stats.worst_detail.exit_timeframe}} · {{market_stats.worst_detail.exit_time}}</div>{% endif %}</a>
+<div class="metric"><div class="title">평균 수익률</div><div class="value {{'pos' if market_stats.average_return_pct is not none and market_stats.average_return_pct >= 0 else 'muted'}}">{% if market_stats.average_return_pct is not none %}{{'%.2f'|format(market_stats.average_return_pct)}}%{% else %}-{% endif %}</div><div class="small">{{market_stats.result_symbol_count}}개 종목의 완료 사이클 평균</div></div>
+<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.best_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.best_detail.symbol}}&period={{period_key}}{% else %}#{% endif %}"><div class="title">최고 수익률</div><div class="value pos">{% if market_stats.best_return_pct is not none %}{{'%.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.best_detail %}<div class="small">{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}}<br>매수 {{market_stats.best_detail.entry_timeframe}} · {{market_stats.best_detail.entry_time}}<br>종료 {{market_stats.best_detail.exit_timeframe}} · {{market_stats.best_detail.exit_time}}</div>{% endif %}</a>
+<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.worst_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.worst_detail.symbol}}&period={{period_key}}{% else %}#{% endif %}"><div class="title">최저 수익률</div><div class="value {{'pos' if market_stats.worst_return_pct is not none and market_stats.worst_return_pct >= 0 else 'neg'}}">{% if market_stats.worst_return_pct is not none %}{{'%.2f'|format(market_stats.worst_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.worst_detail %}<div class="small">{{symbol_display(market_stats.worst_detail.symbol, market_stats.worst_detail.exchange)}}<br>매수 {{market_stats.worst_detail.entry_timeframe}} · {{market_stats.worst_detail.entry_time}}<br>종료 {{market_stats.worst_detail.exit_timeframe}} · {{market_stats.worst_detail.exit_time}}</div>{% endif %}</a>
 <div class="metric"><div class="title">평균 보유시간</div><div class="value">{% if market_stats.average_holding_minutes is not none %}{{format_minutes_compact(market_stats.average_holding_minutes)}}{% else %}-{% endif %}</div></div>
-<div class="metric"><div class="title">시장 승률</div><div class="value {{'pos' if market_stats.win_rate_pct is not none and market_stats.win_rate_pct >= 50 else 'neg'}}">{% if market_stats.win_rate_pct is not none %}{{'%.1f'|format(market_stats.win_rate_pct)}}%{% else %}-{% endif %}</div></div>
-<div class="metric"><div class="title">성과 발생 종목</div><div class="value">{{market_stats.result_symbol_count}} / {{selected.symbol_count}}</div></div>
+<div class="metric"><div class="title">승률</div><div class="value {{'pos' if market_stats.win_rate_pct is not none and market_stats.win_rate_pct >= 50 else 'neg'}}">{% if market_stats.win_rate_pct is not none %}{{'%.1f'|format(market_stats.win_rate_pct)}}%{% else %}-{% endif %}</div></div>
 </div>
 
-<div class="card"><h2>포지션별 성과</h2><div class="grid">
+<div class="card"><h2>포지션별 성과</h2><div class="grid position-grid">
 {% for group in admin_group_stats %}
-<a class="metric" style="color:#f4f4f4;text-decoration:none" href="/performance/dashboard/group?category={{selected_category}}&group={{group.group_key}}&period=all">
-<div class="title">{{group.group_label}}</div>
+<a class="metric position-card" style="color:#f4f4f4;text-decoration:none" href="/performance/dashboard/group?category={{selected_category}}&group={{group.group_key}}&period={{period_key}}">
+<div class="position-title"><span>{{group.group_label}}</span><span>{{group.cycles}}사이클</span></div>
 {% if group.has_results %}
-<div class="value pos">누적 평균 {{'%.2f'|format(group.average_return_pct)}}%</div>
-<div class="small">최근 5사이클 최고수익 평균 {% if group.recent5_max_average_pct is not none %}{{'%.2f'|format(group.recent5_max_average_pct)}}%{% else %}-{% endif %}</div>
-{% if group.best_detail %}<div class="small" style="margin-top:8px"><b>{{symbol_display(group.best_detail.symbol, group.best_detail.exchange)}}</b><br>누적 최고 {{'%+.2f'|format(group.best_detail.return_pct)}}%<br>매수 {{group.best_detail.entry_timeframe}} · {{group.best_detail.entry_time}}<br>종료 {{group.best_detail.exit_timeframe}} · {{group.best_detail.exit_time}}</div>{% endif %}
-{% else %}<div class="value muted">-</div>{% endif %}
+<div class="position-pair">
+<div><small>누적 평균 수익률</small><b>{{'%.2f'|format(group.average_return_pct)}}%</b></div>
+<div><small>최근 5사이클 최고 수익률 평균</small><b>{% if group.recent5_max_average_pct is not none %}{{'%.2f'|format(group.recent5_max_average_pct)}}%{% else %}-{% endif %}</b></div>
+</div>
+{% if group.best_detail %}
+<div class="position-preview"><strong>누적 최고 {{'%+.2f'|format(group.best_detail.return_pct)}}%</strong><br>
+{{symbol_display(group.best_detail.symbol, group.best_detail.exchange)}}<br>
+매수 {{group.best_detail.entry_timeframe}} · {{group.best_detail.entry_time}}<br>
+종료 {{group.best_detail.exit_timeframe}} · {{group.best_detail.exit_time}}</div>
+{% endif %}
+<div class="position-meta"><span>승률 {{'%.1f'|format(group.win_rate_pct)}}%</span><span>평균 보유 {{format_minutes_compact(group.average_holding_minutes)}}</span></div>
+{% else %}
+<div class="position-empty">-</div>
+{% endif %}
 </a>
 {% endfor %}
 </div></div>
@@ -3718,7 +3768,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% if market_stats.recent_completed %}
 <div class="card"><h2>최근 완료 5건</h2>
 {% for detail in market_stats.recent_completed %}
-<a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/dashboard?category={{selected_category}}&symbol={{detail.symbol}}">
+<a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/dashboard?category={{selected_category}}&symbol={{detail.symbol}}&period={{period_key}}">
 <div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><div class="small">사이클 #{{detail.cycle}}</div></div>
 <div class="small">매수 {{detail.entry_timeframe}} · {{detail.entry_time}}<br>종료 {{detail.exit_timeframe}} · {{detail.exit_time}}</div>
 <div class="{{'pos' if detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(detail.return_pct)}}%</div>
@@ -3726,6 +3776,40 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endfor %}
 </div>
 {% endif %}
+
+{% if admin_average_ranking or admin_best_ranking or admin_win_rate_ranking %}
+<div class="card"><h2>수익률·승률 TOP 5</h2>
+<div class="ranking-grid">
+<div><h3>평균 수익률 TOP 5</h3>
+{% for s in admin_average_ranking %}
+<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><b class="pos">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</b></a>
+{% endfor %}</div>
+<div><h3>최고 수익률 TOP 5</h3>
+{% for s in admin_best_ranking %}
+<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><b class="pos">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</b></a>
+{% endfor %}</div>
+<div><h3>승률 TOP 5</h3>
+{% for s in admin_win_rate_ranking %}
+<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}"><span>{{loop.index}}. {{symbol_display(s.symbol, s.exchange)}}</span><b class="pos">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</b></a>
+{% endfor %}</div>
+</div></div>
+{% endif %}
+
+<div class="card">
+<h2>종목별 수익률 현황</h2>
+<div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률 기준은 추후 확정</div>
+<div class="alpha-table">
+<div class="alpha-head"><span>종목</span><span>누적 평균 수익률</span><span>최근 수익률</span><span>완료 사이클</span><span>평균 보유시간</span></div>
+{% for s in admin_symbol_rows %}
+<a class="alpha-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<span>{{symbol_display(s.symbol, s.exchange)}}</span>
+<span class="{{'pos' if s.member_stats.average_return_pct is not none and s.member_stats.average_return_pct >= 0 else 'muted'}}">{% if s.member_stats.average_return_pct is not none %}{{'%.2f'|format(s.member_stats.average_return_pct)}}%{% else %}-{% endif %}</span>
+<span class="muted">기준 보류</span>
+<span>{{s.member_stats.completed_cycle_count}}</span>
+<span>{{format_minutes_compact(s.member_stats.average_holding_minutes)}}</span>
+</a>
+{% endfor %}
+</div></div>
 {% endif %}
 
 {% if selected.symbol_count == 0 %}
@@ -3735,7 +3819,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% elif not selected_symbol %}
 <div class="symbol-list">
 {% for s in selected.symbols %}
-<a class="symbol-card" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}">
+<a class="symbol-card" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
 <div class="symbol-card-head">
 <div class="symbol-name">{{symbol_display(s.symbol, s.exchange)}}</div>
 <div class="small">{{exchange_only_label(s.exchange)}}</div>
@@ -3761,7 +3845,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="label">평균 보유</div>
 <div class="number">
 {% if s.member_stats.average_holding_minutes is not none %}
-{{'%.0f'|format(s.member_stats.average_holding_minutes)}}분
+{{format_minutes_compact(s.member_stats.average_holding_minutes)}}
 {% else %}대기{% endif %}
 </div>
 </div>
@@ -3903,7 +3987,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 
 {% for c in s.completed_cycles %}
 <details>
-<summary>완료 Cycle {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 종료후보 {{c.exit_count}}회</summary>
+<summary>완료 사이클 {{c.cycle_no}} · 진입 {{c.entry_count}}회 · 종료후보 {{c.exit_count}}회</summary>
 
 <div class="grid">
 <div class="metric">
@@ -4047,6 +4131,11 @@ class="{{'active-category' if category.category_key == selected_category else ''
         selected_symbol=selected_symbol,
         selected_symbol_name=selected_symbol_name,
         admin_group_stats=admin_group_stats,
+        admin_average_ranking=admin_average_ranking,
+        admin_best_ranking=admin_best_ranking,
+        admin_win_rate_ranking=admin_win_rate_ranking,
+        admin_symbol_rows=admin_symbol_rows,
+        period_key=period_key,
             market_stats=market_stats,
         entry_exit_matrix=entry_exit_matrix,
         ), 200
