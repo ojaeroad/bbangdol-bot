@@ -2750,6 +2750,7 @@ style="width:{{(avg|abs / chart_scale * 50) if chart_scale else 0}}%"></div>
 {% endfor %}
 </div>
 </details>
+{% endfor %}
 
 <details class="chart-section collapsible-block"><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbols">
 {% for s in selected.symbols %}
@@ -2774,6 +2775,7 @@ style="width:{{(avg|abs / chart_scale * 50) if chart_scale else 0}}%"></div>
 </div></div></details>
 {% else %}
 <div class="notice">현재 수집된 해당 시장 신호가 없습니다.</div>
+{% endif %}
 {% endif %}
 {% endif %}
 
@@ -4069,6 +4071,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% if group.details %}{% for stat in group.details %}<div class="detail-line"><span>매수 {{stat.timeframe}}</span><span>{{stat.result_count}}건</span><b class="{{'pos' if stat.average_return_pct >= 0 else 'neg'}}">평균 {{'%.2f'|format(stat.average_return_pct)}}%</b><span>보유 {{format_minutes_compact(stat.average_holding_minutes)}}</span></div>{% endfor %}{% else %}<div class="muted">결과 대기</div>{% endif %}
 </div>{% endfor %}
 </div></details>
+{% endif %}
+{% endfor %}
 {% if selected.symbol_count == 0 %}
 <div class="card"><div class="empty-note">
 현재 저장된 {{selected.category_label}} 신호가 없습니다.
@@ -4193,6 +4197,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 {% endif %}
 </section>
+{% endif %}
 {% endif %}
 {% endif %}
 </body>
