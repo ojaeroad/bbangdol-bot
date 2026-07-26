@@ -828,9 +828,79 @@ def _report_target(
     raise ValueError(f"unsupported report market: {report_market}")
 
 
+def _period_bounds(
+    kind: str,
+    report_market: str,
+    now_local: datetime,
+    tz: ZoneInfo,
+) -> tuple[datetime, datetime, str]:
+    """리포트 시장별 집계 구간을 UTC 반개구간 [start, end)으로 반환한다.
+
+    완료 사이클은 진입 시각과 무관하게 종료 시각으로 기간에 귀속한다.
+    - 국장 주간: KST 월요일 09:00 ~ 금요일 15:30 포함
+    - 미장 주간: ET 월요일 09:30 ~ 금요일 16:00 포함
+    - 코인 주간: KST 이전 월요일 06:00 ~ 현재 월요일 06:00 미만
+    - 국장/미장 월간: 해당 달 1일 00:00 ~ 다음 달 1일 00:00 미만
+    - 코인 월간: 이전 달 1일 06:00 ~ 현재 달 1일 06:00 미만
+    """
+    local_now = now_local.astimezone(tz)
+
+    if kind == "weekly":
+        if report_market == "COIN":
+            # 자동 발송 시점은 KST 월요일 06:00이다.
+            end_local = local_now.replace(hour=6, minute=0, second=0, microsecond=0)
+            end_local -= timedelta(days=end_local.weekday())
+            if local_now < end_local:
+                end_local -= timedelta(days=7)
+            start_local = end_local - timedelta(days=7)
+            label = f"{start_local:%Y-%m-%d %H:%M} ~ {end_local:%Y-%m-%d %H:%M} KST"
+        else:
+            monday = (local_now - timedelta(days=local_now.weekday())).date()
+            if report_market == "KOREA":
+                start_local = datetime.combine(monday, datetime.min.time(), tzinfo=tz).replace(hour=9)
+                close_local = start_local + timedelta(days=4, hours=6, minutes=30)
+                zone_label = "KST"
+            elif report_market == "US":
+                start_local = datetime.combine(monday, datetime.min.time(), tzinfo=tz).replace(hour=9, minute=30)
+                close_local = start_local + timedelta(days=4, hours=6, minutes=30)
+                zone_label = "ET"
+            else:
+                raise ValueError(f"unsupported report market: {report_market}")
+            # 장 마감 정각의 신호까지 포함하기 위해 종료 경계는 1분 뒤로 둔다.
+            end_local = close_local + timedelta(minutes=1)
+            label = f"{start_local:%Y-%m-%d %H:%M} ~ {close_local:%Y-%m-%d %H:%M} {zone_label}"
+
+    elif kind == "monthly":
+        if report_market == "COIN":
+            # 매월 1일 06:00 발송 시 직전 월의 1일 06:00부터 집계한다.
+            end_local = local_now.replace(day=1, hour=6, minute=0, second=0, microsecond=0)
+            if local_now < end_local:
+                if end_local.month == 1:
+                    end_local = end_local.replace(year=end_local.year - 1, month=12)
+                else:
+                    end_local = end_local.replace(month=end_local.month - 1)
+            if end_local.month == 1:
+                start_local = end_local.replace(year=end_local.year - 1, month=12)
+            else:
+                start_local = end_local.replace(month=end_local.month - 1)
+            label = f"{start_local:%Y-%m-%d %H:%M} ~ {end_local:%Y-%m-%d %H:%M} KST"
+        else:
+            start_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if start_local.month == 12:
+                end_local = start_local.replace(year=start_local.year + 1, month=1)
+            else:
+                end_local = start_local.replace(month=start_local.month + 1)
+            zone_label = "KST" if report_market == "KOREA" else "ET"
+            label = f"{start_local:%Y-%m-%d} ~ {(end_local - timedelta(days=1)):%Y-%m-%d} {zone_label}"
+    else:
+        raise ValueError(f"unsupported period kind: {kind}")
+
+    return start_local.astimezone(UTC), end_local.astimezone(UTC), label
+
+
 def _collect_period(kind: str, report_market: str, now_local: datetime):
     market, include_groups, exclude_groups, tz = _report_target(report_market)
-    start_utc, end_utc, label = _period_bounds(kind, now_local, tz)
+    start_utc, end_utc, label = _period_bounds(kind, report_market, now_local, tz)
     data = group_analysis_market_data(market)
     rows: list[dict[str, Any]] = []
     symbols: set[str] = set()
@@ -847,7 +917,7 @@ def _collect_period(kind: str, report_market: str, now_local: datetime):
                 if group not in {"SWING", "LONG", "LIFE"}:
                     continue
                 exit_time = _parse_datetime(result.get("exit_time"))
-                if exit_time is None or not (start_utc <= exit_time.astimezone(UTC) <= end_utc):
+                if exit_time is None or not (start_utc <= exit_time.astimezone(UTC) < end_utc):
                     continue
                 row = {
                     "market": market,
@@ -939,7 +1009,7 @@ def render_period_report(kind: str, report_market: str, now_local: datetime) -> 
     else:
         metrics = [
             ("평균 수익률", f"{stats['average']:+.2f}%", green if stats['average'] >= 0 else red),
-            ("최대 수익률", f"{stats['best']:+.2f}%", green),
+            ("최고 수익률", f"{stats['best']:+.2f}%", green),
             ("최저 수익률", f"{stats['worst']:+.2f}%", red if stats['worst'] < 0 else green),
             ("승률", f"{stats['win_rate']:.1f}%", white),
             ("완료 결과", f"{stats['count']}건", white),
@@ -960,7 +1030,7 @@ def render_period_report(kind: str, report_market: str, now_local: datetime) -> 
             _rounded(draw, (50, y, 1030, y + 145), fill="#15161a")
             draw.text((80, y + 20), GROUP_LABEL.get(item["group"], item["group"]), font=_font(27, True), fill=blue)
             draw.text((300, y + 20), f"평균 {item['average']:+.2f}%", font=_font(27, True), fill=green if item['average'] >= 0 else red)
-            draw.text((600, y + 20), f"최대 {item['best']:+.2f}%", font=_font(25, True), fill=green)
+            draw.text((600, y + 20), f"최고 {item['best']:+.2f}%", font=_font(25, True), fill=green)
             draw.text((80, y + 82), f"승률 {item['win_rate']:.1f}% · 완료 {item['count']}건", font=_font(21), fill=white)
             draw.text((650, y + 82), f"평균보유 {_duration(item['average_holding'])}", font=_font(19), fill=muted)
             y += 165
@@ -1017,8 +1087,8 @@ def process_scheduled_reports() -> None:
     # 미장: 뉴욕시간 금요일 정규장 종료 1시간 후 17시
     if now_ny.weekday() == 4 and now_ny.hour == 17:
         _send_period_report(chat_id, "weekly", "US", now_ny)
-    # 코인: 한국시간 일요일 21시. 단타는 기본적으로 별도 이미지
-    if now_kst.weekday() == 6 and now_kst.hour == 21:
+    # 코인: 한국시간 월요일 오전 06:00, 직전 월요일 06:00부터 집계
+    if now_kst.weekday() == 0 and now_kst.hour == 6:
         _send_period_report(chat_id, "weekly", "COIN", now_kst)
 
     # 월간 국장: 마지막 평일 16:30 KST
@@ -1027,9 +1097,8 @@ def process_scheduled_reports() -> None:
     # 월간 미장: 마지막 평일 17:00 New York
     if _is_last_weekday_of_month(now_ny) and now_ny.hour == 17:
         _send_period_report(chat_id, "monthly", "US", now_ny)
-    # 월간 코인: 달력상 말일 21:00 KST
-    tomorrow_kst = now_kst + timedelta(days=1)
-    if tomorrow_kst.month != now_kst.month and now_kst.hour == 21:
+    # 월간 코인: 한국시간 매월 1일 오전 06:00, 직전 월 1일 06:00부터 집계
+    if now_kst.day == 1 and now_kst.hour == 6:
         _send_period_report(chat_id, "monthly", "COIN", now_kst)
 
 
