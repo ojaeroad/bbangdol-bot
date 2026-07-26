@@ -62,18 +62,17 @@ MARKET_LABEL = {
     "COIN": "코인",
 }
 
-# 기존 Render 환경변수 이름을 그대로 재사용한다.
-ENTRY_CHAT_ENV = {
-    ("COIN", "SCALP"): "BD_BUY_SHORT",
-    ("COIN", "SWING"): "BD_BUY_SWING",
-    ("COIN", "LONG"): "BD_BUY_LONG",
-    ("COIN", "LIFE"): "BD_BUY_LIFE",
-    ("KOREA", "SWING"): "BUY_SWING_1Q",
-    ("KOREA", "LONG"): "BUY_LONG_1Q",
-    ("KOREA", "LIFE"): "BUY_LIFE_1Q",
-    ("US", "SWING"): "BUY_SWING_1Q",
-    ("US", "LONG"): "BUY_LONG_1Q",
-    ("US", "LIFE"): "BUY_LIFE_1Q",
+# 수익률 결과는 매수방이 아니라 해당 매도 그룹 방으로 발송한다.
+EXIT_CHAT_ENV = {
+    ("COIN", "SWING"): "BD_SELL_SWING",
+    ("COIN", "LONG"): "BD_SELL_LONG",
+    ("COIN", "LIFE"): "BD_SELL_LIFE",
+    ("KOREA", "SWING"): "SELL_SWING_1Q",
+    ("KOREA", "LONG"): "SELL_LONG_1Q",
+    ("KOREA", "LIFE"): "SELL_LIFE_1Q",
+    ("US", "SWING"): "SELL_SWING_1Q",
+    ("US", "LONG"): "SELL_LONG_1Q",
+    ("US", "LIFE"): "SELL_LIFE_1Q",
 }
 
 SCHEMA_SQL = """
@@ -361,49 +360,8 @@ def _chart_interval(entry_group: str) -> int:
     return 1 if entry_group in {"SCALP", "SWING"} else 5
 
 
-def _telegram_send_allowed(market: str, entry_group: str) -> bool:
-    if market == "COIN" and entry_group == "SCALP":
-        return SEND_COIN_SCALP
-    return True
-
-
-def _compress_candles(candles: list[dict[str, Any]], max_items: int = 150) -> list[dict[str, Any]]:
-    if len(candles) <= max_items:
-        return candles
-    step = (len(candles) + max_items - 1) // max_items
-    output = []
-    for i in range(0, len(candles), step):
-        chunk = candles[i:i+step]
-        output.append({
-            "time": chunk[0]["time"], "open": chunk[0]["open"],
-            "high": max(x["high"] for x in chunk), "low": min(x["low"] for x in chunk),
-            "close": chunk[-1]["close"], "volume": sum(x.get("volume",0) for x in chunk),
-        })
-    return output
-
-
-def _draw_candle_chart(draw, box, candles, entry_price, entry_points, exit_price):
-    x0,y0,x1,y1=box
-    if not candles:
-        draw.text((x0+20,y0+20), f"{candles[0].get('interval_minutes', 5) if candles else '선택'}분봉 데이터 없음 · 매수/종료 신호만 표시", font=_font(22), fill="#a5a6ad")
-        return None
-    candles=_compress_candles(candles)
-    hi=max(c["high"] for c in candles); lo=min(c["low"] for c in candles)
-    if hi<=lo: hi=lo+1
-    pad=(hi-lo)*0.06; hi+=pad; lo-=pad
-    def py(v): return y0+(hi-v)/(hi-lo)*(y1-y0)
-    width=max(2,(x1-x0)/max(len(candles),1))
-    for i,c in enumerate(candles):
-        x=x0+(i+0.5)*(x1-x0)/len(candles)
-        up=c["close"]>=c["open"]; color="#43d69b" if up else "#ff6f7d"
-        draw.line((x,py(c["high"]),x,py(c["low"])),fill=color,width=1)
-        top=min(py(c["open"]),py(c["close"])); bot=max(py(c["open"]),py(c["close"]))
-        draw.rectangle((x-width*.3,top,x+width*.3,max(top+2,bot)),fill=color)
-    draw.line((x0,py(entry_price),x1,py(entry_price)),fill="#ffc857",width=2)
-    draw.text((x0+6,py(entry_price)-26),"평균 매수가",font=_font(17,True),fill="#ffc857")
-    draw.line((x0,py(exit_price),x1,py(exit_price)),fill="#54e39a",width=2)
-    draw.text((x1-120,py(exit_price)-26),"종료",font=_font(17,True),fill="#54e39a")
-    return min(c["low"] for c in candles)
+def _telegram_send_allowed(market: str, exit_group: str) -> bool:
+    return exit_group in {"SWING", "LONG", "LIFE"}
 
 def render_exit_image(
     market: str,
@@ -564,143 +522,250 @@ def _position_key(market: str, symbol: str, position: dict[str, Any]) -> str:
     return f"{market}:{symbol}:{base}"
 
 
-def _entry_destination(market: str, entry_group: str) -> tuple[str, str]:
-    env_name = ENTRY_CHAT_ENV.get((market, entry_group), "")
+def _exit_destination(market: str, exit_group: str) -> tuple[str, str]:
+    env_name = EXIT_CHAT_ENV.get((market, exit_group), "")
     return env_name, os.getenv(env_name, "").strip() if env_name else ""
 
 
 def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
-    """Send only results whose HIGH signal id is newer than the saved watermark."""
+    """새 HIGH만 처리하여 종료 그룹별 매도방으로 발송한다."""
     observed_max = after_high_signal_id
+
     for market in ("KOREA", "US", "COIN"):
         market_data = group_analysis_market_data(market)
+
         for symbol, symbol_data in market_data.get("symbol_data", {}).items():
             for position in symbol_data.get("positions", []):
-                env_name, chat_id = _entry_destination(market, position["entry_group"])
-                send_allowed = _telegram_send_allowed(market, position["entry_group"])
-                if send_allowed and (not env_name or not chat_id):
+                if position.get("entry_group") not in {"SWING", "LONG", "LIFE"}:
                     continue
 
                 position_key = _position_key(market, symbol, position)
-                all_results = position.get("exit_results") or []
-                fresh_results = []
+                all_results = [
+                    row for row in (position.get("exit_results") or [])
+                    if row.get("exit_group") in {"SWING", "LONG", "LIFE"}
+                ]
+
+                # 새 개별 종료 결과는 종료 그룹에 해당하는 매도방으로 발송한다.
                 for result in all_results:
                     try:
                         exit_id = int(result.get("exit_signal_id") or 0)
                     except (TypeError, ValueError):
                         continue
-                    observed_max = max(observed_max, exit_id)
-                    if exit_id > after_high_signal_id:
-                        fresh_results.append(result)
 
-                for result in fresh_results:
-                    exit_id = int(result["exit_signal_id"])
-                    if not send_allowed:
-                        log.info("coin scalp exit image suppressed symbol=%s exit_id=%s", symbol, exit_id)
+                    observed_max = max(observed_max, exit_id)
+                    if exit_id <= after_high_signal_id:
                         continue
-                    delivery_key = f"exit-v3:{position_key}:{exit_id}:{result['exit_timeframe']}"
-                    if not _claim(delivery_key, "EXIT_IMAGE", market, symbol, env_name):
+
+                    exit_group = str(result.get("exit_group") or "")
+                    env_name, chat_id = _exit_destination(market, exit_group)
+                    if not _telegram_send_allowed(market, exit_group):
                         continue
+                    if not env_name or not chat_id:
+                        log.warning(
+                            "sell destination missing market=%s group=%s env=%s",
+                            market, exit_group, env_name,
+                        )
+                        continue
+
+                    delivery_key = (
+                        f"exit-v4:{position_key}:{exit_id}:"
+                        f"{exit_group}:{result.get('exit_timeframe')}"
+                    )
+                    if not _claim(
+                        delivery_key, "EXIT_IMAGE", market, symbol, env_name
+                    ):
+                        continue
+
                     try:
                         png = render_exit_image(market, symbol, position, result)
                         caption = (
-                            f"📈 {symbol} · {GROUP_LABEL.get(position['entry_group'])}\n"
-                            f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
-                            f"종료 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
-                            f"수익률 {float(result['return_pct']):+.3f}% · 보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
+                            f"📈 {symbol} · 매도 "
+                            f"{GROUP_LABEL.get(exit_group, exit_group)} 결과\n"
+                            f"매수 {position.get('entry_timeframe','-')} · "
+                            f"{_format_kst(position.get('entry_first_time'))}\n"
+                            f"종료 {result.get('exit_timeframe','-')} · "
+                            f"{_format_kst(result.get('exit_time'))}\n"
+                            f"수익률 {float(result['return_pct']):+.3f}% · "
+                            f"보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
                         )
                         _send_photo(chat_id, png, caption)
                         log.info(
-                            "new exit result sent market=%s symbol=%s exit_id=%s exit_tf=%s env=%s",
-                            market, symbol, exit_id, result["exit_timeframe"], env_name,
+                            "sell result sent market=%s symbol=%s exit_id=%s "
+                            "exit_group=%s exit_tf=%s env=%s",
+                            market, symbol, exit_id, exit_group,
+                            result.get("exit_timeframe"), env_name,
                         )
                     except Exception:
                         _release(delivery_key)
-                        log.exception("new exit result delivery failed key=%s", delivery_key)
+                        log.exception(
+                            "sell result delivery failed key=%s", delivery_key
+                        )
 
-                expected = set(_expected_exit_timeframes(market, position["entry_group"]))
-                completed = {row["exit_timeframe"] for row in all_results}
-                completion_trigger_id = max(
-                    (int(row.get("exit_signal_id") or 0) for row in all_results),
+                # 종료 그룹별 필요한 시간봉이 모두 모이면 같은 매도방에 종합 1장.
+                for exit_group in ("SWING", "LONG", "LIFE"):
+                    expected = set(
+                        MARKET_GROUPS.get(market, {}).get(exit_group, [])
+                    )
+                    group_results = [
+                        row for row in all_results
+                        if row.get("exit_group") == exit_group
+                    ]
+                    completed = {
+                        row.get("exit_timeframe") for row in group_results
+                    }
+                    trigger_id = max(
+                        (
+                            int(row.get("exit_signal_id") or 0)
+                            for row in group_results
+                        ),
+                        default=0,
+                    )
+
+                    if (
+                        not expected
+                        or not expected.issubset(completed)
+                        or trigger_id <= after_high_signal_id
+                    ):
+                        continue
+
+                    env_name, chat_id = _exit_destination(market, exit_group)
+                    if not env_name or not chat_id:
+                        continue
+
+                    summary_key = (
+                        f"exit-group-summary-v4:{position_key}:"
+                        f"{exit_group}:{trigger_id}"
+                    )
+                    if not _claim(
+                        summary_key, "EXIT_GROUP_SUMMARY",
+                        market, symbol, env_name
+                    ):
+                        continue
+
+                    try:
+                        summary_position = dict(position)
+                        summary_position["exit_results"] = group_results
+                        png = render_cycle_summary_image(
+                            market, symbol, summary_position
+                        )
+                        values = [
+                            float(row["return_pct"]) for row in group_results
+                        ]
+                        caption = (
+                            f"✅ {symbol} · 매도 "
+                            f"{GROUP_LABEL.get(exit_group, exit_group)} 종합\n"
+                            f"매수 {position.get('entry_timeframe','-')} · "
+                            f"{_format_kst(position.get('entry_first_time'))}\n"
+                            f"종료 시간봉 {len(group_results)}개 · "
+                            f"평균 {sum(values)/len(values):+.3f}% · "
+                            f"최고 {max(values):+.3f}%"
+                        )
+                        _send_photo(chat_id, png, caption)
+                        completion_time = max(
+                            row["exit_time"] for row in group_results
+                        )
+                        archive_cycle_chart(
+                            summary_key, market, symbol,
+                            position["entry_first_time"],
+                            completion_time, png,
+                        )
+                        log.info(
+                            "sell group summary sent market=%s symbol=%s "
+                            "group=%s trigger_id=%s env=%s",
+                            market, symbol, exit_group, trigger_id, env_name,
+                        )
+                    except Exception:
+                        _release(summary_key)
+                        log.exception(
+                            "sell group summary failed key=%s", summary_key
+                        )
+
+                # 모든 30m 이상 종료 그룹이 완료되면 원본 캔들을 정리한다.
+                expected_all = {
+                    tf
+                    for group in ("SWING", "LONG", "LIFE")
+                    for tf in MARKET_GROUPS.get(market, {}).get(group, [])
+                }
+                completed_all = {
+                    row.get("exit_timeframe") for row in all_results
+                }
+                trigger_all = max(
+                    (
+                        int(row.get("exit_signal_id") or 0)
+                        for row in all_results
+                    ),
                     default=0,
                 )
+
                 if (
-                    expected
-                    and expected.issubset(completed)
-                    and completion_trigger_id > after_high_signal_id
+                    expected_all
+                    and expected_all.issubset(completed_all)
+                    and trigger_all > after_high_signal_id
                 ):
-                    summary_key = f"cycle-summary-v3:{position_key}:{completion_trigger_id}"
-                    if _claim(summary_key, "CYCLE_SUMMARY", market, symbol, env_name):
+                    completion_time = max(
+                        row["exit_time"] for row in all_results
+                    )
+                    watch = candle_watch_status(symbol)
+                    watch_started = watch.get("started_at") if watch else None
+                    incomplete = False
+
+                    for other in symbol_data.get("positions", []):
+                        if other.get("entry_group") not in {
+                            "SWING", "LONG", "LIFE"
+                        }:
+                            continue
                         try:
-                            png = render_cycle_summary_image(market, symbol, position)
-                            values = [float(row["return_pct"]) for row in all_results]
-                            caption = (
-                                f"✅ {symbol} {GROUP_LABEL.get(position['entry_group'])} 완료 사이클 종합\n"
-                                f"종료 {len(all_results)}개 · 평균 {sum(values)/len(values):+.3f}% · "
-                                f"최고 {max(values):+.3f}%"
-                            )
-                            if send_allowed:
-                                _send_photo(chat_id, png, caption)
-                            else:
-                                log.info("coin scalp summary image archived without Telegram symbol=%s", symbol)
-                            completion_time = max(row["exit_time"] for row in all_results)
-                            archive_cycle_chart(summary_key, market, symbol, position["entry_first_time"], completion_time, png)
-                            # 현재 수집 시작 이후의 진행 포지션이 모두 끝났을 때만 1m/5m 원본을 정리한다.
-                            watch = candle_watch_status(symbol)
-                            watch_started = watch.get("started_at") if watch else None
-                            incomplete = False
-                            for other in symbol_data.get("positions", []):
-                                try:
-                                    other_start = datetime.fromisoformat(other["entry_first_time"])
-                                except Exception:
-                                    continue
-                                if watch_started and other_start < watch_started:
-                                    continue
-                                other_expected = set(_expected_exit_timeframes(market, other["entry_group"]))
-                                other_done = {r["exit_timeframe"] for r in (other.get("exit_results") or [])}
-                                if other_expected and not other_expected.issubset(other_done):
-                                    incomplete = True
-                                    break
-                            if not incomplete:
-                                deleted = finish_candle_watch(symbol, completion_time)
-                                log.info("candle watch finished symbol=%s deleted_1m_5m=%s", symbol, deleted)
-                            log.info(
-                                "new cycle summary sent market=%s symbol=%s trigger_id=%s env=%s",
-                                market, symbol, completion_trigger_id, env_name,
+                            other_start = datetime.fromisoformat(
+                                other["entry_first_time"]
                             )
                         except Exception:
-                            _release(summary_key)
-                            log.exception("new cycle summary delivery failed key=%s", summary_key)
+                            continue
+                        if watch_started and other_start < watch_started:
+                            continue
+
+                        other_expected = {
+                            tf
+                            for group in ("SWING", "LONG", "LIFE")
+                            for tf in MARKET_GROUPS.get(
+                                market, {}
+                            ).get(group, [])
+                        }
+                        other_done = {
+                            row.get("exit_timeframe")
+                            for row in (other.get("exit_results") or [])
+                            if row.get("exit_group") in {
+                                "SWING", "LONG", "LIFE"
+                            }
+                        }
+                        if (
+                            other_expected
+                            and not other_expected.issubset(other_done)
+                        ):
+                            incomplete = True
+                            break
+
+                    if not incomplete:
+                        deleted = finish_candle_watch(
+                            symbol, completion_time
+                        )
+                        log.info(
+                            "candle watch finished symbol=%s deleted=%s",
+                            symbol, deleted,
+                        )
+
     return observed_max
 
 
-def _period_bounds(kind: str, now_local: datetime, tz: ZoneInfo) -> tuple[datetime, datetime, str]:
-    if kind == "weekly":
-        end_local = now_local
-        start_local = end_local - timedelta(days=7)
-        label = f"{start_local:%Y.%m.%d} ~ {end_local:%Y.%m.%d}"
-    else:
-        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        if start_local.month == 12:
-            next_month = start_local.replace(year=start_local.year + 1, month=1)
-        else:
-            next_month = start_local.replace(month=start_local.month + 1)
-        end_local = min(now_local, next_month)
-        label = f"{start_local:%Y년 %m월}"
-    return start_local.astimezone(UTC), end_local.astimezone(UTC), label
-
-
-def _report_target(report_market: str) -> tuple[str, set[str] | None, set[str] | None, ZoneInfo]:
-    if report_market == "COIN_SCALP":
-        return "COIN", {"SCALP"}, None, KST
+def _report_target(
+    report_market: str,
+) -> tuple[str, set[str] | None, set[str] | None, ZoneInfo]:
+    # 5m·15m 단타는 모든 성과 리포트에서 제외한다.
     if report_market == "COIN":
-        mode = _coin_scalp_report_mode()
-        exclude = {"SCALP"} if mode in {"separate", "exclude"} else None
-        return "COIN", None, exclude, KST
+        return "COIN", {"SWING", "LONG", "LIFE"}, None, KST
     if report_market == "KOREA":
-        return "KOREA", None, None, KST
+        return "KOREA", {"SWING", "LONG", "LIFE"}, None, KST
     if report_market == "US":
-        return "US", None, None, NY
+        return "US", {"SWING", "LONG", "LIFE"}, None, NY
     raise ValueError(f"unsupported report market: {report_market}")
 
 
@@ -713,19 +778,23 @@ def _collect_period(kind: str, report_market: str, now_local: datetime):
     group_rows: dict[str, list[dict[str, Any]]] = {}
     for symbol, symbol_data in data.get("symbol_data", {}).items():
         for position in symbol_data.get("positions", []):
-            group = str(position.get("entry_group") or "")
-            if include_groups and group not in include_groups:
+            entry_group = str(position.get("entry_group") or "")
+            if include_groups and entry_group not in include_groups:
                 continue
-            if exclude_groups and group in exclude_groups:
+            if exclude_groups and entry_group in exclude_groups:
                 continue
             for result in position.get("exit_results") or []:
+                group = str(result.get("exit_group") or "")
+                if group not in {"SWING", "LONG", "LIFE"}:
+                    continue
                 exit_time = _parse_datetime(result.get("exit_time"))
                 if exit_time is None or not (start_utc <= exit_time.astimezone(UTC) <= end_utc):
                     continue
                 row = {
                     "market": market,
                     "symbol": symbol,
-                    "entry_group": group,
+                    "entry_group": entry_group,
+                    "exit_group": group,
                     "entry_timeframe": position.get("entry_timeframe"),
                     "entry_time": position.get("entry_first_time"),
                     **result,
@@ -786,7 +855,7 @@ def _distinct_best_rows(rows):
     return sorted(best.values(), key=lambda r: float(r.get("return_pct") or 0), reverse=True)
 
 def _report_display_label(report_market: str) -> str:
-    return {"KOREA": "국장", "US": "미장", "COIN": "코인", "COIN_SCALP": "코인 단타"}[report_market]
+    return {"KOREA": "국장", "US": "미장", "COIN": "코인"}[report_market]
 
 
 def render_period_report(kind: str, report_market: str, now_local: datetime) -> tuple[bytes, str]:
@@ -892,8 +961,6 @@ def process_scheduled_reports() -> None:
     # 코인: 한국시간 일요일 21시. 단타는 기본적으로 별도 이미지
     if now_kst.weekday() == 6 and now_kst.hour == 21:
         _send_period_report(chat_id, "weekly", "COIN", now_kst)
-        if _coin_scalp_report_mode() == "separate":
-            _send_period_report(chat_id, "weekly", "COIN_SCALP", now_kst)
 
     # 월간 국장: 마지막 평일 16:30 KST
     if _is_last_weekday_of_month(now_kst) and now_kst.hour == 16 and now_kst.minute >= 30:
@@ -905,8 +972,6 @@ def process_scheduled_reports() -> None:
     tomorrow_kst = now_kst + timedelta(days=1)
     if tomorrow_kst.month != now_kst.month and now_kst.hour == 21:
         _send_period_report(chat_id, "monthly", "COIN", now_kst)
-        if _coin_scalp_report_mode() == "separate":
-            _send_period_report(chat_id, "monthly", "COIN_SCALP", now_kst)
 
 
 def run_once() -> None:
@@ -976,18 +1041,17 @@ def automation_status() -> dict[str, Any]:
         "member_notice_configured": bool(notice_id),
         "high_signal_watermark": _get_state("last_processed_high_signal_id") if DATABASE_URL else None,
         "no_backfill_mode": True,
-        "collect_coin_scalp": os.getenv("PERFORMANCE_COLLECT_COIN_SCALP", "1"),
-        "send_coin_scalp": os.getenv("PERFORMANCE_SEND_COIN_SCALP", "0"),
-        "coin_scalp_report_mode": _coin_scalp_report_mode(),
+        "minimum_performance_timeframe": "30m",
+        "scalp_performance_excluded": True,
         **_font_status(),
         "poll_seconds": POLL_SECONDS,
         "thread_started": _STARTED,
-        "entry_destinations": {
+        "result_destinations": {
             f"{market}_{group}": {
                 "env": env_name,
                 "configured": bool(os.getenv(env_name, "").strip()),
             }
-            for (market, group), env_name in ENTRY_CHAT_ENV.items()
+            for (market, group), env_name in EXIT_CHAT_ENV.items()
         },
     }
 
@@ -1002,12 +1066,10 @@ def send_period_report_test(kind: str, report_market: str | None = None) -> dict
         raise RuntimeError(f"{MEMBER_NOTICE_ENV} is not configured")
     requested = str(report_market or "").strip().upper()
     targets = [requested] if requested else ["KOREA", "US", "COIN"]
-    if not requested and _coin_scalp_report_mode() == "separate":
-        targets.append("COIN_SCALP")
     sent = []
     for target in targets:
-        if target not in {"KOREA", "US", "COIN", "COIN_SCALP"}:
-            raise ValueError("market must be KOREA, US, COIN, or COIN_SCALP")
+        if target not in {"KOREA", "US", "COIN"}:
+            raise ValueError("market must be KOREA, US, or COIN")
         now_local = datetime.now(NY if target == "US" else KST)
         png, caption = render_period_report(kind, target, now_local)
         _send_photo(chat_id, png, f"[관리자 테스트]\\n{caption}")
@@ -1019,7 +1081,7 @@ def send_latest_cycle_test(
     market: str | None = None,
     symbol: str | None = None,
 ) -> dict[str, Any]:
-    """최근 종료 결과 1건을 해당 기존 매수 채널로 즉시 테스트 발송."""
+    """최근 종료 결과 1건을 해당 매도 그룹 채널로 즉시 테스트 발송."""
     requested_market = str(market or "").strip().upper()
     requested_symbol = str(symbol or "").strip().upper()
     candidates: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
@@ -1044,15 +1106,16 @@ def send_latest_cycle_test(
         return str(result.get("exit_time") or "")
 
     current_market, current_symbol, position, result = max(candidates, key=sort_key)
-    env_name, chat_id = _entry_destination(current_market, position["entry_group"])
+    exit_group = str(result.get("exit_group") or "")
+    env_name, chat_id = _exit_destination(current_market, exit_group)
     if not env_name:
-        raise RuntimeError("해당 매수 그룹의 기존 알람방 환경변수 매핑이 없습니다")
+        raise RuntimeError("해당 매도 그룹의 알람방 환경변수 매핑이 없습니다")
     if not chat_id:
         raise RuntimeError(f"{env_name} is not configured")
 
     png = render_exit_image(current_market, current_symbol, position, result)
     caption = (
-        f"[관리자 테스트]\n📈 {current_symbol} · {GROUP_LABEL.get(position['entry_group'])}\n"
+        f"[관리자 테스트]\n📈 {current_symbol} · 매도 {GROUP_LABEL.get(exit_group)}\n"
         f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
         f"종료 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
         f"수익률 {float(result['return_pct']):+.3f}%"
@@ -1063,6 +1126,7 @@ def send_latest_cycle_test(
         "market": current_market,
         "symbol": current_symbol,
         "entry_group": position["entry_group"],
+        "exit_group": exit_group,
         "exit_timeframe": result["exit_timeframe"],
         "destination_env": env_name,
     }

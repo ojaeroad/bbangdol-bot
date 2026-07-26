@@ -227,7 +227,8 @@ def _collection_requirements(route: str) -> tuple[bool, bool]:
     """Return (need_1m, need_5m) for a newly observed LOW route."""
     route = str(route or "").upper()
     if route == "BD_BUY_SHORT":
-        return _env_enabled("PERFORMANCE_COLLECT_COIN_SCALP", "1"), False
+        # 5m·15m 단타는 성과 계산 대상에서 제외한다.
+        return False, False
     if "SWING" in route:
         return True, False
     if "LONG" in route or "LIFE" in route:

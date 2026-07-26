@@ -13,8 +13,9 @@
 4. 포지션별 최대 분할진입은 기본 3회다.
 5. 시간봉 자체 길이 쿨타임은 발생 주기 통계에만 적용한다.
 6. 24시간 제한은 사용하지 않는다.
-7. 각 매수 최초시간봉에 허용된 매도 그룹의 모든 시간봉을 각각 비교하고,
-   마지막 진입 뒤 해당 매도 시간봉의 첫 HIGH에서 전량청산한다.
+7. 성과 계산은 매수·종료 모두 30분봉 이상만 사용한다.
+8. 매수 그룹과 관계없이 매도 스윙·장기·인생타점의 모든 시간봉을 비교하고,
+   마지막 매수 뒤 해당 종료 시간봉의 첫 HIGH에서 결과를 확정한다.
 """
 
 from __future__ import annotations
@@ -52,8 +53,8 @@ GROUP_LABEL = {
 }
 
 MARKET_GROUPS = {
+    # 성과 계산은 매수·종료 모두 최소 30분봉 이상만 사용한다.
     "COIN": {
-        "SCALP": ["5m", "15m"],
         "SWING": ["30m", "1h"],
         "LONG": ["4h", "6h"],
         "LIFE": ["12h", "1d", "1w"],
@@ -70,11 +71,11 @@ MARKET_GROUPS = {
     },
 }
 
+# 매수 그룹이 무엇이든 종료 SWING/LONG/LIFE를 모두 비교한다.
 EXIT_GROUPS = {
-    "SCALP": ["SCALP", "SWING"],
-    "SWING": ["SCALP", "SWING", "LONG"],
+    "SWING": ["SWING", "LONG", "LIFE"],
     "LONG": ["SWING", "LONG", "LIFE"],
-    "LIFE": ["LONG", "LIFE"],
+    "LIFE": ["SWING", "LONG", "LIFE"],
 }
 
 SCHEMA_SQL = """
