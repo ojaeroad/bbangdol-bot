@@ -2093,7 +2093,7 @@ def performance_home():
         return redirect("/performance/dashboard")
     if _performance_role() == "member":
         return redirect("/performance/member")
-    return redirect("/performance/login?role=member")
+    return redirect("/performance/public")
 
 
 @app.get("/performance/health")
@@ -2177,6 +2177,97 @@ def performance_analysis_latest():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+
+
+
+def _public_performance_snapshot(selected_category: str, period_key: str = "7d") -> dict:
+    """공개 홍보 화면에 필요한 최소 성과만 계산한다.
+
+    진행 종목명·진입가 등 실시간 회원 정보는 공개하지 않고,
+    완료 결과와 집계 숫자만 노출한다.
+    """
+    allowed = {"COIN", "KOREA_1Q", "US_1Q"}
+    if selected_category not in allowed:
+        selected_category = "KOREA_1Q"
+    if period_key not in {"today", "7d", "30d", "all"}:
+        period_key = "7d"
+
+    data = _sort_performance_categories(visual_cycle_data(100))
+    selected = next((c for c in data.get("categories", []) if c.get("category_key") == selected_category), None)
+    snapshot = {
+        "selected_category": selected_category,
+        "period_key": period_key,
+        "category_label": "",
+        "symbol_count": 0,
+        "open_count": 0,
+        "completed_count": 0,
+        "average_return_pct": None,
+        "win_rate_pct": None,
+        "best_return_pct": None,
+        "best_symbol": None,
+        "recent_completed": [],
+        "categories": data.get("categories", []),
+    }
+    if not selected:
+        return snapshot
+
+    market_name = {"KOREA_1Q": "KOREA", "US_1Q": "US", "COIN": "COIN"}[selected_category]
+    analysis_by_symbol = group_analysis_market_data(market_name).get("symbol_data", {})
+    result_rows = []
+    recent_rows = []
+    for item in selected.get("symbols", []):
+        analysis = analysis_by_symbol.get(item.get("symbol"), {"positions": [], "performance_summary": [], "occurrence_stats": []})
+        stats = _member_group_engine_statistics(analysis, period_key)
+        if not stats.get("has_results"):
+            continue
+        result_rows.append((item, stats))
+        for detail in stats.get("recent5_details") or []:
+            row = dict(detail)
+            row["symbol"] = item.get("symbol")
+            row["exchange"] = item.get("exchange")
+            recent_rows.append(row)
+
+    total_results = sum(int(stats.get("result_count") or 0) for _, stats in result_rows)
+    weighted_wins = sum((float(stats.get("win_rate_pct") or 0) / 100.0) * int(stats.get("result_count") or 0) for _, stats in result_rows)
+    average_values = [float(stats["average_return_pct"]) for _, stats in result_rows if stats.get("average_return_pct") is not None]
+    best_pair = max(result_rows, key=lambda row: float(row[1].get("best_return_pct") if row[1].get("best_return_pct") is not None else -10**9), default=None)
+    recent_rows.sort(key=lambda d: _parse_iso_datetime(d.get("exit_time_iso")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    snapshot.update({
+        "category_label": selected.get("category_label") or selected_category,
+        "symbol_count": int(selected.get("symbol_count") or 0),
+        "open_count": int(selected.get("open_low_count") or 0),
+        "completed_count": total_results,
+        "average_return_pct": (sum(average_values) / len(average_values)) if average_values else None,
+        "win_rate_pct": (weighted_wins / total_results * 100.0) if total_results else None,
+        "best_return_pct": (best_pair[1].get("best_return_pct") if best_pair else None),
+        "best_symbol": (symbol_display(best_pair[0].get("symbol"), best_pair[0].get("exchange")) if best_pair else None),
+        "recent_completed": recent_rows[:3],
+    })
+    return snapshot
+
+
+@app.get("/performance/public")
+def performance_public():
+    selected_category = request.args.get("category", "KOREA_1Q").strip().upper()
+    period_key = request.args.get("period", "7d").strip().lower()
+    snapshot = _public_performance_snapshot(selected_category, period_key)
+    return render_template_string(r"""
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>빵돌이 타점 알람 성과</title>
+<style>
+:root{--bg:#0c0d0f;--card:#17191d;--line:#343841;--blue:#72d1ff;--green:#55e69a;--yellow:#ffc857;--red:#ff7878}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#fff;font-family:Arial,"Noto Sans KR",sans-serif}.wrap{max-width:1180px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:center}.brand{font-size:20px;font-weight:900}.login{color:#fff;text-decoration:none;border:1px solid #52bff2;border-radius:999px;padding:11px 18px;background:#12394d}.hero{margin-top:28px;padding:38px;border:1px solid #42505d;border-radius:24px;background:radial-gradient(circle at 80% 10%,rgba(255,200,87,.16),transparent 30%),linear-gradient(135deg,#102331,#15171c 55%,#211a0a)}.eyebrow{color:var(--yellow);font-weight:900;font-size:17px}.hero h1{font-size:46px;line-height:1.2;margin:12px 0}.hero h1 strong{color:var(--blue)}.hero p{font-size:20px;line-height:1.7;color:#d1d5db;max-width:850px}.tabs{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}.tabs a{color:var(--blue);text-decoration:none;background:#202329;border:1px solid #414650;padding:11px 15px;border-radius:999px}.tabs a.active{background:#12405a;color:#fff;border-color:#69ccff}.proof{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.metric{background:rgba(10,11,14,.82);border:1px solid #3d424b;border-radius:15px;padding:18px}.metric span{color:#aeb4be}.metric b{display:block;font-size:30px;margin-top:8px}.pos{color:var(--green)}.neg{color:var(--red)}.section{margin-top:24px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:24px}.section h2{margin:0 0 16px;font-size:28px}.live{display:grid;grid-template-columns:1.2fr 1fr;gap:14px}.live-card{border:1px solid #3a414a;border-radius:16px;padding:20px;background:#111318}.live-big{font-size:42px;font-weight:950;color:var(--yellow)}.recent{display:grid;gap:10px}.row{display:grid;grid-template-columns:1fr 1.4fr auto;gap:12px;align-items:center;padding:14px;border-radius:12px;background:#111318}.locked{position:relative;overflow:hidden;min-height:230px}.blur{filter:blur(7px);opacity:.42;user-select:none}.lock-cover{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;background:rgba(11,12,15,.38)}.lock-box{background:#101216;border:1px solid #59616d;border-radius:18px;padding:22px;max-width:460px}.lock-box h3{font-size:26px;margin:0 0 9px}.cta{display:inline-block;margin-top:14px;color:#0d1215;text-decoration:none;background:var(--yellow);padding:13px 20px;border-radius:999px;font-weight:950}.note{color:#8f96a1;font-size:13px;margin-top:16px}@media(max-width:800px){.wrap{padding:14px}.hero{padding:25px}.hero h1{font-size:34px}.hero p{font-size:17px}.proof{grid-template-columns:1fr 1fr}.live{grid-template-columns:1fr}.row{grid-template-columns:1fr}.metric b{font-size:25px}}
+</style></head><body><div class="wrap">
+<div class="top"><div class="brand">빵돌이 타점 알람</div><a class="login" href="/performance/login?role=member">회원 로그인</a></div>
+<section class="hero"><div class="eyebrow">매수 신호만 올리고 끝내지 않습니다</div><h1>우리는 신호를 자랑하지 않습니다.<br><strong>끝까지 검증된 결과를 공개합니다.</strong></h1><p>진입 알람부터 종료 알람까지 완료 사이클로 기록합니다. 처음 방문한 사람도 최근 성과와 실제 종료 결과를 확인하고, 회원은 진행 중 타점과 상세 데이터를 확인할 수 있습니다.</p>
+<div class="tabs">{% for c in snapshot.categories %}<a class="{{'active' if c.category_key == snapshot.selected_category else ''}}" href="/performance/public?category={{c.category_key}}&period={{snapshot.period_key}}">{{c.category_label}}</a>{% endfor %}</div>
+<div class="proof"><div class="metric"><span>최근 완료 사이클</span><b>{{snapshot.completed_count}}회</b></div><div class="metric"><span>평균 수익률</span><b class="{{'pos' if snapshot.average_return_pct is not none and snapshot.average_return_pct >= 0 else 'neg'}}">{% if snapshot.average_return_pct is not none %}{{'%.2f'|format(snapshot.average_return_pct)}}%{% else %}-{% endif %}</b></div><div class="metric"><span>승률</span><b>{% if snapshot.win_rate_pct is not none %}{{'%.1f'|format(snapshot.win_rate_pct)}}%{% else %}-{% endif %}</b></div><div class="metric"><span>현재 종료 대기</span><b class="live-big">{{snapshot.open_count}}건</b></div></div></section>
+<section class="section live"><div class="live-card"><div style="color:var(--yellow);font-weight:900">🔥 지금 진행 중인 알람</div><div class="live-big">{{snapshot.open_count}}개</div><p>진행 종목·시간봉·진입 정보는 회원에게만 공개됩니다.</p><a class="cta" href="/performance/login?role=member">회원 전용 화면 보기</a></div><div class="live-card"><div style="color:var(--blue);font-weight:900">이번 기간 최고 결과</div><div class="live-big {{'pos' if snapshot.best_return_pct is not none and snapshot.best_return_pct >= 0 else 'neg'}}">{% if snapshot.best_return_pct is not none %}{{'%.2f'|format(snapshot.best_return_pct)}}%{% else %}-{% endif %}</div><p>{{snapshot.best_symbol or '완료 결과 대기'}}</p></div></section>
+<section class="section"><h2>최근 놓친 완료 알람</h2><div class="recent">{% for d in snapshot.recent_completed %}<div class="row"><b>{{symbol_display(d.symbol,d.exchange)}}</b><span>매수 {{d.entry_timeframe}} → 종료 {{d.exit_timeframe}}</span><b class="{{'pos' if d.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(d.return_pct)}}%</b></div>{% else %}<div class="row">최근 완료 결과가 없습니다.</div>{% endfor %}</div></section>
+<section class="section locked"><div class="blur"><h2>회원 전용 실시간 진행 포지션</h2><div class="row"><b>종목 비공개</b><span>장기 타점 · 종료 신호 대기</span><b class="pos">진행 중</b></div><div class="row"><b>종목 비공개</b><span>스윙 타점 · 종료 신호 대기</span><b class="pos">진행 중</b></div><div class="row"><b>종목 비공개</b><span>인생타점 · 종료 신호 대기</span><b class="pos">진행 중</b></div></div><div class="lock-cover"><div class="lock-box"><h3>🔒 회원 전용 정보</h3><p>실시간 진행 종목, 매수 시간봉, 종료 알람과 상세 성과는 로그인 후 확인할 수 있습니다.</p><a class="cta" href="/performance/login?role=member">가입·이용 문의</a></div></div></section>
+<div class="note">※ 저장된 알람 신호 기준 가정 성과입니다. 실제 체결가격·수수료·슬리피지·세금에 따라 달라질 수 있습니다.</div>
+</div></body></html>""", snapshot=snapshot, symbol_display=symbol_display)
 
 @app.get("/performance/member")
 @member_required
@@ -2485,7 +2576,7 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 @media(max-width:760px){.values{grid-template-columns:repeat(2,minmax(0,1fr))}.bar-row{grid-template-columns:85px minmax(80px,1fr) 65px}}
 @media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}.symbols{grid-template-columns:1fr}.bar-row{grid-template-columns:72px minmax(60px,1fr) 58px;font-size:13px}}
 .member-alpha-table{display:grid;gap:2px}.member-alpha-head,.member-alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}.member-alpha-head{color:var(--blue);font-weight:800;border-bottom:1px solid #343438}.member-alpha-row{color:#f5f5f5;text-decoration:none;background:#131315;border-radius:8px}.member-alpha-row:hover{background:#1c1c20}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#141416)!important;box-shadow:0 0 14px rgba(255,200,87,.08)!important}.life-metric{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#151517)!important}.life-metric .title{color:var(--yellow)!important}.scalp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.scalp-card{background:#151517;border:1px solid #35353a;border-radius:14px;padding:15px}.scalp-card h3{margin:0 0 12px;color:var(--blue);font-size:19px}.scalp-main{font-size:27px;font-weight:900;margin:7px 0}.scalp-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.scalp-stat{background:#101012;border-radius:9px;padding:9px}.scalp-stat small{display:block;color:#aaa;margin-bottom:5px}.scalp-empty{min-height:150px;display:flex;align-items:center;justify-content:center;color:#777}@media(max-width:1100px){.scalp-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.scalp-grid{grid-template-columns:1fr}}
-.promo-hero{margin:18px 0 22px;padding:24px 28px;border:2px solid #4ebdf2;border-radius:18px;background:linear-gradient(135deg,#10212d 0%,#15171c 58%,#211a0a 100%);box-shadow:0 12px 34px rgba(0,0,0,.22)}.promo-kicker{color:var(--yellow);font-size:16px;font-weight:900;letter-spacing:.04em;margin-bottom:8px}.promo-title{font-size:34px;line-height:1.25;font-weight:950;margin:0;color:#fff}.promo-title strong{color:var(--blue)}.promo-copy{margin-top:11px;color:#d4d4d8;font-size:18px;line-height:1.6}.promo-proof{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px}.promo-proof>div{border:1px solid #383b43;background:rgba(9,10,13,.72);border-radius:12px;padding:12px}.promo-proof span{display:block;color:#a8a8b0;font-size:13px}.promo-proof b{display:block;margin-top:5px;font-size:22px}.promo-note{margin-top:12px;color:#888;font-size:13px}@media(max-width:800px){.promo-hero{padding:20px}.promo-title{font-size:28px}.promo-copy{font-size:16px}.promo-proof{grid-template-columns:repeat(2,1fr)}}
+.promo-hero{margin:18px 0 22px;padding:24px 28px;border:2px solid #4ebdf2;border-radius:18px;background:linear-gradient(135deg,#10212d 0%,#15171c 58%,#211a0a 100%);box-shadow:0 12px 34px rgba(0,0,0,.22)}.promo-kicker{color:var(--yellow);font-size:16px;font-weight:900;letter-spacing:.04em;margin-bottom:8px}.promo-title{font-size:34px;line-height:1.25;font-weight:950;margin:0;color:#fff}.promo-title strong{color:var(--blue)}.promo-copy{margin-top:11px;color:#d4d4d8;font-size:18px;line-height:1.6}.promo-proof{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px}.promo-proof>div{border:1px solid #383b43;background:rgba(9,10,13,.72);border-radius:12px;padding:12px}.promo-proof span{display:block;color:#a8a8b0;font-size:13px}.promo-proof b{display:block;margin-top:5px;font-size:22px}.promo-note{margin-top:12px;color:#888;font-size:13px}@media(max-width:800px){.promo-hero{padding:20px}.promo-title{font-size:28px}.promo-copy{font-size:16px}.promo-proof{grid-template-columns:repeat(2,1fr)}}.member-hook-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:12px;margin:0 0 22px}.member-hook{background:#15171b;border:1px solid #3a3e47;border-radius:15px;padding:17px}.member-hook.hot{border-color:#8a651b;background:linear-gradient(145deg,#251c08,#15171b)}.member-hook .hook-title{font-weight:900;color:var(--yellow);margin-bottom:9px}.member-hook .hook-value{font-size:30px;font-weight:950}.member-hook p{color:#aaa;margin:8px 0 0;line-height:1.5}.member-hook .recent-proof{margin-top:10px;padding-top:10px;border-top:1px solid #343840}@media(max-width:900px){.member-hook-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -2538,6 +2629,11 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
   </div>
   <div class="promo-note">※ 저장된 알람 신호 기준 가정 성과이며 수수료·슬리피지·세금은 반영되지 않을 수 있습니다.</div>
 </section>
+<div class="member-hook-grid">
+  <div class="member-hook hot"><div class="hook-title">🔥 지금 진행 중인 알람</div><div class="hook-value">{{selected.open_low_count}}개</div><p>종료 신호를 기다리는 진행 중 타점입니다. 완료되면 결과가 자동으로 기록됩니다.</p></div>
+  <div class="member-hook"><div class="hook-title">이번 기간 최고 결과</div><div class="hook-value {{'pos' if market_stats.best_return_pct is not none and market_stats.best_return_pct >= 0 else 'neg'}}">{% if market_stats.best_return_pct is not none %}{{'%+.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div><p>{% if market_stats.best_detail %}{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}} · 매수 {{market_stats.best_detail.entry_timeframe}} → 종료 {{market_stats.best_detail.exit_timeframe}}{% else %}완료 결과 대기{% endif %}</p></div>
+  <div class="member-hook"><div class="hook-title">가장 최근 완료</div>{% if market_stats.recent_completed %}{% set hook=market_stats.recent_completed[0] %}<div class="hook-value {{'pos' if hook.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(hook.return_pct)}}%</div><div class="recent-proof">{{symbol_display(hook.symbol,hook.exchange)}} · 매수 {{hook.entry_timeframe}} → 종료 {{hook.exit_timeframe}}</div>{% else %}<div class="hook-value">-</div><p>완료 결과 대기</p>{% endif %}</div>
+</div>
 <div class="market">
 <div class="market-head">
 <h2>{{selected.category_label}}</h2>
