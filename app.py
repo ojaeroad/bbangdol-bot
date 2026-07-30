@@ -17,6 +17,7 @@ from performance_store import (
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 from performance_group_analyzer import group_analysis_data, group_analysis_market_data, update_settings as update_group_settings
+from signal_cadence_simulator import simulate_cadence
 try:
     from performance_automation import (
         automation_status,
@@ -2312,6 +2313,7 @@ def performance_member():
         chart_scale = 1.0
         market_group_stats = []
         coin_segments = []
+        cadence_simulation = None
         market_stats = {
             "has_results": False,
             "average_return_pct": None,
@@ -2333,6 +2335,13 @@ def performance_member():
             market_analysis = group_analysis_market_data(
                 category_market[selected_category]
             )
+            try:
+                cadence_simulation = simulate_cadence(
+                    category_market[selected_category], period_key
+                )
+            except Exception:
+                log.exception("Cadence simulation failed")
+                cadence_simulation = None
             analysis_by_symbol = market_analysis.get(
                 "symbol_data", {}
             )
@@ -2961,6 +2970,45 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% endif %}
 {% endif %}
 
+{% if cadence_simulation %}
+<details class="chart-section collapsible-block" open>
+<summary class="section-title">알람 축소 B안 시뮬레이션</summary>
+<div style="margin-top:14px">
+<div class="notice" style="margin-bottom:14px">최초 신호는 즉시 유지하고, 같은 저점·고점 상태의 반복 알람만 봉 경계에서 줄인 결과입니다. <b>원 시간봉 주기</b>와 <b>절반 주기</b>를 동시에 비교합니다.</div>
+<div class="group-grid">
+{% for v in cadence_simulation.variants %}
+<div class="group-card">
+<div class="group-title"><span>{{v.label}}</span><span>{{v.alert_count}}건</span></div>
+<div class="tf-row tf-head"><span>감소율</span><span>완료</span><span>승률</span><span>평균수익</span><span>최고</span><span>최저</span></div>
+<div class="tf-row">
+<span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span>
+<span>{{v.completed_cycles}}</span>
+<span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span>
+<span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span>
+<span class="{{'pos' if v.best_return_pct is not none and v.best_return_pct >= 0 else 'neg' if v.best_return_pct is not none else ''}}">{% if v.best_return_pct is not none %}{{'%+.2f'|format(v.best_return_pct)}}%{% else %}-{% endif %}</span>
+<span class="{{'pos' if v.worst_return_pct is not none and v.worst_return_pct >= 0 else 'neg' if v.worst_return_pct is not none else ''}}">{% if v.worst_return_pct is not none %}{{'%+.2f'|format(v.worst_return_pct)}}%{% else %}-{% endif %}</span>
+</div></div>
+{% endfor %}
+</div>
+<h3 style="margin-top:22px">시간봉별 실제 알람 감소 비교</h3>
+<div class="member-alpha-table">
+<div class="member-alpha-head"><span>시간봉</span><span>현재</span><span>원 주기</span><span>원 주기 감소</span><span>절반 주기</span><span>절반 주기 감소</span></div>
+{% for r in cadence_simulation.timeframes %}
+<div class="member-alpha-row"><span>{{r.timeframe}}</span><span>{{r.raw_count}}</span><span>{{r.full_count}}</span><span>{{'%.1f'|format(r.full_reduction_pct)}}%</span><span>{{r.half_count}}</span><span>{{'%.1f'|format(r.half_reduction_pct)}}%</span></div>
+{% endfor %}
+</div>
+<h3 style="margin-top:22px">포지션별 결과 비교</h3>
+{% for g in cadence_simulation.groups %}
+<div class="group-card {{'life' if g.group == 'LIFE' else ''}}" style="margin-bottom:10px">
+<div class="group-title"><span>{{g.group_label}}</span><span>현재 · 원 주기 · 절반 주기</span></div>
+<div class="tf-row tf-head"><span>방식</span><span>알람</span><span>감소율</span><span>완료</span><span>승률</span><span>평균수익</span></div>
+{% for v in g.variants %}<div class="tf-row"><span>{{v.label}}</span><span>{{v.alert_count}}</span><span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span><span>{{v.completed_cycles}}</span><span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span><span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span></div>{% endfor %}
+</div>
+{% endfor %}
+<div class="small" style="margin-top:12px">※ 최초 감지는 즉시 유지합니다. 반복 신호는 UTC 자연 봉 경계 기준으로 샘플링하며, 1시간봉은 원 주기에서 매 정시, 절반 주기에서 매 30분 경계로 비교합니다. 저장된 신호 데이터 기반 가정 결과입니다.</div>
+</div></details>
+{% endif %}
+
 <div class="disclaimer">
 표시 수익률은 저장된 알람 신호를 가정 매수·종료 방식으로 계산한 통계이며,
 실제 체결가격·수수료·슬리피지·세금은 반영되지 않을 수 있습니다.
@@ -2980,6 +3028,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
             market_stats=market_stats,
             market_group_stats=market_group_stats,
             coin_segments=coin_segments,
+            cadence_simulation=cadence_simulation,
             visit_stats=visit_stats,
         ), 200
 
