@@ -19,6 +19,7 @@ import psycopg
 
 DATABASE_URL = os.getenv("PERFORMANCE_DATABASE_URL", "").strip()
 TF_MINUTES = {"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240,"6h":360,"12h":720,"1d":1440,"1w":10080}
+HALF_MINUTES = {"3m":3,"5m":5,"15m":5,"30m":15,"1h":30,"2h":60,"4h":120,"6h":180,"12h":360,"1d":720,"1w":5040}
 GROUPS = {
     "COIN":{"SCALP":["5m","15m"],"SWING":["30m","1h"],"LONG":["4h","6h"],"LIFE":["12h","1d","1w"]},
     "KOREA":{"SWING":["30m","1h"],"LONG":["4h","6h"],"LIFE":["1d","1w"]},
@@ -85,7 +86,7 @@ def _sample(signals:list[dict[str,Any]], mode:str)->list[dict[str,Any]]:
     result=[]; state={}
     for s in signals:
         key=(s["symbol"],s["type"],s["tf"])
-        cadence=s["mins"] if mode=="FULL" else max(5, s["mins"]//2)
+        cadence=s["mins"] if mode=="FULL" else HALF_MINUTES.get(s["tf"], max(5, s["mins"]//2))
         prev=state.get(key)
         # 2분 이상 공백이면 조건이 끊겼다가 새로 발생한 것으로 간주해 즉시 알림.
         new_episode=not prev or (s["time"]-prev["last_time"]).total_seconds()>125
@@ -168,4 +169,4 @@ def simulate_cadence(market:str, period_key:str="all")->dict[str,Any]:
         group_rows.append(item)
     return {"market":market,"period_key":period_key,"raw_signal_count":len(signals),"variants":variants,"timeframes":tf_rows,"groups":group_rows,
             "generated_at":datetime.now(timezone.utc).isoformat(),
-            "note":"최초 감지는 즉시 유지하고 반복 신호만 자연 봉 경계에서 샘플링한 과거 저장 신호 기준 시뮬레이션입니다."}
+            "note":"최초 감지는 즉시 유지하고 반복 신호만 자연 봉 경계에서 샘플링한 과거 저장 신호 기준 시뮬레이션입니다. 실제 Telegram 기본 운영값은 절반 주기(HALF)입니다."}

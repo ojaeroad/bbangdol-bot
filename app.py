@@ -135,6 +135,85 @@ def _can_send_now(bucket: str) -> bool:
 def _mark_sent(bucket: str):
     _LAST_SENT_AT[bucket] = now()
 
+# === Telegram cadence filter (실제 회원 알람 축소) ===
+# Pine/DB 원본 신호는 그대로 저장하고, Telegram 전송만 줄인다.
+# 기본값 HALF: 최초 즉시 + 시간봉 절반의 자연 경계에서 조건 유지 알림.
+TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "HALF").strip().upper()
+TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))
+
+# 실제 운영용 자연스러운 반복 간격. 15m의 절반 7.5분처럼 애매한 값은 5분으로 정리한다.
+_CADENCE_FULL_MIN = {
+    "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60,
+    "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440, "1w": 10080,
+}
+_CADENCE_HALF_MIN = {
+    "3m": 3, "5m": 5, "15m": 5, "30m": 15, "1h": 30,
+    "2h": 60, "4h": 120, "6h": 180, "12h": 360, "1d": 720, "1w": 5040,
+}
+_CADENCE_STATE: Dict[str, Dict[str, Any]] = {}
+_CADENCE_LOCK = threading.Lock()
+
+def _telegram_signal_parts(route: str, msg: str, symbol: str) -> Tuple[str, str, str, str]:
+    """상태 키용 종목·방향·시간봉·라우트를 추출한다."""
+    tf_m = _TF_RE.search(msg or "")
+    timeframe = tf_m.group(1).lower() if tf_m else "unknown"
+    text = (msg or "").lower()
+    if "저점" in text or "buy" in (route or "").lower():
+        direction = "LOW"
+    elif "고점" in text or "sell" in (route or "").lower():
+        direction = "HIGH"
+    else:
+        direction = "UNKNOWN"
+    clean_symbol = (symbol or "").strip().upper() or "UNKNOWN"
+    return clean_symbol, direction, timeframe, (route or "").strip().upper()
+
+def _cadence_minutes(timeframe: str) -> int:
+    if TELEGRAM_CADENCE_MODE == "FULL":
+        return _CADENCE_FULL_MIN.get(timeframe, 0)
+    return _CADENCE_HALF_MIN.get(timeframe, 0)
+
+def _decorate_cadence_message(msg: str, phase: str) -> str:
+    """최초 알람은 '집중', 반복 경계 알람은 '유지 확인'으로 명확히 표시한다."""
+    label = "집중" if phase == "FOCUS" else "유지 확인"
+    lines = (msg or "").splitlines()
+    for i, line in enumerate(lines):
+        if ("저점" in line or "고점" in line) and label not in line:
+            lines[i] = f"{line} · {label}"
+            break
+    return "\n".join(lines)
+
+def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
+    """(전송 여부, 표시 메시지, 사유). 원본 저장에는 관여하지 않는다."""
+    if not TELEGRAM_CADENCE_ENABLED:
+        return True, msg, "disabled"
+
+    sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
+    cadence = _cadence_minutes(timeframe)
+    if cadence <= 0 or direction == "UNKNOWN":
+        return True, msg, "unsupported"
+
+    now_ts = time.time()
+    slot = int(now_ts // (cadence * 60))
+    key = f"{sym}|{route_key}|{direction}|{timeframe}"
+
+    with _CADENCE_LOCK:
+        prev = _CADENCE_STATE.get(key)
+        new_episode = prev is None or (now_ts - float(prev.get("last_seen", 0))) > TELEGRAM_EPISODE_GAP_SEC
+        should_send = new_episode or slot != prev.get("last_sent_slot")
+        last_sent_slot = slot if should_send else prev.get("last_sent_slot")
+        _CADENCE_STATE[key] = {
+            "last_seen": now_ts,
+            "last_sent_slot": last_sent_slot,
+            "timeframe": timeframe,
+            "cadence_minutes": cadence,
+        }
+
+    if not should_send:
+        return False, msg, f"cadence_{cadence}m"
+    phase = "FOCUS" if new_episode else "HOLD"
+    return True, _decorate_cadence_message(msg, phase), phase.lower()
+
 def _is_duplicate(bucket: str, msg_norm: str) -> bool:
     """DEDUP_WINDOW_SEC 내 동일 버킷/메시지 반복 차단 + 주기적 청소"""
     global _opcount
@@ -4668,8 +4747,13 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
         log.error(f"[DROP] Unknown route={route} (symbol={symbol})")
         return jsonify({"ok": False, "error": "unknown_route"}), 200
 
-    bucket = _bucket_key(chat_id, symbol, route, msg)
-    msg_norm = safe_text(msg)
+    cadence_ok, cadence_msg, cadence_reason = _telegram_cadence_decision(route, msg, symbol)
+    if not cadence_ok:
+        log.info(f"TG cadence skipped route={route} symbol={symbol} reason={cadence_reason}")
+        return jsonify({"ok": True, "skipped": "cadence", "reason": cadence_reason}), 200
+
+    bucket = _bucket_key(chat_id, symbol, route, cadence_msg)
+    msg_norm = safe_text(cadence_msg)
 
     if not _can_send_now(bucket):
         return jsonify({"ok": True, "skipped": "cooldown", "bucket": bucket}), 200
