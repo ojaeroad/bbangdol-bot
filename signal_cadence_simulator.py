@@ -5,11 +5,11 @@
 - 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입한다.
 - ALL(현재): 첫 신호 이후 기존 공통 5분 쿨타임으로 최대 3회 진입.
 - FULL(원 주기): 첫 신호 이후 원 시간봉의 다음 자연 경계부터 최대 3회 진입.
-- HALF(절반 주기): 첫 신호 이후 절반 주기의 다음 자연 경계부터 최대 3회 진입.
+- HALF(운영 주기): 첫 신호 이후 운영 주기의 다음 자연 경계부터 최대 3회 진입.
 - 매도 HIGH는 샘플링하지 않고 첫 유효 HIGH 신호에서 전량 종료한다.
 
 이 계산으로 원 주기를 기다리는 동안 LOW 상태가 사라져 진입하지 못한 경우와,
-절반 주기에서만 진입 기회를 확보한 경우를 구분할 수 있다.
+운영 주기에서만 진입 기회를 확보한 경우를 구분할 수 있다.
 """
 from __future__ import annotations
 
@@ -259,7 +259,7 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
             episode["entered"] = True
             continue
 
-        # HIGH: 첫 유효 매도 신호에서 전량 종료. HIGH 자체는 원/절반 주기로 지연하지 않는다.
+        # HIGH: 첫 유효 매도 신호에서 전량 종료. HIGH 자체는 원/운영 주기로 지연하지 않는다.
         if signal["type"] == "HIGH":
             for key, position in list(open_positions.items()):
                 symbol, entry_group, _entry_tf = key
@@ -337,7 +337,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     labels = (
         ("ALL", "현재 방식"),
         ("FULL", "B안 · 원 시간봉 주기"),
-        ("HALF", "B안 · 절반 주기"),
+        ("HALF", "B안 · 운영 주기"),
     )
     for code, label in labels:
         sampled = _sample_alerts(signals, code)
@@ -368,7 +368,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     for group in GROUPS.get(market, {}):
         item = {"group": group, "group_label": GROUP_LABEL[group], "variants": []}
         raw_group_count = len([s for s in signals if s["group"] == group])
-        for code, short_label in (("ALL", "현재"), ("FULL", "원 주기"), ("HALF", "절반 주기")):
+        for code, short_label in (("ALL", "현재"), ("FULL", "원 주기"), ("HALF", "운영 주기")):
             group_sample_count = len([s for s in alert_samples[code] if s["group"] == group])
             group_cycles = [c for c in simulations[code]["cycles"] if c["group"] == group]
             group_focus = [
@@ -411,7 +411,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "
-            "원 주기는 다음 원 시간봉 경계, 절반 주기는 다음 절반 시간봉 경계부터 진입하며, "
+            "원 주기는 다음 원 시간봉 경계, 운영 주기는 다음 절반 시간봉 경계부터 진입하며, "
             "매도는 첫 유효 HIGH에서 전량 종료한 저장 신호 기반 가정 결과입니다."
         ),
     }

@@ -95,6 +95,9 @@ def version():
             "PERFORMANCE_AUTOMATION_ENABLED", "1"
         ).strip().lower() not in ("0", "false", "off", "no"),
         "economic_calendar_feature": "removed",
+        "telegram_cadence_enabled": TELEGRAM_CADENCE_ENABLED,
+        "telegram_cadence_mode": TELEGRAM_CADENCE_MODE,
+        "telegram_cadence_minutes": _CADENCE_HALF_MIN if TELEGRAM_CADENCE_MODE != "FULL" else _CADENCE_FULL_MIN,
     })
 
 @app.get("/whoami")
@@ -137,9 +140,10 @@ def _mark_sent(bucket: str):
 
 # === Telegram cadence filter (실제 회원 알람 축소) ===
 # Pine/DB 원본 신호는 그대로 저장하고, Telegram 전송만 줄인다.
-# 기본값 HALF: 최초 즉시 + 시간봉 절반의 자연 경계에서 조건 유지 알림.
+# 기본값 CUSTOM: 최초 즉시 + 운영 확정 주기 경계에서 조건 유지 알림.
+# 5m=5분, 15m=5분, 30m=15분, 1h=30분, 이후는 절반 주기.
 TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
-TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "HALF").strip().upper()
+TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "CUSTOM").strip().upper()
 TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))
 
 # 실제 운영용 자연스러운 반복 간격. 15m의 절반 7.5분처럼 애매한 값은 5분으로 정리한다.
@@ -169,8 +173,18 @@ def _telegram_signal_parts(route: str, msg: str, symbol: str) -> Tuple[str, str,
     return clean_symbol, direction, timeframe, (route or "").strip().upper()
 
 def _cadence_minutes(timeframe: str) -> int:
-    if TELEGRAM_CADENCE_MODE == "FULL":
+    """실제 텔레그램 반복 전송 주기.
+
+    FULL   : 각 원 시간봉 주기
+    HALF   : 기존 절반 주기 표
+    CUSTOM : 운영 확정값(5m=5분, 15m=5분, 나머지는 절반 주기)
+    """
+    mode = TELEGRAM_CADENCE_MODE
+    if mode == "FULL":
         return _CADENCE_FULL_MIN.get(timeframe, 0)
+    if mode in ("HALF", "CUSTOM"):
+        return _CADENCE_HALF_MIN.get(timeframe, 0)
+    # 오타/미등록 값은 알람 폭주 방지를 위해 CUSTOM으로 안전 복귀
     return _CADENCE_HALF_MIN.get(timeframe, 0)
 
 def _decorate_cadence_message(msg: str, phase: str) -> str:
