@@ -3053,20 +3053,23 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <details class="chart-section collapsible-block" open>
 <summary class="section-title">알람 축소 B안 시뮬레이션</summary>
 <div style="margin-top:14px">
-<div class="notice" style="margin-bottom:14px">최초 신호는 즉시 유지하고, 같은 저점·고점 상태의 반복 알람만 봉 경계에서 줄인 결과입니다. <b>원 시간봉 주기</b>와 <b>절반 주기</b>를 동시에 비교합니다.</div>
+<div class="notice" style="margin-bottom:14px"><b>수정된 실제 진입 기준</b><br>매수 첫 LOW는 종목 집중 알림으로만 사용하며 진입하지 않습니다. 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입합니다. 원 주기는 다음 원 시간봉 경계부터, 절반 주기는 다음 절반 시간봉 경계부터 진입하며, 매도는 첫 유효 HIGH에서 전량 종료합니다.</div>
 <div class="group-grid">
 {% for v in cadence_simulation.variants %}
 <div class="group-card">
 <div class="group-title"><span>{{v.label}}</span><span>{{v.alert_count}}건</span></div>
-<div class="tf-row tf-head"><span>감소율</span><span>완료</span><span>승률</span><span>평균수익</span><span>최고</span><span>최저</span></div>
+<div class="tf-row tf-head"><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
 <div class="tf-row">
 <span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span>
+<span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span>
+<span>{{v.no_entry_focus_count}}</span>
 <span>{{v.completed_cycles}}</span>
+<span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</span>
 <span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span>
 <span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span>
-<span class="{{'pos' if v.best_return_pct is not none and v.best_return_pct >= 0 else 'neg' if v.best_return_pct is not none else ''}}">{% if v.best_return_pct is not none %}{{'%+.2f'|format(v.best_return_pct)}}%{% else %}-{% endif %}</span>
-<span class="{{'pos' if v.worst_return_pct is not none and v.worst_return_pct >= 0 else 'neg' if v.worst_return_pct is not none else ''}}">{% if v.worst_return_pct is not none %}{{'%+.2f'|format(v.worst_return_pct)}}%{% else %}-{% endif %}</span>
-</div></div>
+</div>
+<div class="small" style="margin-top:10px">집중 {{v.focus_count}}회 · 실제 진입 {{v.entered_focus_count}}회 · 1회진입 {{v.one_entry_cycles}} · 2회진입 {{v.two_entry_cycles}} · 3회진입 {{v.three_entry_cycles}}</div>
+</div>
 {% endfor %}
 </div>
 <h3 style="margin-top:22px">시간봉별 실제 알람 감소 비교</h3>
@@ -3080,11 +3083,11 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% for g in cadence_simulation.groups %}
 <div class="group-card {{'life' if g.group == 'LIFE' else ''}}" style="margin-bottom:10px">
 <div class="group-title"><span>{{g.group_label}}</span><span>현재 · 원 주기 · 절반 주기</span></div>
-<div class="tf-row tf-head"><span>방식</span><span>알람</span><span>감소율</span><span>완료</span><span>승률</span><span>평균수익</span></div>
-{% for v in g.variants %}<div class="tf-row"><span>{{v.label}}</span><span>{{v.alert_count}}</span><span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span><span>{{v.completed_cycles}}</span><span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span><span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span></div>{% endfor %}
+<div class="tf-row tf-head"><span>방식</span><span>알람</span><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
+{% for v in g.variants %}<div class="tf-row"><span>{{v.label}}</span><span>{{v.alert_count}}</span><span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span><span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span><span>{{v.no_entry_focus_count}}</span><span>{{v.completed_cycles}}</span><span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}{% else %}-{% endif %}</span><span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span><span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span></div>{% endfor %}
 </div>
 {% endfor %}
-<div class="small" style="margin-top:12px">※ 최초 감지는 즉시 유지합니다. 반복 신호는 UTC 자연 봉 경계 기준으로 샘플링하며, 1시간봉은 원 주기에서 매 정시, 절반 주기에서 매 30분 경계로 비교합니다. 저장된 신호 데이터 기반 가정 결과입니다.</div>
+<div class="small" style="margin-top:12px">※ 핵심 확인값은 <b>진입포착률·미진입·평균 진입횟수</b>입니다. 원 주기를 기다리는 동안 LOW가 해제되어 진입하지 못한 경우는 미진입으로 계산됩니다. 1시간봉은 원 주기에서 다음 정시부터, 절반 주기에서 다음 30분 경계부터 최대 3회 진입합니다. 매도는 첫 유효 고점 신호입니다.</div>
 </div></details>
 {% endif %}
 
