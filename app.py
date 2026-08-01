@@ -1,3 +1,4 @@
+# V44_FINAL_CADENCE: 실제 Telegram 전송 축소 + 회원 페이지 목차/모바일/캐시 최종본
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
 import os, json, logging, time, re, hmac, hashlib, math, threading
 import csv
