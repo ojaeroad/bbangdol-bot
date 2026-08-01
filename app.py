@@ -2363,8 +2363,41 @@ def performance_public():
 <div class="note">※ 저장된 알람 신호 기준 가정 성과입니다. 실제 체결가격·수수료·슬리피지·세금에 따라 달라질 수 있습니다.</div>
 </div></body></html>""", snapshot=snapshot, symbol_display=symbol_display)
 
+
+# 회원 메인 화면 단기 캐시: 무료 Render에서도 반복 클릭 시 전체 통계를 매번 재계산하지 않는다.
+# 신호 데이터는 계속 저장되며, 화면 캐시는 기본 45초 뒤 자동 갱신된다.
+_MEMBER_PAGE_CACHE = {}
+_MEMBER_PAGE_CACHE_LOCK = threading.Lock()
+_MEMBER_PAGE_CACHE_TTL = max(5, int(os.getenv("PERFORMANCE_MEMBER_CACHE_SECONDS", "45") or 45))
+
+
+def member_page_cache(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        # 세션 인증 후 실행되므로 회원 화면에만 적용한다.
+        cache_key = request.full_path.rstrip("?")
+        current = time.time()
+        with _MEMBER_PAGE_CACHE_LOCK:
+            cached = _MEMBER_PAGE_CACHE.get(cache_key)
+            if cached and current - cached[0] < _MEMBER_PAGE_CACHE_TTL:
+                return cached[1]
+        response = view_func(*args, **kwargs)
+        # 오류 JSON은 캐시하지 않고 정상 HTML 응답만 캐시한다.
+        status = response[1] if isinstance(response, tuple) and len(response) > 1 else 200
+        if status == 200:
+            with _MEMBER_PAGE_CACHE_LOCK:
+                _MEMBER_PAGE_CACHE[cache_key] = (current, response)
+                # 무한 증가 방지
+                if len(_MEMBER_PAGE_CACHE) > 40:
+                    oldest = min(_MEMBER_PAGE_CACHE, key=lambda k: _MEMBER_PAGE_CACHE[k][0])
+                    _MEMBER_PAGE_CACHE.pop(oldest, None)
+        return response
+    return wrapped
+
+
 @app.get("/performance/member")
 @member_required
+@member_page_cache
 def performance_member():
     try:
         visitor_source = f"{request.remote_addr or ''}|{request.headers.get('User-Agent','')}|{app.secret_key}"
@@ -2679,6 +2712,17 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 @media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}.symbols{grid-template-columns:1fr}.bar-row{grid-template-columns:72px minmax(60px,1fr) 58px;font-size:13px}}
 .member-alpha-table{display:grid;gap:2px}.member-alpha-head,.member-alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}.member-alpha-head{color:var(--blue);font-weight:800;border-bottom:1px solid #343438}.member-alpha-row{color:#f5f5f5;text-decoration:none;background:#131315;border-radius:8px}.member-alpha-row:hover{background:#1c1c20}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#141416)!important;box-shadow:0 0 14px rgba(255,200,87,.08)!important}.life-metric{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#151517)!important}.life-metric .title{color:var(--yellow)!important}.scalp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.scalp-card{background:#151517;border:1px solid #35353a;border-radius:14px;padding:15px}.scalp-card h3{margin:0 0 12px;color:var(--blue);font-size:19px}.scalp-main{font-size:27px;font-weight:900;margin:7px 0}.scalp-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.scalp-stat{background:#101012;border-radius:9px;padding:9px}.scalp-stat small{display:block;color:#aaa;margin-bottom:5px}.scalp-empty{min-height:150px;display:flex;align-items:center;justify-content:center;color:#777}@media(max-width:1100px){.scalp-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.scalp-grid{grid-template-columns:1fr}}
 .promo-hero{margin:18px 0 22px;padding:24px 28px;border:2px solid #4ebdf2;border-radius:18px;background:linear-gradient(135deg,#10212d 0%,#15171c 58%,#211a0a 100%);box-shadow:0 12px 34px rgba(0,0,0,.22)}.promo-kicker{color:var(--yellow);font-size:16px;font-weight:900;letter-spacing:.04em;margin-bottom:8px}.promo-title{font-size:34px;line-height:1.25;font-weight:950;margin:0;color:#fff}.promo-title strong{color:var(--blue)}.promo-copy{margin-top:11px;color:#d4d4d8;font-size:18px;line-height:1.6}.promo-proof{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px}.promo-proof>div{border:1px solid #383b43;background:rgba(9,10,13,.72);border-radius:12px;padding:12px}.promo-proof span{display:block;color:#a8a8b0;font-size:13px}.promo-proof b{display:block;margin-top:5px;font-size:22px}.promo-note{margin-top:12px;color:#888;font-size:13px}@media(max-width:800px){.promo-hero{padding:20px}.promo-title{font-size:28px}.promo-copy{font-size:16px}.promo-proof{grid-template-columns:repeat(2,1fr)}}.member-hook-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:12px;margin:0 0 22px}.member-hook{background:#15171b;border:1px solid #3a3e47;border-radius:15px;padding:17px}.member-hook.hot{border-color:#8a651b;background:linear-gradient(145deg,#251c08,#15171b)}.member-hook .hook-title{font-weight:900;color:var(--yellow);margin-bottom:9px}.member-hook .hook-value{font-size:30px;font-weight:950}.member-hook p{color:#aaa;margin:8px 0 0;line-height:1.5}.member-hook .recent-proof{margin-top:10px;padding-top:10px;border-top:1px solid #343840}@media(max-width:900px){.member-hook-grid{grid-template-columns:1fr}}
+/* v43: 한 화면에 모든 섹션을 쌓지 않고 목차로 전환 */
+.member-shell{display:grid;grid-template-columns:220px minmax(0,1fr);gap:18px;align-items:start}
+.member-side{position:sticky;top:12px;background:#15171b;border:1px solid #353943;border-radius:16px;padding:12px;z-index:20}
+.member-side-title{font-weight:950;color:var(--blue);font-size:18px;padding:8px 9px 12px}
+.member-nav{display:grid;gap:6px}.member-nav button{width:100%;border:0;border-radius:10px;background:transparent;color:#d8dbe1;text-align:left;padding:11px 12px;font-size:15px;font-weight:800;cursor:pointer}.member-nav button:hover,.member-nav button.active{background:#113b50;color:#fff}.member-nav button.life{color:var(--yellow)}
+.member-tools{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid #30343b}.member-tools button{border:1px solid #3d424c;background:#202329;color:#ddd;border-radius:9px;padding:8px;cursor:pointer}
+.member-main{min-width:0}.mobile-menu-button{display:none;position:sticky;top:8px;z-index:55;width:100%;border:1px solid #56c5fa;background:#12384b;color:#fff;border-radius:12px;padding:12px 14px;font-size:16px;font-weight:900;margin:0 0 12px;cursor:pointer}.mobile-menu-backdrop{display:none}
+.member-view-hidden{display:none!important}.member-view{scroll-margin-top:18px}.main-core-note{color:#9ca3af;font-size:13px;margin:8px 0 14px}.main-quick-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}.main-quick{border:1px solid #373b44;background:#15171b;border-radius:13px;padding:14px;cursor:pointer;color:#fff;text-align:left}.main-quick b{display:block;color:var(--blue);font-size:17px;margin-bottom:5px}.main-quick span{color:#aeb4be;font-size:13px}
+.section-loader{position:fixed;right:18px;bottom:18px;padding:10px 14px;border-radius:999px;background:#12384b;border:1px solid #56c5fa;display:none;z-index:99}
+@media(max-width:980px){.member-shell{display:block}.member-side{display:none;position:fixed;left:12px;right:12px;top:70px;max-height:calc(100vh - 90px);overflow:auto;box-shadow:0 18px 55px rgba(0,0,0,.55);z-index:70}.member-side.open{display:block}.mobile-menu-button{display:block}.mobile-menu-backdrop.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:60}.main-quick-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.main-quick-grid{grid-template-columns:1fr}.member-nav button{padding:13px 12px;font-size:16px}.member-side{top:64px}.promo-hero{margin-top:8px}}
 </style>
 </head>
 <body>
@@ -2719,7 +2763,35 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 
 {% if selected %}
-<section class="promo-hero">
+<button class="mobile-menu-button" type="button" id="mobileMenuButton">☰ 주요 섹션 메뉴</button>
+<div class="mobile-menu-backdrop" id="mobileMenuBackdrop"></div>
+<div class="member-shell">
+<aside class="member-side" id="memberSide">
+  <div class="member-side-title">주요 섹션</div>
+  <nav class="member-nav" id="memberNav">
+    <button type="button" class="active" data-view="overview">핵심 요약</button>
+    <button type="button" data-view="positions">포지션별 성과</button>
+    <button type="button" data-view="top5">수익률·승률 TOP5</button>
+    <button type="button" data-view="recent">최근 완료 5건</button>
+    <button type="button" class="life" data-view="life">인생타점 상세</button>
+    <button type="button" data-view="symbols-performance">종목별 수익률</button>
+    <button type="button" data-view="timeframes">시간봉별 상세</button>
+    <button type="button" data-view="symbols">종목 목록</button>
+    <button type="button" data-view="cadence">알람 축소 분석</button>
+  </nav>
+  <div class="member-tools">
+    <button type="button" id="openAllButton">전체 펼치기</button>
+    <button type="button" id="closeAllButton">전체 접기</button>
+  </div>
+</aside>
+<main class="member-main" id="memberMain">
+<div class="main-quick-grid member-view" data-member-view="overview">
+  <button class="main-quick" type="button" data-jump="positions"><b>포지션 성과</b><span>단타·스윙·장기·인생타점</span></button>
+  <button class="main-quick" type="button" data-jump="recent"><b>최근 완료</b><span>가장 최근 검증 결과 5건</span></button>
+  <button class="main-quick" type="button" data-jump="symbols-performance"><b>종목별 성과</b><span>누적·최근 수익률 비교</span></button>
+  <button class="main-quick" type="button" data-jump="cadence"><b>알람 분석</b><span>원 주기·운영 주기 비교</span></button>
+</div>
+<section class="promo-hero member-view" data-member-view="overview">
   <div class="promo-kicker">실제 알람 결과를 완료 사이클로 검증합니다</div>
   <h2 class="promo-title">감이 아닌 <strong>기록으로 확인하는 타점</strong></h2>
   <div class="promo-copy">진입 알람부터 종료 알람까지 모든 결과를 저장하고, 회원이 실제로 따라갔을 때의 기준으로 수익률·승률·보유기간을 공개합니다.</div>
@@ -2731,12 +2803,12 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
   </div>
   <div class="promo-note">※ 저장된 알람 신호 기준 가정 성과이며 수수료·슬리피지·세금은 반영되지 않을 수 있습니다.</div>
 </section>
-<div class="member-hook-grid">
+<div class="member-hook-grid member-view" data-member-view="overview">
   <div class="member-hook hot"><div class="hook-title">🔥 지금 진행 중인 알람</div><div class="hook-value">{{selected.open_low_count}}개</div><p>종료 신호를 기다리는 진행 중 타점입니다. 완료되면 결과가 자동으로 기록됩니다.</p></div>
   <div class="member-hook"><div class="hook-title">이번 기간 최고 결과</div><div class="hook-value {{'pos' if market_stats.best_return_pct is not none and market_stats.best_return_pct >= 0 else 'neg'}}">{% if market_stats.best_return_pct is not none %}{{'%+.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div><p>{% if market_stats.best_detail %}{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}} · 매수 {{market_stats.best_detail.entry_timeframe}} → 종료 {{market_stats.best_detail.exit_timeframe}}{% else %}완료 결과 대기{% endif %}</p></div>
   <div class="member-hook"><div class="hook-title">가장 최근 완료</div>{% if market_stats.recent_completed %}{% set hook=market_stats.recent_completed[0] %}<div class="hook-value {{'pos' if hook.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(hook.return_pct)}}%</div><div class="recent-proof">{{symbol_display(hook.symbol,hook.exchange)}} · 매수 {{hook.entry_timeframe}} → 종료 {{hook.exit_timeframe}}</div>{% else %}<div class="hook-value">-</div><p>완료 결과 대기</p>{% endif %}</div>
 </div>
-<div class="market">
+<div class="market member-view" data-member-view="overview">
 <div class="market-head">
 <h2>{{selected.category_label}}</h2>
 <div class="badges">
@@ -2834,7 +2906,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% if selected.symbol_count %}
 
 {% if ranked_symbols %}
-<details class="chart-section collapsible-block" open><summary class="section-title">포지션별 성과</summary>
+<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="positions" open><summary class="section-title">포지션별 성과</summary>
 <div class="trust-grid">
 {% for group in market_group_stats %}
 <a class="trust-card {{'life' if group.group_key == 'LIFE' else ''}}" href="/performance/member/group?category={{selected_category}}&group={{group.group_key}}&period={{period_key}}">
@@ -2860,7 +2932,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% endfor %}
 </div></details>
 
-<details class="titled-section collapsible-block" open><summary class="section-title">수익률·승률 TOP 5</summary><div class="ranking-wrap" style="margin-top:14px">
+<details class="titled-section collapsible-block member-view member-view-hidden" data-member-view="top5" open><summary class="section-title">수익률·승률 TOP 5</summary><div class="ranking-wrap" style="margin-top:14px">
 <div class="ranking">
 <h3>평균 수익률 TOP 5</h3>
 {% for s in average_ranking %}
@@ -2897,7 +2969,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </details>
 
 {% if market_stats.recent_completed %}
-<details class="chart-section collapsible-block" open>
+<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="recent" open>
 <summary class="section-title">최근 완료 5건</summary>
 <div class="recent-grid" style="margin-top:14px">
 {% for detail in market_stats.recent_completed %}
@@ -2911,7 +2983,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </details>
 {% endif %}
 
-<details class="chart-section collapsible-block life-section" open>
+<details class="chart-section collapsible-block life-section member-view member-view-hidden" data-member-view="life" open>
 <summary class="section-title life-title">
 인생타점 상세 성과
 </summary>
@@ -2951,7 +3023,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 </details>
 
-<details class="chart-section collapsible-block" open>
+<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="symbols-performance" open>
 <summary class="section-title">종목별 수익률 현황</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률은 가장 최근에 완료된 사이클의 평균 수익률입니다.</div>
@@ -2989,7 +3061,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 </details>
 
-<details class="chart-section">
+<details class="chart-section member-view member-view-hidden" data-member-view="timeframes">
 <summary class="section-title">
 매수·종료 시간봉별 상세 성과
 </summary>
@@ -3036,7 +3108,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 </details>
 
-<details class="chart-section collapsible-block" open><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbols">
+<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="symbols" open><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbols">
 {% for s in selected.symbols %}
 <a class="symbol" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}">
 <h3>{{symbol_display(s.symbol, s.exchange)}}</h3>
@@ -3064,7 +3136,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% endif %}
 
 {% if cadence_simulation %}
-<details class="chart-section collapsible-block" open>
+<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="cadence" open>
 <summary class="section-title">알람 축소 B안 시뮬레이션</summary>
 <div style="margin-top:14px">
 <div class="notice" style="margin-bottom:14px"><b>수정된 실제 진입 기준</b><br>매수 첫 LOW는 종목 집중 알림으로만 사용하며 진입하지 않습니다. 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입합니다. 원 주기는 다음 원 시간봉 경계부터, 절반 주기는 다음 절반 시간봉 경계부터 진입하며, 매도는 첫 유효 HIGH에서 전량 종료합니다.</div>
@@ -3105,10 +3177,40 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div></details>
 {% endif %}
 
-<div class="disclaimer">
+<div class="disclaimer member-view" data-member-view="overview">
 표시 수익률은 저장된 알람 신호를 가정 매수·종료 방식으로 계산한 통계이며,
 실제 체결가격·수수료·슬리피지·세금은 반영되지 않을 수 있습니다.
 </div>
+</main></div>
+<div class="section-loader" id="sectionLoader">화면 전환 중…</div>
+<script>
+(function(){
+ const nav=document.getElementById('memberNav'); if(!nav) return;
+ const side=document.getElementById('memberSide');
+ const backdrop=document.getElementById('mobileMenuBackdrop');
+ const mobileButton=document.getElementById('mobileMenuButton');
+ const views=[...document.querySelectorAll('[data-member-view]')];
+ function closeMenu(){side.classList.remove('open');backdrop.classList.remove('open');}
+ function showView(name, updateHash=true){
+   views.forEach(el=>el.classList.toggle('member-view-hidden',el.dataset.memberView!==name));
+   nav.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===name));
+   const target=views.find(el=>el.dataset.memberView===name);
+   if(target && target.tagName==='DETAILS') target.open=true;
+   if(updateHash) history.replaceState(null,'','#'+name);
+   closeMenu(); window.scrollTo({top:0,behavior:'smooth'});
+   try{sessionStorage.setItem('memberSelectedView',name);}catch(e){}
+ }
+ nav.addEventListener('click',e=>{const b=e.target.closest('[data-view]');if(b)showView(b.dataset.view)});
+ document.querySelectorAll('[data-jump]').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.jump)));
+ mobileButton.addEventListener('click',()=>{side.classList.toggle('open');backdrop.classList.toggle('open')});
+ backdrop.addEventListener('click',closeMenu);
+ document.getElementById('openAllButton').addEventListener('click',()=>document.querySelectorAll('details').forEach(d=>d.open=true));
+ document.getElementById('closeAllButton').addEventListener('click',()=>document.querySelectorAll('details').forEach(d=>d.open=false));
+ let initial=(location.hash||'').replace('#','');
+ if(!nav.querySelector('[data-view="'+initial+'"]')){try{initial=sessionStorage.getItem('memberSelectedView')||'overview'}catch(e){initial='overview'}}
+ showView(initial,false);
+})();
+</script>
 </body>
 </html>
             """,
