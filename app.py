@@ -145,7 +145,8 @@ def _mark_sent(bucket: str):
 # 5m=5분, 15m=5분, 30m=15분, 1h=30분, 이후는 절반 주기.
 TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "CUSTOM").strip().upper()
-TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))
+TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))  # 하위 호환용(실제 판정에는 사용하지 않음)
+TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC = int(os.getenv("TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC", "90"))
 
 # 실제 운영용 자연스러운 반복 간격. 15m의 절반 7.5분처럼 애매한 값은 5분으로 정리한다.
 _CADENCE_FULL_MIN = {
@@ -199,7 +200,18 @@ def _decorate_cadence_message(msg: str, phase: str) -> str:
     return "\n".join(lines)
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
-    """(전송 여부, 표시 메시지, 사유). 원본 저장에는 관여하지 않는다."""
+    """실제 Telegram 전송 주기 판정.
+
+    핵심 규칙
+    1) 같은 종목·방향·시간봉의 첫 신호는 딱 한 번 ``집중``으로 보낸다.
+    2) 같은 자연 주기 슬롯 안에서 들어오는 반복 신호는 전부 막는다.
+    3) 바로 다음 자연 경계에서 신호가 계속 들어오면 ``유지 확인``으로 한 번 보낸다.
+    4) 예정 경계를 한 번이라도 놓친 뒤 다시 들어온 신호는 새 ``집중``으로 시작한다.
+
+    예: 1h 신호 / 운영주기 30분
+        05:01 집중 → 05:09·05:23 차단 → 05:30 유지 확인
+        05:30에 신호가 없고 05:41에 재발생 → 새 집중
+    """
     if not TELEGRAM_CADENCE_ENABLED:
         return True, msg, "disabled"
 
@@ -209,24 +221,48 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
         return True, msg, "unsupported"
 
     now_ts = time.time()
-    slot = int(now_ts // (cadence * 60))
+    cadence_sec = cadence * 60
+    slot = int(now_ts // cadence_sec)
+    seconds_after_boundary = int(now_ts % cadence_sec)
     key = f"{sym}|{route_key}|{direction}|{timeframe}"
 
     with _CADENCE_LOCK:
         prev = _CADENCE_STATE.get(key)
-        new_episode = prev is None or (now_ts - float(prev.get("last_seen", 0))) > TELEGRAM_EPISODE_GAP_SEC
-        should_send = new_episode or slot != prev.get("last_sent_slot")
-        last_sent_slot = slot if should_send else prev.get("last_sent_slot")
+
+        if prev is None:
+            phase = "FOCUS"
+            should_send = True
+        else:
+            previous_slot = int(prev.get("last_seen_slot", slot))
+
+            if slot == previous_slot:
+                # 같은 슬롯에서 1분 단위로 반복되는 신호는 모두 차단한다.
+                phase = "SUPPRESS"
+                should_send = False
+            else:
+                is_immediate_next_slot = slot == previous_slot + 1
+                is_boundary_signal = seconds_after_boundary <= TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC
+
+                if is_immediate_next_slot and is_boundary_signal:
+                    # 끊기지 않고 바로 다음 자연 경계에서 확인된 경우만 유지 신호다.
+                    phase = "HOLD"
+                    should_send = True
+                else:
+                    # 경계를 놓쳤거나 여러 슬롯이 지나 재등장하면 새 집중 신호로 본다.
+                    phase = "FOCUS"
+                    should_send = True
+
         _CADENCE_STATE[key] = {
             "last_seen": now_ts,
-            "last_sent_slot": last_sent_slot,
+            "last_seen_slot": slot,
+            "last_sent_slot": slot if should_send else (prev or {}).get("last_sent_slot"),
             "timeframe": timeframe,
             "cadence_minutes": cadence,
+            "phase": phase,
         }
 
     if not should_send:
-        return False, msg, f"cadence_{cadence}m"
-    phase = "FOCUS" if new_episode else "HOLD"
+        return False, msg, f"same_slot_{cadence}m"
     return True, _decorate_cadence_message(msg, phase), phase.lower()
 
 def _is_duplicate(bucket: str, msg_norm: str) -> bool:
