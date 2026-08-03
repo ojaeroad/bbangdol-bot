@@ -311,19 +311,21 @@ def _format_kst(value: Any, multiline: bool = False) -> str:
     if dt is None:
         return "-"
     local = dt.astimezone(KST)
-    return local.strftime("%Y-%m-%d\\n%H:%M KST" if multiline else "%Y-%m-%d %H:%M KST")
+    return local.strftime("%y.%m.%d\\n%H:%M KST" if multiline else "%y.%m.%d %H:%M KST")
 
 
 def _price(value: Any) -> str:
+    """가격을 불필요하게 길게 표시하지 않고 약 4자리 유효숫자로 정리한다."""
     try:
         number = float(value)
     except (TypeError, ValueError):
         return "-"
-    if abs(number) >= 1000:
-        return f"{number:,.2f}".rstrip("0").rstrip(".")
-    if abs(number) >= 1:
-        return f"{number:.4f}".rstrip("0").rstrip(".")
-    return f"{number:.8f}".rstrip("0").rstrip(".")
+    if number == 0:
+        return "0"
+    import math
+    magnitude = math.floor(math.log10(abs(number)))
+    decimals = max(0, min(10, 3 - magnitude))  # 약 4자리 유효숫자
+    return f"{number:,.{decimals}f}".rstrip("0").rstrip(".")
 
 
 def _send_photo(chat_id: str, png: bytes, caption: str) -> None:
@@ -424,7 +426,7 @@ def render_exit_image(
         ("매수 시간봉", position.get("entry_timeframe") or "-"),
         ("매수 시각", _format_kst(position.get("entry_first_time"), multiline=True)),
         ("분할 매수", f"{position.get('entry_count', 0)}회"),
-        ("평균 매수가", _price(position.get("entry_price"))),
+        ("평균 진입가", _price(position.get("entry_price"))),
         ("종료 시간봉", result.get("exit_timeframe") or "-"),
         ("종료 시각", _format_kst(result.get("exit_time"), multiline=True)),
         ("종료가", _price(result.get("exit_price"))),
@@ -440,10 +442,10 @@ def render_exit_image(
         row = idx // 4
         x = 70 + col * col_w
         y = 275 + row * 165
-        draw.text((x, y), label, font=_font(19, True), fill=blue)
+        draw.text((x, y), label, font=_font(23, True), fill=blue)
         lines = str(value).split("\\n")
         for line_idx, line in enumerate(lines):
-            draw.text((x, y + 38 + line_idx * 32), line, font=_font(24 if len(line) < 15 else 19, True), fill=white)
+            draw.text((x, y + 38 + line_idx * 32), line, font=_font(29 if len(line) < 15 else 23, True), fill=white)
 
     return_pct = float(result.get("return_pct") or 0)
     candle_low = min((c["low"] for c in candles), default=None)
@@ -500,18 +502,18 @@ def render_cycle_summary_image(
 
     # 매수 정보는 별도 카드로 분리하여 종료 정보와 혼동되지 않게 한다.
     _rounded(draw, (45, 265, 1035, 555), fill="#15161a", outline="#ffc857")
-    draw.text((70, 286), "① 매수 정보", font=_font(33, True), fill=gold)
+    draw.text((70, 286), "① 매수(진입) 정보", font=_font(33, True), fill=gold)
     buy_rows = [
         ("매수 시간봉", position.get("entry_timeframe") or "-"),
-        ("평균 매수가", _price(position.get("entry_price"))),
+        ("평균 진입가", _price(position.get("entry_price"))),
         ("진입 횟수", f"{position.get('entry_count', 0)}회"),
-        ("최초 매수 시각", _format_kst(position.get("entry_first_time"))),
+        ("최초 진입 시각", _format_kst(position.get("entry_first_time"))),
     ]
     for idx, (label, value) in enumerate(buy_rows):
         x = 70 + (idx % 2) * 480
         y = 350 + (idx // 2) * 92
-        draw.text((x, y), label, font=_font(21, True), fill=blue)
-        draw.text((x + 170, y - 3), str(value), font=_font(25, True), fill=white)
+        draw.text((x, y), label, font=_font(29, True), fill=blue)
+        draw.text((x + 170, y - 3), str(value), font=_font(30, True), fill=white)
 
     _rounded(draw, (45, 600, 1035, 1125), fill="#111216")
     draw.text((70, 625), f"② 매수 → 매도 가격 흐름 ({interval}분봉 압축)", font=_font(32, True), fill=white)
@@ -523,21 +525,21 @@ def render_cycle_summary_image(
         low = None
     adverse = (((low - float(position["entry_price"])) / float(position["entry_price"]) * 100) if low is not None else float(position.get("signal_adverse_pct") or 0))
 
-    draw.text((60, 1170), "③ 매도 시간봉별 결과", font=_font(36, True), fill=gold)
-    draw.text((75, 1225), "매도 TF", font=_font(21, True), fill=blue)
-    draw.text((230, 1225), "매도가", font=_font(21, True), fill=blue)
-    draw.text((455, 1225), "수익률", font=_font(21, True), fill=blue)
-    draw.text((650, 1225), "매도 시각", font=_font(21, True), fill=blue)
+    draw.text((60, 1170), "③ 매도(종료) 시간봉별 결과", font=_font(36, True), fill=gold)
+    draw.text((75, 1225), "매도 TF", font=_font(29, True), fill=blue)
+    draw.text((230, 1225), "매도가", font=_font(29, True), fill=blue)
+    draw.text((455, 1225), "수익률", font=_font(29, True), fill=blue)
+    draw.text((650, 1225), "매도 시각", font=_font(29, True), fill=blue)
     y = 1270
     returns = []
     for result in results:
         value = float(result.get("return_pct") or 0)
         returns.append(value)
         _rounded(draw, (55, y, 1025, y + 102), fill="#15161a")
-        draw.text((80, y + 30), f"매도 {result.get('exit_timeframe') or '-'}", font=_font(25, True), fill=blue)
-        draw.text((230, y + 30), _price(result.get("exit_price")), font=_font(25, True), fill=white)
+        draw.text((80, y + 30), f"매도 {result.get('exit_timeframe') or '-'}", font=_font(29, True), fill=blue)
+        draw.text((230, y + 30), _price(result.get("exit_price")), font=_font(30, True), fill=white)
         draw.text((455, y + 24), f"{value:+.3f}%", font=_font(32, True), fill=green if value >= 0 else red)
-        draw.text((650, y + 21), _format_kst(result.get("exit_time"), multiline=True), font=_font(21, True), fill=white)
+        draw.text((650, y + 21), _format_kst(result.get("exit_time"), multiline=True), font=_font(24, True), fill=white)
         y += 118
 
     if returns:
@@ -702,13 +704,13 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                         entry_count = position.get("entry_count", 0)
                         caption_lines = [
                             f"✅ {symbol} · 매도 {GROUP_LABEL.get(exit_group, exit_group)} 종합",
-                            f"🟠 매수 {entry_tf} · 평균가 {entry_price} · {entry_count}회 · {_format_kst(position.get('entry_first_time'))}",
+                            f"🟠 매수 {entry_tf}  |  평균 진입가 {entry_price}  |  {entry_count}회  |  {_format_kst(position.get('entry_first_time'))}",
                         ]
                         for row in sorted(group_results, key=lambda item: item.get("exit_timeframe_minutes", 0)):
                             caption_lines.append(
-                                f"🟢 매도 {row.get('exit_timeframe','-')} · "
-                                f"매도가 {_price(row.get('exit_price'))} · "
-                                f"{float(row.get('return_pct') or 0):+.3f}% · "
+                                f"🟢 매도 {row.get('exit_timeframe','-')}  |  "
+                                f"매도가 {_price(row.get('exit_price'))}  |  "
+                                f"수익률 {float(row.get('return_pct') or 0):+.3f}%  |  "
                                 f"{_format_kst(row.get('exit_time'))}"
                             )
                         caption_lines.append(

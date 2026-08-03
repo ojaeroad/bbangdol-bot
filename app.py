@@ -190,13 +190,27 @@ def _cadence_minutes(timeframe: str) -> int:
     return _CADENCE_HALF_MIN.get(timeframe, 0)
 
 def _decorate_cadence_message(msg: str, phase: str) -> str:
-    """최초 알람은 '집중', 반복 경계 알람은 '유지 확인'으로 명확히 표시한다."""
-    label = "집중" if phase == "FOCUS" else "유지 확인"
+    """알람 문구를 모바일에서 즉시 구분되도록 정리한다.
+
+    - ``ALL 저점``/``ALL 고점``은 각각 ``[저점]``/``[고점]``으로 축약한다.
+    - 최초 감지는 ``🚨 신규 집중``으로 표시한다.
+    - 자연 경계의 반복 확인은 ``🔁 신호 유지``로 표시한다.
+    """
+    phase_label = "🚨 신규 집중" if phase == "FOCUS" else "🔁 신호 유지"
     lines = (msg or "").splitlines()
     for i, line in enumerate(lines):
-        if ("저점" in line or "고점" in line) and label not in line:
-            lines[i] = f"{line} · {label}"
+        normalized = (line
+            .replace("ALL 저점", "[저점]")
+            .replace("ALL 고점", "[고점]")
+        )
+        if "저점" in normalized or "고점" in normalized:
+            # 과거 버전 문구가 섞여 들어와도 중복되지 않게 제거한다.
+            for old_label in (" · 집중", " · 유지 확인", " · 🚨 신규 집중", " · 🔁 신호 유지"):
+                normalized = normalized.replace(old_label, "")
+            normalized = f"{normalized} · {phase_label}"
+            lines[i] = normalized
             break
+        lines[i] = normalized
     return "\n".join(lines)
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
