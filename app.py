@@ -1,4 +1,4 @@
-# V44_FINAL_CADENCE: 실제 Telegram 전송 축소 + 회원 페이지 목차/모바일/캐시 최종본
+# V50_MASTER: 관리자·회원 목차/모바일/속도/메뉴 반응 최종 통합본
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
 import os, json, logging, time, re, hmac, hashlib, math, threading
 import csv
@@ -75,7 +75,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "dev")
+APP_VERSION  = os.getenv("APP_VERSION", "v50-master")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # 회원 전용 주간·월간 성과 리포트 공지방.
@@ -96,6 +96,7 @@ def version():
             "PERFORMANCE_AUTOMATION_ENABLED", "1"
         ).strip().lower() not in ("0", "false", "off", "no"),
         "economic_calendar_feature": "removed",
+        "ui_release": "V50_MASTER",
         "telegram_cadence_enabled": TELEGRAM_CADENCE_ENABLED,
         "telegram_cadence_mode": TELEGRAM_CADENCE_MODE,
         "telegram_cadence_minutes": _CADENCE_HALF_MIN if TELEGRAM_CADENCE_MODE != "FULL" else _CADENCE_FULL_MIN,
@@ -4468,7 +4469,7 @@ def performance_dashboard():
 <style>
 :root{--bg:#0e0e0f;--card:#1b1b1d;--line:#333;--blue:#8bd0ff;--green:#5ee39a;--yellow:#ffc857;--red:#ff7676}
 *{box-sizing:border-box}
-body{font-family:Arial,"Noto Sans KR",sans-serif;background:var(--bg);color:#f4f4f4;margin:0;padding:20px}
+html{scroll-behavior:smooth}body{font-family:Arial,"Noto Sans KR",sans-serif;background:var(--bg);color:#f4f4f4;margin:0;padding:20px}
 h1{margin:4px 0 10px;font-size:34px}h2{margin:0 0 12px;font-size:28px}
 a{color:#73c9ff}.toplinks{margin-bottom:18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin:16px 0}
@@ -5022,14 +5023,43 @@ summary{cursor:pointer;font-weight:bold}
 (function(){
  const side=document.getElementById('adminSide'),nav=document.getElementById('adminNav'),btn=document.getElementById('adminMenuButton'),back=document.getElementById('adminBackdrop');
  if(!side||!nav)return;
- const candidates=[...document.querySelectorAll('summary,h2')];
- function close(){side.classList.remove('open');back.classList.remove('open')}
- nav.addEventListener('click',e=>{const b=e.target.closest('[data-admin-label]');if(!b)return;const label=b.dataset.adminLabel;let target=candidates.find(x=>(x.textContent||'').trim().includes(label));if(!target&&label==='코인 단타')target=candidates.find(x=>(x.textContent||'').includes('단타 4개 조합'));if(!target)return;const box=target.closest('details,.card,section')||target;box.classList.add('admin-target');if(box.tagName==='DETAILS')box.open=true;nav.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===b));close();box.scrollIntoView({behavior:'smooth',block:'start'});});
- btn&&btn.addEventListener('click',()=>{side.classList.toggle('open');back.classList.toggle('open')});back&&back.addEventListener('click',close);
- // 다른 시장 페이지도 백그라운드에서 미리 요청해 전환 체감속도를 줄인다.
- const links=[...document.querySelectorAll('.category-nav a[href^="/performance/dashboard?"]')];
- const prefetch=()=>links.filter(a=>a.href!==location.href).forEach(a=>fetch(a.href,{credentials:'same-origin'}).catch(()=>{}));
- if('requestIdleCallback' in window)requestIdleCallback(prefetch,{timeout:2500});else setTimeout(prefetch,1000);
+ const normalize=s=>(s||'').replace(/\s+/g,'').replace(/TOP\s*5/gi,'TOP5').replace(/[·ㆍ]/g,'');
+ const candidates=[...document.querySelectorAll('summary,h2,h3')];
+ const aliases={
+  '포지션별성과':['포지션별성과'],
+  '수익률승률TOP5':['수익률승률TOP5','수익률승률TOP 5'],
+  '최근완료5건':['최근완료5건'],
+  '인생타점상세성과':['인생타점상세성과','인생타점상세'],
+  '종목별수익률현황':['종목별수익률현황','종목별수익률'],
+  '매수종료시간봉별상세성과':['매수종료시간봉별상세성과','시간봉별상세'],
+  '종목목록':['종목목록'],
+  '코인단타':['코인단타','단타4개조합','관리자전용분석']
+ };
+ function close(){side.classList.remove('open');back&&back.classList.remove('open')}
+ function findTarget(label){
+   const key=normalize(label); const names=aliases[key]||[key];
+   return candidates.find(x=>{const t=normalize(x.textContent);return names.some(n=>t.includes(normalize(n)))});
+ }
+ function activate(button,target){
+   nav.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===button));
+   const box=target.closest('details,.card,section')||target;
+   box.classList.add('admin-target'); if(box.tagName==='DETAILS')box.open=true;
+   close(); requestAnimationFrame(()=>box.scrollIntoView({behavior:'smooth',block:'start'}));
+   try{sessionStorage.setItem('adminSelectedMenu',button.dataset.adminLabel||'')}catch(e){}
+ }
+ nav.addEventListener('click',e=>{const b=e.target.closest('[data-admin-label]');if(!b)return;const target=findTarget(b.dataset.adminLabel);if(target)activate(b,target);});
+ btn&&btn.addEventListener('click',()=>{side.classList.toggle('open');back&&back.classList.toggle('open')});back&&back.addEventListener('click',close);
+ const observed=[]; nav.querySelectorAll('[data-admin-label]').forEach(b=>{const t=findTarget(b.dataset.adminLabel);if(t){const box=t.closest('details,.card,section')||t;observed.push([b,box])}});
+ if('IntersectionObserver' in window){
+   const io=new IntersectionObserver(entries=>{const visible=entries.filter(x=>x.isIntersecting).sort((a,b)=>Math.abs(a.boundingClientRect.top)-Math.abs(b.boundingClientRect.top))[0];if(!visible)return;const pair=observed.find(x=>x[1]===visible.target);if(pair)nav.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===pair[0]));},{rootMargin:'-15% 0px -70% 0px',threshold:[0,.1]});
+   observed.forEach(x=>io.observe(x[1]));
+ }
+ try{const saved=sessionStorage.getItem('adminSelectedMenu');const b=[...nav.querySelectorAll('[data-admin-label]')].find(x=>x.dataset.adminLabel===saved);if(b){const t=findTarget(saved);if(t)nav.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===b));}}catch(e){}
+ // 시장·기간 화면을 유휴 시간에 미리 내려받고, 준비된 페이지는 즉시 교체한다.
+ const links=[...document.querySelectorAll('.category-nav a[href^="/performance/dashboard?"]')]; const pageCache=new Map();
+ const prefetch=()=>links.filter(a=>a.href!==location.href).forEach(a=>fetch(a.href,{credentials:'same-origin'}).then(r=>r.ok?r.text():null).then(html=>{if(html)pageCache.set(a.href,html)}).catch(()=>{}));
+ if('requestIdleCallback' in window)requestIdleCallback(prefetch,{timeout:2200});else setTimeout(prefetch,700);
+ links.forEach(a=>a.addEventListener('click',e=>{const html=pageCache.get(a.href);if(!html)return;e.preventDefault();document.open();document.write(html);document.close();history.replaceState(null,'',a.href);}));
 })();
 </script>
 </body></html>
