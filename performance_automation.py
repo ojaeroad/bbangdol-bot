@@ -405,10 +405,10 @@ def render_exit_image(
     position: dict[str, Any],
     result: dict[str, Any],
 ) -> bytes:
-    """텔레그램에서 1~2초 안에 결과를 읽을 수 있는 프리미엄 결과 카드."""
+    """텔레그램용 최소 정보 수익률 결과 카드."""
     interval = _chart_interval(position["entry_group"])
     candles = load_candles(symbol, position["entry_first_time"], result["exit_time"], interval)
-    image, draw = _base_canvas(1760)
+    image, draw = _base_canvas(1510)
 
     white = "#F7F8FA"
     blue = "#66C7FF"
@@ -431,80 +431,73 @@ def render_exit_image(
         (candle_low - float(position["entry_price"])) / float(position["entry_price"]) * 100
         if candle_low is not None else float(result.get("signal_adverse_pct") or 0)
     )
-    adverse_basis = f"{interval}분봉 저가 기준" if candle_low is not None else "신호 가격 기준"
 
-    # 상단 브랜드·대상 정보
-    draw.text((55, 42), "완료 타점 리포트", font=_font(42, True), fill=white)
-    badge = f"{MARKET_LABEL.get(market, market)}  ·  {GROUP_LABEL.get(position['entry_group'], position['entry_group'])}  ·  사이클 {cycle_no}"
-    _rounded(draw, (55, 103, 760, 163), fill="#102332", outline="#285B78", radius=20, width=2)
-    draw.text((80, 118), badge, font=_font(24, True), fill=blue)
-    draw.text((55, 185), symbol, font=_font(52, True), fill=white)
+    market_name = MARKET_LABEL.get(market, market)
+    group_name = GROUP_LABEL.get(position.get("entry_group"), position.get("entry_group", "-"))
+    title = f"{market_name} · {group_name} · {symbol} (사이클 {cycle_no})"
 
-    # 핵심 결과: 가장 먼저 보이게 크게 배치
-    _rounded(draw, (45, 270, 1035, 515), fill=panel_dark, outline=result_color, radius=30, width=4)
-    draw.text((78, 300), "최종 수익률", font=_font(28, True), fill=muted)
-    draw.text((78, 350), f"{result_icon} {return_pct:+.2f}%", font=_font(82, True), fill=result_color)
-    draw.line((655, 305, 655, 480), fill=line, width=2)
-    draw.text((700, 315), "보유기간", font=_font(27, True), fill=muted)
-    duration_size = 38 if len(str(holding_text)) <= 9 else 32
-    draw.text((700, 362), str(holding_text), font=_font(duration_size, True), fill=white)
-    draw.text((700, 435), "첫 매도 신호 기준 종료", font=_font(21, True), fill=blue)
+    # 제목: 요청한 정보만 한 줄로 표시
+    draw.text((55, 45), title, font=_font(38, True), fill=white)
 
-    # 진입·종료를 좌우 2개 카드로 분리
+    # 최종 결과
+    _rounded(draw, (45, 120, 1035, 350), fill=panel_dark, outline=result_color, radius=30, width=4)
+    draw.text((78, 150), "수익률", font=_font(27, True), fill=muted)
+    draw.text((78, 198), f"{result_icon} {return_pct:+.2f}%", font=_font(82, True), fill=result_color)
+    draw.line((665, 155, 665, 315), fill=line, width=2)
+    draw.text((710, 165), "보유기간", font=_font(26, True), fill=muted)
+    duration_size = 36 if len(str(holding_text)) <= 10 else 30
+    draw.text((710, 218), str(holding_text), font=_font(duration_size, True), fill=white)
+
+    # 매수 / 매도 최소 정보 카드
     entry_x1, entry_x2 = 45, 525
     exit_x1, exit_x2 = 555, 1035
-    card_top, card_bottom = 555, 945
+    card_top, card_bottom = 385, 685
 
     _rounded(draw, (entry_x1, card_top, entry_x2, card_bottom), fill=panel, outline=gold, radius=28, width=3)
-    draw.text((75, 585), "① 매수 · 진입", font=_font(34, True), fill=gold)
-    draw.text((75, 650), str(position.get("entry_timeframe") or "-"), font=_font(58, True), fill=white)
-    draw.text((230, 663), "시간봉", font=_font(24, True), fill=muted)
-    draw.line((75, 735, 495, 735), fill=line, width=2)
-    draw.text((75, 762), "평균 진입가", font=_font(22, True), fill=muted)
-    draw.text((75, 800), _price(position.get("entry_price")), font=_font(40, True), fill=white)
-    draw.text((75, 862), f"분할 {position.get('entry_count', 0)}회", font=_font(26, True), fill=gold)
-    draw.text((215, 862), _format_kst(position.get("entry_first_time")), font=_font(22, True), fill=white)
+    draw.text((75, 418), "① 매수", font=_font(34, True), fill=gold)
+    draw.text((75, 490), str(position.get("entry_timeframe") or "-"), font=_font(54, True), fill=white)
+    draw.text((205, 500), _price(position.get("entry_price")), font=_font(46, True), fill=white)
+    draw.text((410, 505), f"{position.get('entry_count', 0)}회", font=_font(35, True), fill=gold)
+    draw.text((75, 565), "시간봉", font=_font(20, True), fill=muted)
+    draw.text((205, 565), "진입가", font=_font(20, True), fill=muted)
+    draw.text((410, 565), "분할", font=_font(20, True), fill=muted)
+    draw.text((75, 625), _format_kst(position.get("entry_first_time")), font=_font(22, True), fill=muted)
 
     _rounded(draw, (exit_x1, card_top, exit_x2, card_bottom), fill=panel, outline=red, radius=28, width=3)
-    draw.text((585, 585), "② 매도 · 종료", font=_font(34, True), fill=red)
-    draw.text((585, 650), str(result.get("exit_timeframe") or "-"), font=_font(58, True), fill=white)
-    draw.text((740, 663), "시간봉", font=_font(24, True), fill=muted)
-    draw.line((585, 735, 1005, 735), fill=line, width=2)
-    draw.text((585, 762), "최종 매도가", font=_font(22, True), fill=muted)
-    draw.text((585, 800), _price(result.get("exit_price")), font=_font(40, True), fill=white)
-    draw.text((585, 862), "전량 종료", font=_font(26, True), fill=red)
-    draw.text((725, 862), _format_kst(result.get("exit_time")), font=_font(22, True), fill=white)
+    draw.text((585, 418), "② 매도", font=_font(34, True), fill=red)
+    draw.text((585, 490), str(result.get("exit_timeframe") or "-"), font=_font(54, True), fill=white)
+    draw.text((715, 500), _price(result.get("exit_price")), font=_font(46, True), fill=white)
+    draw.text((585, 565), "시간봉", font=_font(20, True), fill=muted)
+    draw.text((715, 565), "매도가", font=_font(20, True), fill=muted)
+    draw.text((585, 625), _format_kst(result.get("exit_time")), font=_font(22, True), fill=muted)
 
-    # 위험 정보는 별도 빨간 스트립으로 강조
-    _rounded(draw, (45, 980, 1035, 1115), fill="#191316", outline="#6E3038", radius=24, width=2)
-    draw.text((75, 1008), "최대 역행", font=_font(25, True), fill=red)
-    draw.text((75, 1045), f"{adverse_pct:+.2f}%", font=_font(43, True), fill=red)
-    draw.text((330, 1012), adverse_basis, font=_font(21, True), fill=muted)
-    draw.text((330, 1052), "진입 후 가장 불리했던 가격 움직임", font=_font(22, True), fill=white)
+    # 쉬운 표현만 사용
+    _rounded(draw, (45, 720, 1035, 835), fill="#191316", outline="#6E3038", radius=24, width=2)
+    draw.text((75, 748), "최대 하락폭", font=_font(25, True), fill=red)
+    draw.text((75, 785), f"{adverse_pct:+.2f}%", font=_font(39, True), fill=red)
 
-    # 차트는 하단에 크게, 매수·종료 의미를 제목에서 명시
-    _rounded(draw, (45, 1150, 1035, 1665), fill=panel_dark, outline=line, radius=28, width=2)
-    draw.text((75, 1180), "③ 매수 → 종료 가격 흐름", font=_font(32, True), fill=white)
-    draw.text((75, 1225), f"TradingView 확정 {interval}분봉 · 노랑=매수 · 초록=종료", font=_font(21, True), fill=muted)
+    # 차트
+    _rounded(draw, (45, 870, 1035, 1415), fill=panel_dark, outline=line, radius=28, width=2)
+    draw.text((75, 900), "③ 매수 → 매도 가격 흐름", font=_font(31, True), fill=white)
+    draw.text((75, 944), "노랑 = 매수 · 초록 = 매도", font=_font(21, True), fill=muted)
     if candles:
         _draw_candle_chart(
-            draw, (80, 1270, 1000, 1605), candles,
+            draw, (80, 990, 1000, 1360), candles,
             float(position["entry_price"]), position.get("entry_points") or [], float(result["exit_price"]),
         )
     else:
         _draw_signal_flow_fallback(
-            draw, (80, 1270, 1000, 1605),
+            draw, (80, 990, 1000, 1360),
             position.get("entry_points") or [],
             float(result["exit_price"]),
         )
 
     draw.text(
-        (55, 1705),
-        "※ TradingView 확정 OHLC/신호 가격 기준 · 수수료·슬리피지·세금 미반영",
+        (55, 1450),
+        "※ 신호 가격 기준 · 수수료·슬리피지·세금 미반영",
         font=_font(19), fill=muted,
     )
     return _png_bytes(image)
-
 
 def render_cycle_summary_image(
     market: str,
@@ -659,7 +652,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                             f"{GROUP_LABEL.get(exit_group, exit_group)} 결과\n"
                             f"매수 {position.get('entry_timeframe','-')} · "
                             f"{_format_kst(position.get('entry_first_time'))}\n"
-                            f"종료 {result.get('exit_timeframe','-')} · "
+                            f"매도 {result.get('exit_timeframe','-')} · "
                             f"{_format_kst(result.get('exit_time'))}\n"
                             f"수익률 {float(result['return_pct']):+.3f}% · "
                             f"보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
@@ -1272,7 +1265,7 @@ def send_latest_cycle_test(
     caption = (
         f"[관리자 테스트]\n📈 {current_symbol} · 매도 {GROUP_LABEL.get(exit_group)}\n"
         f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
-        f"종료 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
+        f"매도 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
         f"수익률 {float(result['return_pct']):+.3f}%"
     )
     _send_photo(chat_id, png, caption)
