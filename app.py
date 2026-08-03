@@ -147,7 +147,7 @@ def _mark_sent(bucket: str):
 TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "CUSTOM").strip().upper()
 TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))  # 하위 호환용(실제 판정에는 사용하지 않음)
-TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC = int(os.getenv("TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC", "90"))
+TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC = min(59, max(0, int(os.getenv("TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC", "59"))))
 
 # 실제 운영용 자연스러운 반복 간격. 15m의 절반 7.5분처럼 애매한 값은 5분으로 정리한다.
 _CADENCE_FULL_MIN = {
@@ -228,7 +228,7 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
                 " · ✅ 종료 신호 1/3", " · ⚠️ 종료 재확인 2/3", " · 🚨 최종 종료 알림 3/3",
             ):
                 normalized = normalized.replace(old_label, "")
-            normalized = f"{normalized} · {phase_label}"
+            normalized = f"{normalized}\n{phase_label}"
             lines[i] = normalized
             break
         lines[i] = normalized

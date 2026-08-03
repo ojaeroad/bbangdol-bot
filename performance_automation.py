@@ -454,22 +454,22 @@ def render_exit_image(
     card_top, card_bottom = 385, 685
 
     _rounded(draw, (entry_x1, card_top, entry_x2, card_bottom), fill=panel, outline=gold, radius=28, width=3)
-    draw.text((75, 418), "① 매수", font=_font(34, True), fill=gold)
-    draw.text((75, 490), str(position.get("entry_timeframe") or "-"), font=_font(54, True), fill=white)
-    draw.text((205, 500), _price(position.get("entry_price")), font=_font(46, True), fill=white)
-    draw.text((410, 505), f"{position.get('entry_count', 0)}회", font=_font(35, True), fill=gold)
-    draw.text((75, 565), "시간봉", font=_font(20, True), fill=muted)
-    draw.text((205, 565), "진입가", font=_font(20, True), fill=muted)
-    draw.text((410, 565), "분할", font=_font(20, True), fill=muted)
-    draw.text((75, 625), _format_kst(position.get("entry_first_time")), font=_font(22, True), fill=muted)
+    draw.text((75, 412), "① 매수", font=_font(40, True), fill=gold)
+    draw.text((75, 485), str(position.get("entry_timeframe") or "-"), font=_font(66, True), fill=white)
+    draw.text((215, 497), _price(position.get("entry_price")), font=_font(54, True), fill=white)
+    draw.text((414, 502), f"{position.get('entry_count', 0)}회", font=_font(43, True), fill=gold)
+    draw.text((75, 572), "시간봉", font=_font(25, True), fill=muted)
+    draw.text((215, 572), "매수가", font=_font(25, True), fill=muted)
+    draw.text((414, 572), "분할", font=_font(25, True), fill=muted)
+    draw.text((75, 625), _format_kst(position.get("entry_first_time")), font=_font(28, True), fill=white)
 
     _rounded(draw, (exit_x1, card_top, exit_x2, card_bottom), fill=panel, outline=red, radius=28, width=3)
-    draw.text((585, 418), "② 매도", font=_font(34, True), fill=red)
-    draw.text((585, 490), str(result.get("exit_timeframe") or "-"), font=_font(54, True), fill=white)
-    draw.text((715, 500), _price(result.get("exit_price")), font=_font(46, True), fill=white)
-    draw.text((585, 565), "시간봉", font=_font(20, True), fill=muted)
-    draw.text((715, 565), "매도가", font=_font(20, True), fill=muted)
-    draw.text((585, 625), _format_kst(result.get("exit_time")), font=_font(22, True), fill=muted)
+    draw.text((585, 412), "② 매도", font=_font(40, True), fill=red)
+    draw.text((585, 485), str(result.get("exit_timeframe") or "-"), font=_font(66, True), fill=white)
+    draw.text((725, 497), _price(result.get("exit_price")), font=_font(54, True), fill=white)
+    draw.text((585, 572), "시간봉", font=_font(25, True), fill=muted)
+    draw.text((725, 572), "매도가", font=_font(25, True), fill=muted)
+    draw.text((585, 625), _format_kst(result.get("exit_time")), font=_font(28, True), fill=white)
 
     # 쉬운 표현만 사용
     _rounded(draw, (45, 720, 1035, 835), fill="#191316", outline="#6E3038", radius=24, width=2)
@@ -521,20 +521,17 @@ def render_cycle_summary_image(
     draw.text((60, 118), f"{MARKET_LABEL.get(market, market)} · {GROUP_LABEL.get(position['entry_group'], position['entry_group'])}", font=_font(32, True), fill=blue)
     draw.text((60, 178), symbol, font=_font(50, True), fill=white)
 
-    # 매수 정보는 별도 카드로 분리하여 종료 정보와 혼동되지 않게 한다.
+    # 매수 핵심 정보: 시간봉 · 매수가 · 분할을 크게 한 줄로 표시한다.
     _rounded(draw, (45, 265, 1035, 555), fill="#15161a", outline="#ffc857")
-    draw.text((70, 286), "① 매수(진입) 정보", font=_font(33, True), fill=gold)
-    buy_rows = [
-        ("매수 시간봉", position.get("entry_timeframe") or "-"),
-        ("평균 진입가", _price(position.get("entry_price"))),
-        ("진입 횟수", f"{position.get('entry_count', 0)}회"),
-        ("최초 진입 시각", _format_kst(position.get("entry_first_time"))),
-    ]
-    for idx, (label, value) in enumerate(buy_rows):
-        x = 70 + (idx % 2) * 480
-        y = 350 + (idx // 2) * 92
-        draw.text((x, y), label, font=_font(29, True), fill=blue)
-        draw.text((x + 170, y - 3), str(value), font=_font(30, True), fill=white)
+    draw.text((70, 286), "① 매수", font=_font(40, True), fill=gold)
+    buy_tf = str(position.get("entry_timeframe") or "-")
+    buy_price = _price(position.get("entry_price"))
+    buy_count = f"{position.get('entry_count', 0)}회"
+    columns = [(85, buy_tf, "시간봉"), (390, buy_price, "매수가"), (760, buy_count, "분할")]
+    for x, value, label in columns:
+        draw.text((x, 355), str(value), font=_font(54, True), fill=white if label != "분할" else gold)
+        draw.text((x, 425), label, font=_font(25, True), fill=muted)
+    draw.text((85, 492), _format_kst(position.get("entry_first_time")), font=_font(29, True), fill=white)
 
     _rounded(draw, (45, 600, 1035, 1125), fill="#111216")
     draw.text((70, 625), f"② 매수 → 매도 가격 흐름 ({interval}분봉 압축)", font=_font(32, True), fill=white)
