@@ -2415,6 +2415,44 @@ def performance_public():
 </div></body></html>""", snapshot=snapshot, symbol_display=symbol_display)
 
 
+
+# v47: 시장 전환 속도 개선용 계산 캐시.
+# 화면 HTML뿐 아니라 완료사이클/그룹분석/알람분석 결과 자체를 짧게 재사용한다.
+_PERFORMANCE_CALC_CACHE: dict[tuple, tuple[float, object]] = {}
+_PERFORMANCE_CALC_CACHE_LOCK = threading.Lock()
+_PERFORMANCE_CALC_CACHE_TTL = max(30, int(os.getenv("PERFORMANCE_CALC_CACHE_SECONDS", "120") or 120))
+
+
+def _cached_calculation(key: tuple, factory):
+    now_ts = time.time()
+    with _PERFORMANCE_CALC_CACHE_LOCK:
+        cached = _PERFORMANCE_CALC_CACHE.get(key)
+        if cached and now_ts - cached[0] < _PERFORMANCE_CALC_CACHE_TTL:
+            return cached[1]
+    value = factory()
+    with _PERFORMANCE_CALC_CACHE_LOCK:
+        _PERFORMANCE_CALC_CACHE[key] = (now_ts, value)
+        if len(_PERFORMANCE_CALC_CACHE) > 30:
+            oldest_key = min(_PERFORMANCE_CALC_CACHE, key=lambda k: _PERFORMANCE_CALC_CACHE[k][0])
+            _PERFORMANCE_CALC_CACHE.pop(oldest_key, None)
+    return value
+
+
+def _cached_visual_cycle_data(limit: int):
+    return _cached_calculation(("visual_cycle_data", int(limit)), lambda: visual_cycle_data(limit))
+
+
+def _cached_group_analysis_market_data(market: str):
+    market = str(market).upper()
+    return _cached_calculation(("group_analysis_market_data", market), lambda: group_analysis_market_data(market))
+
+
+def _cached_simulate_cadence(market: str, period_key: str):
+    market = str(market).upper()
+    period_key = str(period_key).lower()
+    return _cached_calculation(("simulate_cadence", market, period_key), lambda: simulate_cadence(market, period_key))
+
+
 # 회원 메인 화면 단기 캐시: 무료 Render에서도 반복 클릭 시 전체 통계를 매번 재계산하지 않는다.
 # 신호 데이터는 계속 저장되며, 화면 캐시는 기본 45초 뒤 자동 갱신된다.
 _MEMBER_PAGE_CACHE = {}
@@ -2469,7 +2507,7 @@ def performance_member():
         if selected_category not in allowed_categories:
             selected_category = "KOREA_1Q"
 
-        data = _sort_performance_categories(visual_cycle_data(limit))
+        data = _sort_performance_categories(_cached_visual_cycle_data(limit))
         selected = next(
             (
                 category
@@ -2509,11 +2547,11 @@ def performance_member():
                 "US_1Q": "US",
                 "COIN": "COIN",
             }
-            market_analysis = group_analysis_market_data(
+            market_analysis = _cached_group_analysis_market_data(
                 category_market[selected_category]
             )
             try:
-                cadence_simulation = simulate_cadence(
+                cadence_simulation = _cached_simulate_cadence(
                     category_market[selected_category], period_key
                 )
             except Exception:
@@ -2818,7 +2856,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <div class="mobile-menu-backdrop" id="mobileMenuBackdrop"></div>
 <div class="member-shell">
 <aside class="member-side" id="memberSide">
-  <div class="member-side-title">주요 섹션</div>
+  <div class="member-side-title">회원 성과 메뉴</div>
   <nav class="member-nav" id="memberNav">
     <button type="button" class="active" data-view="overview">핵심 요약</button>
     <button type="button" data-view="positions">포지션별 성과</button>
@@ -2828,7 +2866,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
     <button type="button" data-view="symbols-performance">종목별 수익률</button>
     <button type="button" data-view="timeframes">시간봉별 상세</button>
     <button type="button" data-view="symbols">종목 목록</button>
-    <button type="button" data-view="cadence">알람 축소 분석</button>
+    <button type="button" data-view="cadence">알람 분석</button>
   </nav>
   <div class="member-tools">
     <button type="button" id="openAllButton">전체 펼치기</button>
@@ -2837,10 +2875,10 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </aside>
 <main class="member-main" id="memberMain">
 <div class="main-quick-grid member-view" data-member-view="overview">
-  <button class="main-quick" type="button" data-jump="positions"><b>포지션 성과</b><span>단타·스윙·장기·인생타점</span></button>
+  <button class="main-quick" type="button" data-jump="positions"><b>포지션별 성과</b><span>단타·스윙·장기·인생타점</span></button>
   <button class="main-quick" type="button" data-jump="recent"><b>최근 완료</b><span>가장 최근 검증 결과 5건</span></button>
   <button class="main-quick" type="button" data-jump="symbols-performance"><b>종목별 성과</b><span>누적·최근 수익률 비교</span></button>
-  <button class="main-quick" type="button" data-jump="cadence"><b>알람 분석</b><span>원 주기·운영 주기 비교</span></button>
+  <button class="main-quick" type="button" data-jump="cadence"><b>알람 분석</b><span>현재 적용 중인 운영 주기 결과</span></button>
 </div>
 <section class="promo-hero member-view" data-member-view="overview">
   <div class="promo-kicker">실제 알람 결과를 완료 사이클로 검증합니다</div>
@@ -3188,43 +3226,36 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 
 {% if cadence_simulation %}
 <details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="cadence" open>
-<summary class="section-title">알람 축소 B안 시뮬레이션</summary>
+<summary class="section-title">알람 분석</summary>
 <div style="margin-top:14px">
-<div class="notice" style="margin-bottom:14px"><b>수정된 실제 진입 기준</b><br>매수 첫 LOW는 종목 집중 알림으로만 사용하며 진입하지 않습니다. 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입합니다. 원 주기는 다음 원 시간봉 경계부터, 절반 주기는 다음 절반 시간봉 경계부터 진입하며, 매도는 첫 유효 HIGH에서 전량 종료합니다.</div>
-<div class="group-grid">
-{% for v in cadence_simulation.variants %}
+<div class="notice" style="margin-bottom:14px"><b>현재 적용 중인 알람 운영 기준</b><br>첫 LOW는 종목 집중 알림으로만 사용하고 진입하지 않습니다. 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입하며, 매도는 첫 유효 HIGH에서 전량 종료합니다.</div>
+{% for v in cadence_simulation.variants %}{% if v.code == 'HALF' %}
 <div class="group-card">
-<div class="group-title"><span>{{v.label}}</span><span>{{v.alert_count}}건</span></div>
+<div class="group-title"><span>알람 분석 결과</span><span>{{v.alert_count}}건</span></div>
 <div class="tf-row tf-head"><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
 <div class="tf-row">
 <span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span>
 <span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span>
-<span>{{v.no_entry_focus_count}}</span>
-<span>{{v.completed_cycles}}</span>
+<span>{{v.no_entry_focus_count}}</span><span>{{v.completed_cycles}}</span>
 <span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</span>
 <span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span>
 <span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span>
 </div>
 <div class="small" style="margin-top:10px">집중 {{v.focus_count}}회 · 실제 진입 {{v.entered_focus_count}}회 · 1회진입 {{v.one_entry_cycles}} · 2회진입 {{v.two_entry_cycles}} · 3회진입 {{v.three_entry_cycles}}</div>
-</div>
-{% endfor %}
-</div>
-<h3 style="margin-top:22px">시간봉별 실제 알람 감소 비교</h3>
+</div>{% endif %}{% endfor %}
+<h3 style="margin-top:22px">시간봉별 알람 감소</h3>
 <div class="member-alpha-table">
-<div class="member-alpha-head"><span>시간봉</span><span>현재</span><span>원 주기</span><span>원 주기 감소</span><span>절반 주기</span><span>절반 주기 감소</span></div>
-{% for r in cadence_simulation.timeframes %}
-<div class="member-alpha-row"><span>{{r.timeframe}}</span><span>{{r.raw_count}}</span><span>{{r.full_count}}</span><span>{{'%.1f'|format(r.full_reduction_pct)}}%</span><span>{{r.half_count}}</span><span>{{'%.1f'|format(r.half_reduction_pct)}}%</span></div>
-{% endfor %}
+<div class="member-alpha-head" style="grid-template-columns:1.3fr 1fr 1fr"><span>시간봉</span><span>알람 수</span><span>감소율</span></div>
+{% for r in cadence_simulation.timeframes %}<div class="member-alpha-row" style="grid-template-columns:1.3fr 1fr 1fr"><span>{{r.timeframe}}</span><span>{{r.half_count}}</span><span>{{'%.1f'|format(r.half_reduction_pct)}}%</span></div>{% endfor %}
 </div>
-<h3 style="margin-top:22px">포지션별 결과 비교</h3>
+<h3 style="margin-top:22px">포지션별 결과</h3>
 {% for g in cadence_simulation.groups %}
 <div class="group-card {{'life' if g.group == 'LIFE' else ''}}" style="margin-bottom:10px">
-<div class="group-title"><span>{{g.group_label}}</span><span>현재 · 원 주기 · 절반 주기</span></div>
-<div class="tf-row tf-head"><span>방식</span><span>알람</span><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
-{% for v in g.variants %}<div class="tf-row"><span>{{v.label}}</span><span>{{v.alert_count}}</span><span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span><span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span><span>{{v.no_entry_focus_count}}</span><span>{{v.completed_cycles}}</span><span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}{% else %}-{% endif %}</span><span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span><span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span></div>{% endfor %}
-</div>
-{% endfor %}
-<div class="small" style="margin-top:12px">※ 핵심 확인값은 <b>진입포착률·미진입·평균 진입횟수</b>입니다. 원 주기를 기다리는 동안 LOW가 해제되어 진입하지 못한 경우는 미진입으로 계산됩니다. 1시간봉은 원 주기에서 다음 정시부터, 절반 주기에서 다음 30분 경계부터 최대 3회 진입합니다. 매도는 첫 유효 고점 신호입니다.</div>
+<div class="group-title"><span>{{g.group_label}}</span><span>알람 분석</span></div>
+<div class="tf-row tf-head"><span>알람</span><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
+{% for v in g.variants %}{% if v.code == 'HALF' %}<div class="tf-row"><span>{{v.alert_count}}</span><span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span><span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span><span>{{v.no_entry_focus_count}}</span><span>{{v.completed_cycles}}</span><span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}{% else %}-{% endif %}</span><span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span><span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span></div>{% endif %}{% endfor %}
+</div>{% endfor %}
+<div class="small" style="margin-top:12px">※ 진입포착률·미진입·평균 진입횟수는 현재 적용 중인 운영 주기로 계산한 값입니다.</div>
 </div></details>
 {% endif %}
 
@@ -3260,6 +3291,17 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
  let initial=(location.hash||'').replace('#','');
  if(!nav.querySelector('[data-view="'+initial+'"]')){try{initial=sessionStorage.getItem('memberSelectedView')||'overview'}catch(e){initial='overview'}}
  showView(initial,false);
+ // v47: 국장·미장·코인 전환 페이지를 유휴 시간에 미리 받아 첫 클릭 대기시간을 줄인다.
+ const pageCache=new Map();
+ const marketLinks=[...document.querySelectorAll('.tabs a[href^="/performance/member?"]')];
+ const prefetchPages=()=>marketLinks.filter(a=>a.href!==location.href).forEach(a=>{
+   fetch(a.href,{credentials:'same-origin'}).then(r=>r.ok?r.text():null).then(html=>{if(html)pageCache.set(a.href,html)}).catch(()=>{});
+ });
+ if('requestIdleCallback' in window) requestIdleCallback(prefetchPages,{timeout:2500}); else setTimeout(prefetchPages,900);
+ marketLinks.forEach(a=>a.addEventListener('click',e=>{
+   const html=pageCache.get(a.href); if(!html) return;
+   e.preventDefault(); document.open(); document.write(html); document.close(); history.replaceState(null,'',a.href);
+ }));
 })();
 </script>
 </body>
@@ -4108,7 +4150,7 @@ def performance_dashboard():
         if period_key not in {"today", "7d", "30d", "all"}:
             period_key = "all"
 
-        data = _sort_performance_categories(visual_cycle_data(limit))
+        data = _sort_performance_categories(_cached_visual_cycle_data(limit))
         selected = next(
             (
                 category
@@ -4142,7 +4184,7 @@ def performance_dashboard():
                 "US_1Q": "US",
                 "COIN": "COIN",
             }
-            market_analysis = group_analysis_market_data(
+            market_analysis = _cached_group_analysis_market_data(
                 category_market[selected_category]
             )
             analysis_by_symbol = market_analysis.get("symbol_data", {})
@@ -4412,9 +4454,18 @@ summary{cursor:pointer;font-weight:bold}
 @media(max-width:650px){.market-performance,.symbol-result-grid{grid-template-columns:1fr}}
 @media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:10px}h1{font-size:27px}}
 .group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#141416)!important;box-shadow:0 0 14px rgba(255,200,87,.08)!important}.life-metric{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#151517)!important}.life-metric .title{color:var(--yellow)!important}.scalp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.scalp-card{background:#151517;border:1px solid #35353a;border-radius:14px;padding:15px}.scalp-card h3{margin:0 0 12px;color:var(--blue);font-size:19px}.scalp-main{font-size:27px;font-weight:900;margin:7px 0}.scalp-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.scalp-stat{background:#101012;border-radius:9px;padding:9px}.scalp-stat small{display:block;color:#aaa;margin-bottom:5px}.scalp-empty{min-height:150px;display:flex;align-items:center;justify-content:center;color:#777}@media(max-width:1100px){.scalp-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.scalp-grid{grid-template-columns:1fr}}
+
+/* v47 관리자 목차: 기존 관리자 전용 기능은 삭제하지 않고 빠른 이동만 추가 */
+.admin-menu-button{display:none;position:sticky;top:8px;z-index:95;width:100%;border:1px solid #56c5fa;background:#12384b;color:#fff;border-radius:11px;padding:11px;font-weight:900;margin-bottom:10px}.admin-side{position:fixed;left:12px;top:150px;width:210px;max-height:calc(100vh - 170px);overflow:auto;background:#15171b;border:1px solid #353943;border-radius:15px;padding:11px;z-index:80}.admin-side-title{color:var(--blue);font-size:18px;font-weight:950;padding:7px 8px 11px}.admin-nav{display:grid;gap:5px}.admin-nav button{border:0;border-radius:9px;background:transparent;color:#d8dbe1;text-align:left;padding:10px;font-weight:800;cursor:pointer}.admin-nav button:hover,.admin-nav button.active{background:#113b50;color:#fff}.admin-nav button.life{color:var(--yellow)}.admin-nav .admin-only{border-top:1px solid #343840;margin-top:5px;padding-top:12px;color:#ffbf69}.admin-backdrop{display:none}body.admin-menu-ready{padding-left:246px}.admin-target{scroll-margin-top:16px}
+@media(max-width:1050px){body.admin-menu-ready{padding-left:12px}.admin-side{display:none;left:12px;right:12px;top:62px;width:auto;max-height:calc(100vh - 80px);box-shadow:0 18px 55px rgba(0,0,0,.58)}.admin-side.open{display:block}.admin-menu-button{display:block}.admin-backdrop.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:70}}
 </style>
 </head>
-<body>
+<body class="admin-menu-ready">
+<button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리자 성과 메뉴</button>
+<div class="admin-backdrop" id="adminBackdrop"></div>
+<aside class="admin-side" id="adminSide"><div class="admin-side-title">관리자 성과 메뉴</div><nav class="admin-nav" id="adminNav">
+<button data-admin-label="포지션별 성과">포지션별 성과</button><button data-admin-label="수익률·승률 TOP 5">수익률·승률 TOP5</button><button data-admin-label="최근 완료 5건">최근 완료 5건</button><button class="life" data-admin-label="인생타점 상세 성과">인생타점 상세</button><button data-admin-label="종목별 수익률 현황">종목별 수익률</button><button data-admin-label="매수·종료 시간봉별 상세 성과">시간봉별 상세</button><button data-admin-label="종목 목록">종목 목록</button><button class="admin-only" data-admin-label="코인 단타">관리자 전용 분석</button>
+</nav></aside>
 <h1>관리자 성과 분석</h1>
 <div class="toplinks">
 <a href="/performance/health">DB 상태</a> ·
@@ -4890,7 +4941,22 @@ summary{cursor:pointer;font-weight:bold}
 {% else %}<p class="muted">생성된 매수 포지션이 없습니다.</p>{% endfor %}
 </div>
 {% endif %}
-</div></body></html>
+</div>
+<script>
+(function(){
+ const side=document.getElementById('adminSide'),nav=document.getElementById('adminNav'),btn=document.getElementById('adminMenuButton'),back=document.getElementById('adminBackdrop');
+ if(!side||!nav)return;
+ const candidates=[...document.querySelectorAll('summary,h2')];
+ function close(){side.classList.remove('open');back.classList.remove('open')}
+ nav.addEventListener('click',e=>{const b=e.target.closest('[data-admin-label]');if(!b)return;const label=b.dataset.adminLabel;let target=candidates.find(x=>(x.textContent||'').trim().includes(label));if(!target&&label==='코인 단타')target=candidates.find(x=>(x.textContent||'').includes('단타 4개 조합'));if(!target)return;const box=target.closest('details,.card,section')||target;box.classList.add('admin-target');if(box.tagName==='DETAILS')box.open=true;nav.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===b));close();box.scrollIntoView({behavior:'smooth',block:'start'});});
+ btn&&btn.addEventListener('click',()=>{side.classList.toggle('open');back.classList.toggle('open')});back&&back.addEventListener('click',close);
+ // 다른 시장 페이지도 백그라운드에서 미리 요청해 전환 체감속도를 줄인다.
+ const links=[...document.querySelectorAll('.category-nav a[href^="/performance/dashboard?"]')];
+ const prefetch=()=>links.filter(a=>a.href!==location.href).forEach(a=>fetch(a.href,{credentials:'same-origin'}).catch(()=>{}));
+ if('requestIdleCallback' in window)requestIdleCallback(prefetch,{timeout:2500});else setTimeout(prefetch,1000);
+})();
+</script>
+</body></html>
 """, data=data), 200
 
 
