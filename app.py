@@ -2534,7 +2534,7 @@ def _cached_simulate_cadence(market: str, period_key: str):
 # 신호 데이터는 계속 저장되며, 화면 캐시는 기본 45초 뒤 자동 갱신된다.
 _MEMBER_PAGE_CACHE = {}
 _MEMBER_PAGE_CACHE_LOCK = threading.Lock()
-_MEMBER_PAGE_CACHE_TTL = max(5, int(os.getenv("PERFORMANCE_MEMBER_CACHE_SECONDS", "45") or 45))
+_MEMBER_PAGE_CACHE_TTL = max(5, int(os.getenv("PERFORMANCE_MEMBER_CACHE_SECONDS", "90") or 45))
 
 
 def member_page_cache(view_func):
@@ -2606,6 +2606,7 @@ def performance_member():
         market_group_stats = []
         coin_segments = []
         cadence_simulation = None
+        member_occurrence_rows = []
         market_stats = {
             "has_results": False,
             "average_return_pct": None,
@@ -2636,6 +2637,26 @@ def performance_member():
                 cadence_simulation = None
             analysis_by_symbol = market_analysis.get(
                 "symbol_data", {}
+            )
+
+            # 회원 알람 분석에서 과거 전체 평균 주기와 최근 5회 평균 주기를
+            # 종목·포지션·시간봉별로 바로 확인할 수 있도록 펼친 목록을 만든다.
+            exchange_by_symbol = {
+                str(item.get("symbol") or ""): item.get("exchange")
+                for item in (selected.get("symbols") or [])
+            }
+            for occurrence_symbol, occurrence_data in analysis_by_symbol.items():
+                for occurrence in (occurrence_data.get("occurrence_stats") or []):
+                    occurrence_row = dict(occurrence)
+                    occurrence_row["symbol"] = occurrence_symbol
+                    occurrence_row["exchange"] = exchange_by_symbol.get(str(occurrence_symbol), "")
+                    member_occurrence_rows.append(occurrence_row)
+            member_occurrence_rows.sort(
+                key=lambda row: (
+                    TIMEFRAME_ORDER_MINUTES.get(str(row.get("timeframe") or "").lower(), 999999),
+                    str(row.get("group_label") or ""),
+                    str(row.get("symbol") or ""),
+                )
             )
 
             symbol_stats = []
@@ -2877,7 +2898,7 @@ h1{margin:0;font-size:32px}.logout{color:#aaa}
 @media(max-width:760px){.values{grid-template-columns:repeat(2,minmax(0,1fr))}.bar-row{grid-template-columns:85px minmax(80px,1fr) 65px}}
 @media(max-width:560px){body{padding:11px}.summary{grid-template-columns:1fr}h1{font-size:26px}.symbols{grid-template-columns:1fr}.bar-row{grid-template-columns:72px minmax(60px,1fr) 58px;font-size:13px}}
 .member-alpha-table{display:grid;gap:2px}.member-alpha-head,.member-alpha-row{display:grid;grid-template-columns:2fr 1fr 1fr .8fr 1fr;gap:12px;align-items:center;padding:11px}.member-alpha-head{color:var(--blue);font-weight:800;border-bottom:1px solid #343438}.member-alpha-row{color:#f5f5f5;text-decoration:none;background:#131315;border-radius:8px}.member-alpha-row:hover{background:#1c1c20}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#141416)!important;box-shadow:0 0 14px rgba(255,200,87,.08)!important}.life-metric{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#151517)!important}.life-metric .title{color:var(--yellow)!important}.scalp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.scalp-card{background:#151517;border:1px solid #35353a;border-radius:14px;padding:15px}.scalp-card h3{margin:0 0 12px;color:var(--blue);font-size:19px}.scalp-main{font-size:27px;font-weight:900;margin:7px 0}.scalp-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.scalp-stat{background:#101012;border-radius:9px;padding:9px}.scalp-stat small{display:block;color:#aaa;margin-bottom:5px}.scalp-empty{min-height:150px;display:flex;align-items:center;justify-content:center;color:#777}@media(max-width:1100px){.scalp-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.scalp-grid{grid-template-columns:1fr}}
-.promo-hero{margin:18px 0 22px;padding:24px 28px;border:2px solid #4ebdf2;border-radius:18px;background:linear-gradient(135deg,#10212d 0%,#15171c 58%,#211a0a 100%);box-shadow:0 12px 34px rgba(0,0,0,.22)}.promo-kicker{color:var(--yellow);font-size:16px;font-weight:900;letter-spacing:.04em;margin-bottom:8px}.promo-title{font-size:34px;line-height:1.25;font-weight:950;margin:0;color:#fff}.promo-title strong{color:var(--blue)}.promo-copy{margin-top:11px;color:#d4d4d8;font-size:18px;line-height:1.6}.promo-proof{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px}.promo-proof>div{border:1px solid #383b43;background:rgba(9,10,13,.72);border-radius:12px;padding:12px}.promo-proof span{display:block;color:#a8a8b0;font-size:13px}.promo-proof b{display:block;margin-top:5px;font-size:22px}.promo-note{margin-top:12px;color:#888;font-size:13px}@media(max-width:800px){.promo-hero{padding:20px}.promo-title{font-size:28px}.promo-copy{font-size:16px}.promo-proof{grid-template-columns:repeat(2,1fr)}}.member-hook-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:12px;margin:0 0 22px}.member-hook{background:#15171b;border:1px solid #3a3e47;border-radius:15px;padding:17px}.member-hook.hot{border-color:#8a651b;background:linear-gradient(145deg,#251c08,#15171b)}.member-hook .hook-title{font-weight:900;color:var(--yellow);margin-bottom:9px}.member-hook .hook-value{font-size:30px;font-weight:950}.member-hook p{color:#aaa;margin:8px 0 0;line-height:1.5}.member-hook .recent-proof{margin-top:10px;padding-top:10px;border-top:1px solid #343840}@media(max-width:900px){.member-hook-grid{grid-template-columns:1fr}}
+.promo-hero{margin:18px 0 22px;padding:24px 28px;border:2px solid #4ebdf2;border-radius:18px;background:linear-gradient(135deg,#10212d 0%,#15171c 58%,#211a0a 100%);box-shadow:0 12px 34px rgba(0,0,0,.22)}.promo-kicker{color:var(--yellow);font-size:16px;font-weight:900;letter-spacing:.04em;margin-bottom:8px}.promo-title{font-size:34px;line-height:1.25;font-weight:950;margin:0;color:#fff}.promo-title strong{color:var(--blue)}.promo-copy{margin-top:11px;color:#d4d4d8;font-size:18px;line-height:1.6}.promo-proof{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:18px}.promo-proof>div{border:1px solid #383b43;background:rgba(9,10,13,.72);border-radius:12px;padding:12px}.promo-proof span{display:block;color:#a8a8b0;font-size:13px}.promo-proof b{display:block;margin-top:5px;font-size:22px}.promo-note{margin-top:12px;color:#888;font-size:13px}@media(max-width:800px){.promo-hero{padding:20px}.promo-title{font-size:28px}.promo-copy{font-size:16px}.promo-proof{grid-template-columns:repeat(2,1fr)}}.member-hook-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:12px;margin:0 0 22px}.member-hook{display:block;background:#15171b;border:1px solid #3a3e47;border-radius:15px;padding:17px;color:inherit;text-decoration:none;transition:.16s transform,.16s border-color,.16s background}.member-hook[href]:hover{transform:translateY(-2px);border-color:#55c7ff;background:#191c22}.member-hook.hot{border-color:#8a651b;background:linear-gradient(145deg,#251c08,#15171b)}.member-hook .hook-title{font-weight:900;color:var(--yellow);margin-bottom:9px}.member-hook .hook-value{font-size:30px;font-weight:950}.member-hook p{color:#aaa;margin:8px 0 0;line-height:1.5}.member-hook .recent-proof{margin-top:10px;padding-top:10px;border-top:1px solid #343840}@media(max-width:900px){.member-hook-grid{grid-template-columns:1fr}}
 /* v43: 한 화면에 모든 섹션을 쌓지 않고 목차로 전환 */
 .member-shell{display:grid;grid-template-columns:220px minmax(0,1fr);gap:18px;align-items:start}
 .member-side{position:sticky;top:12px;background:#15171b;border:1px solid #353943;border-radius:16px;padding:12px;z-index:20}
@@ -2935,12 +2956,12 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <aside class="member-side" id="memberSide">
   <div class="member-side-title">회원 성과 메뉴</div>
   <nav class="member-nav" id="memberNav">
-    <button type="button" class="active" data-view="overview">핵심 요약</button>
+    <button type="button" class="active" data-view="overview">메인 페이지</button>
     <button type="button" data-view="positions">포지션별 성과</button>
     <button type="button" data-view="top5">수익률·승률 TOP5</button>
     <button type="button" data-view="recent">최근 완료 5건</button>
     <button type="button" class="life" data-view="life">인생타점 상세</button>
-    <button type="button" data-view="symbols-performance">종목별 수익률</button>
+    <button type="button" data-view="symbols-performance">종목별 성과</button>
     <button type="button" data-view="timeframes">시간봉별 상세</button>
     <button type="button" data-view="symbols">종목 목록</button>
     <button type="button" data-view="cadence">알람 분석</button>
@@ -2971,8 +2992,8 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </section>
 <div class="member-hook-grid member-view" data-member-view="overview">
   <div class="member-hook hot"><div class="hook-title">🔥 지금 진행 중인 알람</div><div class="hook-value">{{selected.open_low_count}}개</div><p>종료 신호를 기다리는 진행 중 타점입니다. 완료되면 결과가 자동으로 기록됩니다.</p></div>
-  <div class="member-hook"><div class="hook-title">이번 기간 최고 결과</div><div class="hook-value {{'pos' if market_stats.best_return_pct is not none and market_stats.best_return_pct >= 0 else 'neg'}}">{% if market_stats.best_return_pct is not none %}{{'%+.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div><p>{% if market_stats.best_detail %}{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}} · 매수 {{market_stats.best_detail.entry_timeframe}} → 종료 {{market_stats.best_detail.exit_timeframe}}{% else %}완료 결과 대기{% endif %}</p></div>
-  <div class="member-hook"><div class="hook-title">가장 최근 완료</div>{% if market_stats.recent_completed %}{% set hook=market_stats.recent_completed[0] %}<div class="hook-value {{'pos' if hook.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(hook.return_pct)}}%</div><div class="recent-proof">{{symbol_display(hook.symbol,hook.exchange)}} · 매수 {{hook.entry_timeframe}} → 종료 {{hook.exit_timeframe}}</div>{% else %}<div class="hook-value">-</div><p>완료 결과 대기</p>{% endif %}</div>
+  {% if market_stats.best_detail %}<a class="member-hook" href="/performance/member/symbol?category={{selected_category}}&symbol={{market_stats.best_detail.symbol}}"><div class="hook-title">이번 기간 최고 결과</div><div class="hook-value {{'pos' if market_stats.best_return_pct is not none and market_stats.best_return_pct >= 0 else 'neg'}}">{% if market_stats.best_return_pct is not none %}{{'%+.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div><p>{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}} · 매수 {{market_stats.best_detail.entry_timeframe}} → 종료 {{market_stats.best_detail.exit_timeframe}}</p></a>{% else %}<div class="member-hook"><div class="hook-title">이번 기간 최고 결과</div><div class="hook-value">-</div><p>완료 결과 대기</p></div>{% endif %}
+  {% if market_stats.recent_completed %}{% set hook=market_stats.recent_completed[0] %}<a class="member-hook" href="/performance/member/symbol?category={{selected_category}}&symbol={{hook.symbol}}"><div class="hook-title">가장 최근 완료</div><div class="hook-value {{'pos' if hook.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(hook.return_pct)}}%</div><div class="recent-proof">{{symbol_display(hook.symbol,hook.exchange)}} · 매수 {{hook.entry_timeframe}} → 종료 {{hook.exit_timeframe}}</div></a>{% else %}<div class="member-hook"><div class="hook-title">가장 최근 완료</div><div class="hook-value">-</div><p>완료 결과 대기</p></div>{% endif %}
 </div>
 <div class="market member-view" data-member-view="overview">
 <div class="market-head">
@@ -3190,7 +3211,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </details>
 
 <details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="symbols-performance" open>
-<summary class="section-title">종목별 수익률 현황</summary>
+<summary class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률은 가장 최근에 완료된 사이클의 평균 수익률입니다.</div>
 <div class="member-alpha-table">
@@ -3305,34 +3326,38 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 <details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="cadence" open>
 <summary class="section-title">알람 분석</summary>
 <div style="margin-top:14px">
-<div class="notice" style="margin-bottom:14px"><b>현재 적용 중인 알람 운영 기준</b><br>첫 LOW는 종목 집중 알림으로만 사용하고 진입하지 않습니다. 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입하며, 매도는 첫 유효 HIGH에서 전량 종료합니다.</div>
+<div class="notice" style="margin-bottom:14px"><b>현재 적용 중인 알람 기준</b><br>회원 화면에는 실제 운영 중인 알람의 횟수와 발생 주기만 표시합니다.</div>
 {% for v in cadence_simulation.variants %}{% if v.code == 'HALF' %}
 <div class="group-card">
-<div class="group-title"><span>알람 분석 결과</span><span>{{v.alert_count}}건</span></div>
-<div class="tf-row tf-head"><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
-<div class="tf-row">
-<span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span>
-<span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span>
-<span>{{v.no_entry_focus_count}}</span><span>{{v.completed_cycles}}</span>
-<span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</span>
-<span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span>
-<span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span>
-</div>
-<div class="small" style="margin-top:10px">집중 {{v.focus_count}}회 · 실제 진입 {{v.entered_focus_count}}회 · 1회진입 {{v.one_entry_cycles}} · 2회진입 {{v.two_entry_cycles}} · 3회진입 {{v.three_entry_cycles}}</div>
+<div class="group-title"><span>전체 알람</span><span>{{v.alert_count}}건</span></div>
+<div class="small" style="margin-top:8px">선택한 기간에 회원 채널로 전달되는 운영 기준 알람 수입니다.</div>
 </div>{% endif %}{% endfor %}
-<h3 style="margin-top:22px">시간봉별 알람 감소</h3>
+
+<h3 style="margin-top:22px">시간봉별 알람 횟수</h3>
 <div class="member-alpha-table">
-<div class="member-alpha-head" style="grid-template-columns:1.3fr 1fr 1fr"><span>시간봉</span><span>알람 수</span><span>감소율</span></div>
-{% for r in cadence_simulation.timeframes %}<div class="member-alpha-row" style="grid-template-columns:1.3fr 1fr 1fr"><span>{{r.timeframe}}</span><span>{{r.half_count}}</span><span>{{'%.1f'|format(r.half_reduction_pct)}}%</span></div>{% endfor %}
+<div class="member-alpha-head" style="grid-template-columns:1.3fr 1fr"><span>시간봉</span><span>알람 수</span></div>
+{% for r in cadence_simulation.timeframes %}<div class="member-alpha-row" style="grid-template-columns:1.3fr 1fr"><span>{{r.timeframe}}</span><span>{{r.half_count}}건</span></div>{% endfor %}
 </div>
-<h3 style="margin-top:22px">포지션별 결과</h3>
-{% for g in cadence_simulation.groups %}
-<div class="group-card {{'life' if g.group == 'LIFE' else ''}}" style="margin-bottom:10px">
-<div class="group-title"><span>{{g.group_label}}</span><span>알람 분석</span></div>
-<div class="tf-row tf-head"><span>알람</span><span>감소율</span><span>진입포착</span><span>미진입</span><span>완료</span><span>평균진입</span><span>승률</span><span>평균수익</span></div>
-{% for v in g.variants %}{% if v.code == 'HALF' %}<div class="tf-row"><span>{{v.alert_count}}</span><span>{{'%.1f'|format(v.alert_reduction_pct)}}%</span><span>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</span><span>{{v.no_entry_focus_count}}</span><span>{{v.completed_cycles}}</span><span>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}{% else %}-{% endif %}</span><span>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</span><span class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</span></div>{% endif %}{% endfor %}
-</div>{% endfor %}
-<div class="small" style="margin-top:12px">※ 진입포착률·미진입·평균 진입횟수는 현재 적용 중인 운영 주기로 계산한 값입니다.</div>
+
+<h3 style="margin-top:22px">알람 발생 주기</h3>
+<div class="small" style="margin-bottom:12px">전체 기록의 평균 주기와 가장 최근 5회 알람의 평균 주기를 함께 표시합니다.</div>
+<div style="overflow-x:auto">
+<table>
+<tr><th>종목</th><th>포지션</th><th>시간봉</th><th>누적 알람</th><th>전체 평균 주기</th><th>최근 5회 평균 주기</th></tr>
+{% for row in member_occurrence_rows %}
+<tr>
+<td>{{symbol_display(row.symbol, row.exchange)}}</td>
+<td>{{row.group_label}}</td>
+<td>{{row.timeframe}}</td>
+<td>{{row.occurrence_count}}회</td>
+<td>{{row.overall_average_text}}</td>
+<td>{{row.recent_average_text}}</td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="small">발생 주기 데이터가 아직 없습니다.</td></tr>
+{% endfor %}
+</table>
+</div>
 </div></details>
 {% endif %}
 
@@ -3397,6 +3422,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
             market_group_stats=market_group_stats,
             coin_segments=coin_segments,
             cadence_simulation=cadence_simulation,
+            member_occurrence_rows=member_occurrence_rows,
             visit_stats=visit_stats,
         ), 200
 
@@ -4681,7 +4707,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 
 <details class="card collapsible-block" open>
-<summary class="section-title">종목별 수익률 현황</summary>
+<summary class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목명 순 · 최근 수익률은 가장 최근에 완료된 사이클의 평균 수익률입니다.</div>
 <div class="alpha-table">
