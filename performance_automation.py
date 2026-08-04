@@ -457,23 +457,32 @@ def render_exit_image(
 
     _rounded(draw, (entry_x1, card_top, entry_x2, card_bottom), fill=panel, outline=gold, radius=28, width=3)
     draw.text((75, 585), "① 매수", font=_font(34, True), fill=gold)
-    draw.text((75, 650), str(position.get("entry_timeframe") or "-"), font=_font(58, True), fill=white)
-    draw.text((230, 663), "시간봉", font=_font(24, True), fill=muted)
-    draw.line((75, 735, 495, 735), fill=line, width=2)
-    draw.text((75, 762), "매수가", font=_font(22, True), fill=muted)
-    draw.text((75, 800), _price(position.get("entry_price")), font=_font(40, True), fill=white)
-    draw.text((75, 862), f"분할 {position.get('entry_count', 0)}회", font=_font(26, True), fill=gold)
-    draw.text((215, 862), _format_kst(position.get("entry_first_time")), font=_font(22, True), fill=white)
+
+    # 사진 2 방식: 시간봉 · 매수가 · 분할을 한 줄에 크게 표시
+    buy_columns = [
+        (75, str(position.get("entry_timeframe") or "-"), "시간봉", white),
+        (245, _price(position.get("entry_price")), "매수가", white),
+        (415, f"{position.get('entry_count', 0)}회", "분할", gold),
+    ]
+    for x, value, label, color in buy_columns:
+        value_font = _font(45 if len(str(value)) <= 7 else 37, True)
+        draw.text((x, 675), str(value), font=value_font, fill=color)
+        draw.text((x, 735), label, font=_font(20, True), fill=muted)
+    draw.text((75, 850), _format_kst(position.get("entry_first_time")), font=_font(22, True), fill=white)
 
     _rounded(draw, (exit_x1, card_top, exit_x2, card_bottom), fill=panel, outline=red, radius=28, width=3)
     draw.text((585, 585), "② 매도", font=_font(34, True), fill=red)
-    draw.text((585, 650), str(result.get("exit_timeframe") or "-"), font=_font(58, True), fill=white)
-    draw.text((740, 663), "시간봉", font=_font(24, True), fill=muted)
-    draw.line((585, 735, 1005, 735), fill=line, width=2)
-    draw.text((585, 762), "매도가", font=_font(22, True), fill=muted)
-    draw.text((585, 800), _price(result.get("exit_price")), font=_font(40, True), fill=white)
-    draw.text((585, 862), "전량 종료", font=_font(26, True), fill=red)
-    draw.text((725, 862), _format_kst(result.get("exit_time")), font=_font(22, True), fill=white)
+
+    # 매도도 동일한 카드 규칙: 시간봉 · 매도가를 한 줄에 크게 표시
+    sell_columns = [
+        (585, str(result.get("exit_timeframe") or "-"), "시간봉", white),
+        (785, _price(result.get("exit_price")), "매도가", white),
+    ]
+    for x, value, label, color in sell_columns:
+        value_font = _font(45 if len(str(value)) <= 7 else 37, True)
+        draw.text((x, 675), str(value), font=value_font, fill=color)
+        draw.text((x, 735), label, font=_font(20, True), fill=muted)
+    draw.text((585, 850), _format_kst(result.get("exit_time")), font=_font(22, True), fill=white)
 
     # 위험 정보는 별도 빨간 스트립으로 강조
     _rounded(draw, (45, 980, 1035, 1115), fill="#191316", outline="#6E3038", radius=24, width=2)
@@ -599,10 +608,19 @@ def render_cycle_summary_image(
         value = float(result.get("return_pct") or 0)
         value_color = green if value >= 0 else red
         _rounded(draw, (x1, y1, x2, y2), fill=panel, outline=value_color, radius=25, width=3)
-        draw.text((x1 + 25, y1 + 22), f"매도 {result.get('exit_timeframe') or '-'}", font=_font(28, True), fill=blue)
-        draw.text((x1 + 25, y1 + 72), f"{value:+.2f}%", font=_font(54, True), fill=value_color)
-        draw.text((x1 + 25, y1 + 142), f"매도가 {_price(result.get('exit_price'))}", font=_font(22, True), fill=white)
-        draw.text((x1 + 25, y1 + 177), _format_kst(result.get("exit_time")), font=_font(18, True), fill=muted)
+        draw.text((x1 + 25, y1 + 18), "매도 결과", font=_font(25, True), fill=blue)
+
+        # 시간봉별 결과도 사진 2와 같은 3열 카드로 통일
+        compact_columns = [
+            (x1 + 25, str(result.get("exit_timeframe") or "-"), "시간봉", white),
+            (x1 + 165, _price(result.get("exit_price")), "매도가", white),
+            (x1 + 315, f"{value:+.2f}%", "수익률", value_color),
+        ]
+        for cx, cvalue, clabel, ccolor in compact_columns:
+            value_font = _font(33 if len(str(cvalue)) <= 7 else 27, True)
+            draw.text((cx, y1 + 72), str(cvalue), font=value_font, fill=ccolor)
+            draw.text((cx, y1 + 117), clabel, font=_font(17, True), fill=muted)
+        draw.text((x1 + 25, y1 + 174), _format_kst(result.get("exit_time")), font=_font(18, True), fill=muted)
 
     if not results:
         _rounded(draw, (45, cards_top, 1035, cards_top + 190), fill=panel, outline=line, radius=25, width=2)
