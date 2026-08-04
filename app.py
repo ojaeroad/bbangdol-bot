@@ -1,6 +1,6 @@
 # V50_MASTER: 관리자·회원 목차/모바일/속도/메뉴 반응 최종 통합본
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
-import os, json, logging, time, re, hmac, hashlib, math, threading
+import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile
 import csv
 import io
 from datetime import datetime, timedelta, timezone
@@ -161,6 +161,80 @@ _CADENCE_HALF_MIN = {
 _CADENCE_STATE: Dict[str, Dict[str, Any]] = {}
 _CADENCE_LOCK = threading.Lock()
 
+# Gunicorn 다중 워커에서도 같은 종목의 집중 상태를 공유하기 위한 파일 상태 저장소.
+# 메모리 딕셔너리만 쓰면 10:54 요청과 10:55 요청이 서로 다른 워커로 들어갈 때
+# 둘 다 첫 신호로 오인될 수 있다. Render 인스턴스 내부 공용 파일 + flock으로 방지한다.
+TELEGRAM_CADENCE_STATE_FILE = os.getenv(
+    "TELEGRAM_CADENCE_STATE_FILE",
+    "/tmp/bbangdol_telegram_cadence_state.json",
+).strip() or "/tmp/bbangdol_telegram_cadence_state.json"
+TELEGRAM_CADENCE_STATE_MAX_AGE_SEC = max(86400, int(os.getenv(
+    "TELEGRAM_CADENCE_STATE_MAX_AGE_SEC",
+    str(14 * 86400),
+)))
+
+def _cadence_state_transaction():
+    """다중 프로세스 안전 상태 트랜잭션을 반환한다.
+
+    반환값은 ``(state, commit, close)`` 형태다. Linux(Render)에서는 flock을
+    사용하고, 예외가 나면 기존 메모리 상태로 안전하게 폴백한다.
+    """
+    try:
+        import fcntl
+        state_path = TELEGRAM_CADENCE_STATE_FILE
+        lock_path = state_path + ".lock"
+        os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+        lock_fp = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(state_path, "r", encoding="utf-8") as fp:
+                state = json.load(fp)
+            if not isinstance(state, dict):
+                state = {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            state = {}
+
+        now_ts = time.time()
+        for stale_key, stale_value in list(state.items()):
+            try:
+                last_seen = float((stale_value or {}).get("last_seen", 0))
+            except (TypeError, ValueError, AttributeError):
+                last_seen = 0
+            if last_seen <= 0 or now_ts - last_seen > TELEGRAM_CADENCE_STATE_MAX_AGE_SEC:
+                state.pop(stale_key, None)
+
+        def commit(updated_state):
+            directory = os.path.dirname(state_path) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix="cadence_", suffix=".json", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                    json.dump(updated_state, fp, ensure_ascii=False, separators=(",", ":"))
+                    fp.flush()
+                    os.fsync(fp.fileno())
+                os.replace(tmp_path, state_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+        def close():
+            try:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_fp.close()
+
+        return state, commit, close
+    except Exception:
+        log.exception("Cadence shared state unavailable; falling back to process memory")
+        def commit(updated_state):
+            _CADENCE_STATE.clear()
+            _CADENCE_STATE.update(updated_state)
+        def close():
+            return None
+        return dict(_CADENCE_STATE), commit, close
+
 def _telegram_signal_parts(route: str, msg: str, symbol: str) -> Tuple[str, str, str, str]:
     """상태 키용 종목·방향·시간봉·라우트를 추출한다."""
     tf_m = _TF_RE.search(msg or "")
@@ -250,16 +324,12 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
     """실제 Telegram 전송 주기 판정.
 
-    매수 LOW
-    - 첫 신호는 즉시 ``💰 매수 집중``.
-    - 같은 운영 주기 전 반복은 차단.
-    - 다음 자연 경계에서 유효하면 ``✅ 매수 유효``.
-    - 예정 경계를 놓친 뒤 다시 등장하면 새 ``매수 집중``.
-
-    매도 HIGH
-    - 첫 신호는 ``💸 매도 집중 1/3``.
-    - 이후 절반 주기 경계에서 ``🚨 매도 유효 2/3, 3/3``.
-    - 3회 이후 동일 시간봉 HIGH는 생략.
+    핵심 보정:
+    - 상태를 파일에 저장해 Gunicorn 여러 워커가 같은 집중/유효 상태를 공유한다.
+    - 가격은 상태 키에 포함하지 않는다. 같은 종목·방향·시간봉이면 가격이 바뀌어도
+      동일 LOW/HIGH 에피소드로 본다.
+    - 5분봉에서 10:54 첫 신호 후 10:55 경계 신호는 ``매수 유효``이며,
+      다시 ``매수 집중``이 되지 않는다.
     """
     if not TELEGRAM_CADENCE_ENABLED:
         return True, msg, "disabled"
@@ -276,47 +346,86 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
     key = f"{sym}|{route_key}|{direction}|{timeframe}"
 
     with _CADENCE_LOCK:
-        if direction == "LOW":
-            suffix = f"|HIGH|{timeframe}"
-            for old_key in list(_CADENCE_STATE):
-                if old_key.startswith(f"{sym}|") and old_key.endswith(suffix):
-                    _CADENCE_STATE.pop(old_key, None)
+        state, commit_state, close_state = _cadence_state_transaction()
+        try:
+            if direction == "LOW":
+                suffix = f"|HIGH|{timeframe}"
+                for old_key in list(state):
+                    if old_key.startswith(f"{sym}|") and old_key.endswith(suffix):
+                        state.pop(old_key, None)
 
-        prev = _CADENCE_STATE.get(key)
+            prev = state.get(key)
 
-        if direction == "HIGH":
+            if direction == "HIGH":
+                if prev is None:
+                    episode_count = 1
+                    phase = "EXIT"
+                    should_send = True
+                else:
+                    previous_slot = int(prev.get("last_seen_slot", slot))
+                    previous_count = int(prev.get("episode_count", 1))
+                    last_sent_ts = float(prev.get("last_sent", prev.get("last_seen", now_ts)))
+                    elapsed_since_send = max(0.0, now_ts - last_sent_ts)
+
+                    if slot == previous_slot or elapsed_since_send < cadence_sec:
+                        phase = "SUPPRESS"
+                        should_send = False
+                        episode_count = previous_count
+                    else:
+                        is_immediate_next_slot = slot == previous_slot + 1
+                        is_boundary_signal = seconds_after_boundary <= TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC
+                        if is_immediate_next_slot and is_boundary_signal:
+                            if previous_count >= 3:
+                                phase = "SUPPRESS"
+                                should_send = False
+                                episode_count = previous_count
+                            else:
+                                episode_count = previous_count + 1
+                                phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
+                                should_send = True
+                        else:
+                            episode_count = 1
+                            phase = "EXIT"
+                            should_send = True
+
+                state[key] = {
+                    "last_seen": now_ts,
+                    "last_seen_slot": slot,
+                    "last_sent": now_ts if should_send else (prev or {}).get("last_sent"),
+                    "last_sent_slot": slot if should_send else (prev or {}).get("last_sent_slot"),
+                    "timeframe": timeframe,
+                    "cadence_minutes": cadence,
+                    "phase": phase,
+                    "episode_count": episode_count,
+                }
+                commit_state(state)
+                if not should_send:
+                    reason = "high_max_3_reached" if episode_count >= 3 else f"same_slot_{cadence}m"
+                    return False, msg, reason
+                return True, _decorate_cadence_message(msg, phase, episode_count), f"high_{episode_count}_of_3"
+
             if prev is None:
-                episode_count = 1
-                phase = "EXIT"
+                phase = "FOCUS"
                 should_send = True
             else:
                 previous_slot = int(prev.get("last_seen_slot", slot))
-                previous_count = int(prev.get("episode_count", 1))
                 last_sent_ts = float(prev.get("last_sent", prev.get("last_seen", now_ts)))
                 elapsed_since_send = max(0.0, now_ts - last_sent_ts)
 
                 if slot == previous_slot or elapsed_since_send < cadence_sec:
                     phase = "SUPPRESS"
                     should_send = False
-                    episode_count = previous_count
                 else:
                     is_immediate_next_slot = slot == previous_slot + 1
                     is_boundary_signal = seconds_after_boundary <= TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC
                     if is_immediate_next_slot and is_boundary_signal:
-                        if previous_count >= 3:
-                            phase = "SUPPRESS"
-                            should_send = False
-                            episode_count = previous_count
-                        else:
-                            episode_count = previous_count + 1
-                            phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
-                            should_send = True
+                        phase = "HOLD"
+                        should_send = True
                     else:
-                        episode_count = 1
-                        phase = "EXIT"
+                        phase = "FOCUS"
                         should_send = True
 
-            _CADENCE_STATE[key] = {
+            state[key] = {
                 "last_seen": now_ts,
                 "last_seen_slot": slot,
                 "last_sent": now_ts if should_send else (prev or {}).get("last_sent"),
@@ -324,43 +433,10 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                 "timeframe": timeframe,
                 "cadence_minutes": cadence,
                 "phase": phase,
-                "episode_count": episode_count,
             }
-            if not should_send:
-                reason = "high_max_3_reached" if episode_count >= 3 else f"same_slot_{cadence}m"
-                return False, msg, reason
-            return True, _decorate_cadence_message(msg, phase, episode_count), f"high_{episode_count}_of_3"
-
-        if prev is None:
-            phase = "FOCUS"
-            should_send = True
-        else:
-            previous_slot = int(prev.get("last_seen_slot", slot))
-            last_sent_ts = float(prev.get("last_sent", prev.get("last_seen", now_ts)))
-            elapsed_since_send = max(0.0, now_ts - last_sent_ts)
-
-            if slot == previous_slot or elapsed_since_send < cadence_sec:
-                phase = "SUPPRESS"
-                should_send = False
-            else:
-                is_immediate_next_slot = slot == previous_slot + 1
-                is_boundary_signal = seconds_after_boundary <= TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC
-                if is_immediate_next_slot and is_boundary_signal:
-                    phase = "HOLD"
-                    should_send = True
-                else:
-                    phase = "FOCUS"
-                    should_send = True
-
-        _CADENCE_STATE[key] = {
-            "last_seen": now_ts,
-            "last_seen_slot": slot,
-            "last_sent": now_ts if should_send else (prev or {}).get("last_sent"),
-            "last_sent_slot": slot if should_send else (prev or {}).get("last_sent_slot"),
-            "timeframe": timeframe,
-            "cadence_minutes": cadence,
-            "phase": phase,
-        }
+            commit_state(state)
+        finally:
+            close_state()
 
     if not should_send:
         return False, msg, f"same_slot_{cadence}m"
