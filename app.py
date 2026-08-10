@@ -3607,17 +3607,10 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
  let initial=(location.hash||'').replace('#','');
  if(!nav.querySelector('[data-view="'+initial+'"]')){try{initial=sessionStorage.getItem('memberSelectedView')||'overview'}catch(e){initial='overview'}}
  showView(initial,false);
- // v47: 국장·미장·코인 전환 페이지를 유휴 시간에 미리 받아 첫 클릭 대기시간을 줄인다.
- const pageCache=new Map();
- const marketLinks=[...document.querySelectorAll('.tabs a[href^="/performance/member?"]')];
- const prefetchPages=()=>marketLinks.filter(a=>a.href!==location.href).forEach(a=>{
-   fetch(a.href,{credentials:'same-origin'}).then(r=>r.ok?r.text():null).then(html=>{if(html)pageCache.set(a.href,html)}).catch(()=>{});
- });
- if('requestIdleCallback' in window) requestIdleCallback(prefetchPages,{timeout:2500}); else setTimeout(prefetchPages,900);
- marketLinks.forEach(a=>a.addEventListener('click',e=>{
-   const html=pageCache.get(a.href); if(!html) return;
-   e.preventDefault(); document.open(); document.write(html); document.close(); history.replaceState(null,'',a.href);
- }));
+
+ // v64: 자동 prefetch 제거. 사용자가 아무것도 누르지 않아도 KOREA/US/COIN 전체 분석을
+ // 백그라운드에서 연속 실행해 512MB 메모리와 Gunicorn worker를 압박하던 원인을 제거한다.
+
 })();
 </script>
 </body>
@@ -3654,7 +3647,7 @@ def _group_detail_rows(category: str, group_key: str, period_key: str):
     category_market = {"KOREA_1Q": "KOREA", "US_1Q": "US", "COIN": "COIN"}
     market = category_market.get(category, "KOREA")
     start_at = _period_start(period_key)
-    analysis = group_analysis_market_data(market)
+    analysis = _cached_group_analysis_market_data(market)
     rows = []
     for symbol, symbol_data in (analysis.get("symbol_data") or {}).items():
         exchange = "KRX" if market == "KOREA" else market
@@ -4782,7 +4775,7 @@ summary{cursor:pointer;font-weight:bold}
 <button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리센터 메뉴</button>
 <div class="admin-backdrop" id="adminBackdrop"></div>
 <aside class="admin-side" id="adminSide"><div class="admin-side-title">관리센터 메뉴</div><nav class="admin-nav" id="adminNav">
-<button data-admin-label="포지션별 성과">포지션별 성과</button><button data-admin-label="수익률·승률 TOP 5">수익률·승률 TOP5</button><button data-admin-label="최근 완료 10건">최근 완료 10건</button><button class="life" data-admin-label="인생타점 상세 성과">인생타점 상세</button><button data-admin-label="종목별 수익률 현황">종목별 수익률</button><button data-admin-label="매수·매도 시간봉별 상세 성과">시간봉별 상세</button><button data-admin-label="종목 목록">종목 목록</button><button class="admin-only" data-admin-label="코인 단타">관리자 전용 분석</button>
+<button data-admin-label="포지션별 성과">포지션별 성과</button><button data-admin-label="수익률·승률 TOP 5">수익률·승률 TOP5</button><button data-admin-label="최근 완료 10건">최근 완료 10건</button><button class="life" data-admin-label="인생타점 상세 성과">인생타점 상세</button><button data-admin-label="종목별 성과 현황">종목별 성과</button><button data-admin-label="매수·매도 시간봉별 상세 성과">시간봉별 상세</button><button data-admin-label="종목 목록">종목 목록</button><button class="admin-only" data-admin-label="코인 단타">관리자 전용 분석</button>
 </nav></aside>
 <h1>성과운영센터 · 관리센터</h1>
 <div class="toplinks">
