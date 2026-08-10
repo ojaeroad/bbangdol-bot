@@ -2658,8 +2658,12 @@ def _cached_calculation(key: tuple, factory):
     return value
 
 
-def _cached_visual_cycle_data(limit: int):
-    return _cached_calculation(("visual_cycle_data", int(limit)), lambda: visual_cycle_data(limit))
+def _cached_visual_cycle_data(limit: int, category_key: str | None = None):
+    category_key = str(category_key or "").upper()
+    return _cached_calculation(
+        ("visual_cycle_data", int(limit), category_key),
+        lambda: visual_cycle_data(limit, category_key or None),
+    )
 
 
 def _cached_group_analysis_market_data(market: str):
@@ -2727,7 +2731,7 @@ def performance_member():
         if selected_category not in allowed_categories:
             selected_category = "KOREA_1Q"
 
-        data = _sort_performance_categories(_cached_visual_cycle_data(limit))
+        data = _sort_performance_categories(_cached_visual_cycle_data(limit, selected_category))
         selected = next(
             (
                 category
@@ -4469,7 +4473,7 @@ def performance_dashboard():
         if requested_symbol:
             return redirect(f"/performance/member/symbol?category={selected_category}&symbol={requested_symbol}&from=admin")
 
-        data = _sort_performance_categories(_cached_visual_cycle_data(limit))
+        data = _sort_performance_categories(_cached_visual_cycle_data(limit, selected_category))
         selected = next(
             (
                 category
@@ -4783,7 +4787,7 @@ summary{cursor:pointer;font-weight:bold}
 <button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리센터 메뉴</button>
 <div class="admin-backdrop" id="adminBackdrop"></div>
 <aside class="admin-side" id="adminSide"><div class="admin-side-title">관리센터 메뉴</div><nav class="admin-nav" id="adminNav">
-<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a class="admin-only" href="#admin-scalp">관리자 전용 분석</a>
+<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a class="admin-only" href="{% if selected_category == 'COIN' %}#admin-scalp{% else %}/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp{% endif %}">관리자 전용 분석</a>
 </nav></aside>
 <h1>성과운영센터 · 관리센터</h1>
 <div class="toplinks">

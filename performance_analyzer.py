@@ -131,9 +131,25 @@ def _weighted_average(prices: list[Decimal]) -> Decimal:
     return sum(prices, Decimal("0")) / Decimal(len(prices))
 
 
-def _load_signals(conn) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
+def _load_signals(conn, category_key: str | None = None) -> list[dict[str, Any]]:
+    # v68: 화면에서 선택한 시장만 SQL 단계에서 읽는다.
+    # 기존 visual_cycle_data()가 세 시장 전체 신호를 매번 메모리에 올려
+    # 회원/관리자 첫 화면에서 512MB OOM/502를 유발하던 경로를 제거한다.
+    selected = str(category_key or "").upper()
+    korea_cond = """(strategy = '1Q' AND (
+        UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
+            '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
+        ]) OR symbol ~ '^[0-9]{6}$'))"""
+    if selected == "COIN":
+        market_where = "AND strategy = 'STARFLOWER'"
+    elif selected == "KOREA_1Q":
+        market_where = f"AND {korea_cond}"
+    elif selected == "US_1Q":
+        market_where = f"AND strategy = '1Q' AND NOT {korea_cond}"
+    else:
+        market_where = ""
+
+    sql = f"""
         SELECT
             id, signal_no, strategy,
             COALESCE(exchange, raw_exchange),
@@ -143,13 +159,14 @@ def _load_signals(conn) -> list[dict[str, Any]]:
         FROM performance_signals
         WHERE signal_price IS NOT NULL
           AND signal_type IN ('LOW', 'HIGH')
+          {market_where}
         ORDER BY strategy,
                  COALESCE(exchange, raw_exchange, ''),
                  symbol,
                  received_at,
                  id
         """
-    ).fetchall()
+    rows = conn.execute(sql).fetchall()
 
     return [
         {
@@ -356,7 +373,7 @@ def rebuild_individual_pairs() -> dict[str, Any]:
     mode_counts: dict[str, int] = defaultdict(int)
 
     with _connect() as conn:
-        signals = _load_signals(conn)
+        signals = _load_signals(conn, category_key)
         cycles = _build_cycles(signals)
         cycle_count = len(cycles)
 
@@ -581,7 +598,7 @@ def _market_category(
     return "OTHER", "기타"
 
 
-def visual_cycle_data(limit_symbols: int = 30) -> dict[str, Any]:
+def visual_cycle_data(limit_symbols: int = 30, category_key: str | None = None) -> dict[str, Any]:
     """회원용 대시보드 데이터.
 
     완료 사이클:
