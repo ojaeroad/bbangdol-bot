@@ -3716,6 +3716,8 @@ def performance_dashboard_group():
 def performance_member_symbol():
     category = request.args.get("category", "KOREA_1Q").strip().upper()
     symbol = request.args.get("symbol", "").strip().upper()
+    from_admin = (_performance_role() == "admin" or request.args.get("from") == "admin")
+    detail_back_url = (f"/performance/dashboard?category={category}&period=all" if from_admin else f"/performance/member?category={category}&period=all")
 
     category_market = {
         "KOREA_1Q": "KOREA",
@@ -3740,10 +3742,10 @@ def performance_member_symbol():
 body{background:#0e0e0f;color:#f4f4f4;font-family:Arial,"Noto Sans KR",sans-serif;padding:20px}
 a{color:#76ceff}.card{background:#1b1b1d;border:1px solid #343438;border-radius:14px;padding:18px}
 </style></head><body>
-<a href="/performance/member?category={{category}}">← 종목 목록</a>
+<a href="{{detail_back_url}}">← 종목 목록</a>
 <div class="card"><h2>종목 데이터가 없습니다.</h2></div>
 </body></html>
-""", category=category), 404
+""", category=category, detail_back_url=detail_back_url), 404
 
 
     member_stats = _member_group_engine_statistics(data, "all")
@@ -4461,6 +4463,12 @@ def performance_dashboard():
         if period_key not in {"today", "7d", "30d", "all"}:
             period_key = "all"
 
+        # v65: 종목 상세는 시장 전체 분석 페이지를 다시 만들지 않는다.
+        # 기존 /dashboard?symbol=... 링크/북마크도 단일 종목 분석으로 즉시 우회한다.
+        requested_symbol = request.args.get("symbol", "").strip().upper()
+        if requested_symbol:
+            return redirect(f"/performance/member/symbol?category={selected_category}&symbol={requested_symbol}&from=admin")
+
         data = _sort_performance_categories(_cached_visual_cycle_data(limit))
         selected = next(
             (
@@ -4822,8 +4830,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% if not selected_symbol %}
 <div class="market-performance">
 <div class="metric"><div class="title">평균 수익률</div><div class="value {{'pos' if market_stats.average_return_pct is not none and market_stats.average_return_pct >= 0 else 'neg' if market_stats.average_return_pct is not none else 'muted'}}">{% if market_stats.average_return_pct is not none %}{{'%.2f'|format(market_stats.average_return_pct)}}%{% else %}-{% endif %}</div><div class="small">{{market_stats.result_symbol_count}}개 종목의 완료 사이클 평균</div></div>
-<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.best_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.best_detail.symbol}}&period={{period_key}}{% else %}#{% endif %}"><div class="title">최고 수익률</div><div class="value pos">{% if market_stats.best_return_pct is not none %}{{'%.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.best_detail %}<div class="small">{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}}<br>매수 {{market_stats.best_detail.entry_timeframe}} · {{market_stats.best_detail.entry_time}}<br>🔴 매도 {{market_stats.best_detail.exit_timeframe}} · {{market_stats.best_detail.exit_time}}</div>{% endif %}</a>
-<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.worst_detail %}/performance/dashboard?category={{selected_category}}&symbol={{market_stats.worst_detail.symbol}}&period={{period_key}}{% else %}#{% endif %}"><div class="title">최저 수익률</div><div class="value {{'pos' if market_stats.worst_return_pct is not none and market_stats.worst_return_pct >= 0 else 'neg'}}">{% if market_stats.worst_return_pct is not none %}{{'%.2f'|format(market_stats.worst_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.worst_detail %}<div class="small">{{symbol_display(market_stats.worst_detail.symbol, market_stats.worst_detail.exchange)}}<br>매수 {{market_stats.worst_detail.entry_timeframe}} · {{market_stats.worst_detail.entry_time}}<br>🔴 매도 {{market_stats.worst_detail.exit_timeframe}} · {{market_stats.worst_detail.exit_time}}</div>{% endif %}</a>
+<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.best_detail %}/performance/member/symbol?category={{selected_category}}&symbol={{market_stats.best_detail.symbol}}&from=admin{% else %}#{% endif %}"><div class="title">최고 수익률</div><div class="value pos">{% if market_stats.best_return_pct is not none %}{{'%.2f'|format(market_stats.best_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.best_detail %}<div class="small">{{symbol_display(market_stats.best_detail.symbol, market_stats.best_detail.exchange)}}<br>매수 {{market_stats.best_detail.entry_timeframe}} · {{market_stats.best_detail.entry_time}}<br>🔴 매도 {{market_stats.best_detail.exit_timeframe}} · {{market_stats.best_detail.exit_time}}</div>{% endif %}</a>
+<a class="metric" style="color:#f4f4f4;text-decoration:none" href="{% if market_stats.worst_detail %}/performance/member/symbol?category={{selected_category}}&symbol={{market_stats.worst_detail.symbol}}&from=admin{% else %}#{% endif %}"><div class="title">최저 수익률</div><div class="value {{'pos' if market_stats.worst_return_pct is not none and market_stats.worst_return_pct >= 0 else 'neg'}}">{% if market_stats.worst_return_pct is not none %}{{'%.2f'|format(market_stats.worst_return_pct)}}%{% else %}-{% endif %}</div>{% if market_stats.worst_detail %}<div class="small">{{symbol_display(market_stats.worst_detail.symbol, market_stats.worst_detail.exchange)}}<br>매수 {{market_stats.worst_detail.entry_timeframe}} · {{market_stats.worst_detail.entry_time}}<br>🔴 매도 {{market_stats.worst_detail.exit_timeframe}} · {{market_stats.worst_detail.exit_time}}</div>{% endif %}</a>
 <div class="metric"><div class="title">승률</div><div class="value {{'pos' if market_stats.win_rate_pct is not none and market_stats.win_rate_pct >= 50 else 'neg'}}">{% if market_stats.win_rate_pct is not none %}{{'%.1f'|format(market_stats.win_rate_pct)}}%{% else %}-{% endif %}</div></div>
 <div class="metric"><div class="title">평균 보유시간</div><div class="value">{% if market_stats.average_holding_minutes is not none %}{{format_minutes_compact(market_stats.average_holding_minutes)}}{% else %}-{% endif %}</div></div>
 </div>
@@ -4836,7 +4844,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
   </div>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:14px">
     {% for d in market_stats.recent_completed %}
-    <a class="metric" href="/performance/dashboard?category={{selected_category}}&symbol={{d.symbol}}&period={{period_key}}" style="color:#f4f4f4;text-decoration:none">
+    <a class="metric" href="/performance/member/symbol?category={{selected_category}}&symbol={{d.symbol}}&from=admin" style="color:#f4f4f4;text-decoration:none">
       <div style="display:flex;justify-content:space-between;gap:10px">
         <b>{{symbol_display(d.symbol,d.exchange)}}</b>
         <b class="{{'pos' if d.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(d.return_pct)}}%</b>
@@ -4879,7 +4887,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div class="ranking-grid" style="margin-top:14px">
 <div class="admin-ranking"><h3>평균 수익률 TOP 5</h3>
 {% for s in admin_average_ranking %}
-<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<a class="admin-rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}&from=admin">
 <span class="admin-rank-no">{{loop.index}}</span>
 <span class="admin-rank-symbol">{{symbol_display(s.symbol, s.exchange)}}{% if s.member_stats.best_detail %}<small>대표 최고 · 매수 {{s.member_stats.best_detail.entry_timeframe}} {{s.member_stats.best_detail.entry_time}} → 매도 {{s.member_stats.best_detail.exit_timeframe}} {{s.member_stats.best_detail.exit_time}}</small>{% endif %}</span>
 <b class="admin-rank-value {{'pos' if s.member_stats.average_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.average_return_pct)}}%</b>
@@ -4887,7 +4895,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endfor %}</div>
 <div class="admin-ranking"><h3>최고 수익률 TOP 5</h3>
 {% for s in admin_best_ranking %}
-<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<a class="admin-rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}&from=admin">
 <span class="admin-rank-no">{{loop.index}}</span>
 <span class="admin-rank-symbol">{{symbol_display(s.symbol, s.exchange)}}{% if s.member_stats.best_detail %}<small>매수 {{s.member_stats.best_detail.entry_timeframe}} {{s.member_stats.best_detail.entry_time}} → 매도 {{s.member_stats.best_detail.exit_timeframe}} {{s.member_stats.best_detail.exit_time}}</small>{% endif %}</span>
 <b class="admin-rank-value {{'pos' if s.member_stats.best_return_pct >= 0 else 'neg'}}">{{'%.2f'|format(s.member_stats.best_return_pct)}}%</b>
@@ -4895,7 +4903,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endfor %}</div>
 <div class="admin-ranking"><h3>승률 TOP 5</h3>
 {% for s in admin_win_rate_ranking %}
-<a class="admin-rank-row" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<a class="admin-rank-row" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}&from=admin">
 <span class="admin-rank-no">{{loop.index}}</span>
 <span class="admin-rank-symbol">{{symbol_display(s.symbol, s.exchange)}}<small>검증 {{s.member_stats.completed_cycle_count}}사이클{% if s.member_stats.best_detail %} · 대표 매수 {{s.member_stats.best_detail.entry_timeframe}} → 매도 {{s.member_stats.best_detail.exit_timeframe}}{% endif %}</small></span>
 <b class="admin-rank-value {{'pos' if s.member_stats.win_rate_pct >= 50 else 'neg'}}">{{'%.1f'|format(s.member_stats.win_rate_pct)}}%</b>
@@ -4907,7 +4915,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% if market_stats.recent_completed %}
 <details class="card collapsible-block" open><summary class="section-title">최근 완료 10건</summary><div style="margin-top:14px">
 {% for detail in market_stats.recent_completed %}
-<a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/dashboard?category={{selected_category}}&symbol={{detail.symbol}}&period={{period_key}}">
+<a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/member/symbol?category={{selected_category}}&symbol={{detail.symbol}}&from=admin">
 <div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><div class="small">사이클 #{{detail.cycle}}</div></div>
 <div class="small">🟡 매수 {{detail.entry_timeframe}} · {{detail.entry_time}}<br>🔴 매도 {{detail.exit_timeframe}} · {{detail.exit_time}}</div>
 <div class="{{'pos' if detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(detail.return_pct)}}%</div>
@@ -4992,7 +5000,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% elif not selected_symbol %}
 <details class="card collapsible-block" open><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbol-list">
 {% for s in selected.symbols %}
-<a class="symbol-card" href="/performance/dashboard?category={{selected_category}}&symbol={{s.symbol}}&period={{period_key}}">
+<a class="symbol-card" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}&from=admin">
 <div class="symbol-card-head">
 <div class="symbol-name">{{symbol_display(s.symbol, s.exchange)}}</div>
 <div class="small">{{exchange_only_label(s.exchange)}}</div>
@@ -5299,10 +5307,10 @@ summary{cursor:pointer;font-weight:bold}
  const aliases={
   '포지션별성과':['포지션별성과'],
   '수익률승률TOP5':['수익률승률TOP5','수익률승률TOP 5'],
-  '최근완료5건':['최근완료5건'],
+  '최근완료10건':['최근완료10건'],
   '인생타점상세성과':['인생타점상세성과','인생타점상세'],
-  '종목별수익률현황':['종목별수익률현황','종목별수익률'],
-  '매수종료시간봉별상세성과':['매수종료시간봉별상세성과','시간봉별상세'],
+  '종목별성과현황':['종목별성과현황','종목별성과'],
+  '매수매도시간봉별상세성과':['매수매도시간봉별상세성과','매수종료시간봉별상세성과','시간봉별상세'],
   '종목목록':['종목목록'],
   '코인단타':['코인단타','단타4개조합','관리자전용분석']
  };
@@ -5326,11 +5334,9 @@ summary{cursor:pointer;font-weight:bold}
    observed.forEach(x=>io.observe(x[1]));
  }
  try{const saved=sessionStorage.getItem('adminSelectedMenu');const b=[...nav.querySelectorAll('[data-admin-label]')].find(x=>x.dataset.adminLabel===saved);if(b){const t=findTarget(saved);if(t)nav.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===b));}}catch(e){}
- // 시장·기간 화면을 유휴 시간에 미리 내려받고, 준비된 페이지는 즉시 교체한다.
- const links=[...document.querySelectorAll('.category-nav a[href^="/performance/dashboard?"]')]; const pageCache=new Map();
- const prefetch=()=>links.filter(a=>a.href!==location.href).forEach(a=>fetch(a.href,{credentials:'same-origin'}).then(r=>r.ok?r.text():null).then(html=>{if(html)pageCache.set(a.href,html)}).catch(()=>{}));
- if('requestIdleCallback' in window)requestIdleCallback(prefetch,{timeout:2200});else setTimeout(prefetch,700);
- links.forEach(a=>a.addEventListener('click',e=>{const html=pageCache.get(a.href);if(!html)return;e.preventDefault();document.open();document.write(html);document.close();history.replaceState(null,'',a.href);}));
+ // v65: 관리자 자동 prefetch도 완전 제거.
+ // 이전 코드는 화면을 보고만 있어도 KOREA/US/COIN 페이지를 백그라운드 fetch하여
+ // 512MB 인스턴스의 메모리/CPU를 소모하고 WORKER TIMEOUT/SIGKILL/502를 유발할 수 있었다.
 })();
 </script>
 </body></html>
