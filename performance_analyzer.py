@@ -132,14 +132,19 @@ def _weighted_average(prices: list[Decimal]) -> Decimal:
 
 
 def _load_signals(conn, category_key: str | None = None) -> list[dict[str, Any]]:
-    # v68: 화면에서 선택한 시장만 SQL 단계에서 읽는다.
-    # 기존 visual_cycle_data()가 세 시장 전체 신호를 매번 메모리에 올려
-    # 회원/관리자 첫 화면에서 512MB OOM/502를 유발하던 경로를 제거한다.
+    """필요한 시장 신호만 SQL 단계에서 읽는다.
+
+    v69 OOM fix:
+    - 관리자/회원 화면이 국장/미장/코인 하나를 볼 때 세 시장 전체 신호를
+      Python 메모리에 올리지 않는다.
+    - category_key=None 인 관리용 전체 JSON 경로만 기존처럼 전체를 읽는다.
+    """
     selected = str(category_key or "").upper()
     korea_cond = """(strategy = '1Q' AND (
         UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
             '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
         ]) OR symbol ~ '^[0-9]{6}$'))"""
+
     if selected == "COIN":
         market_where = "AND strategy = 'STARFLOWER'"
     elif selected == "KOREA_1Q":
@@ -165,7 +170,7 @@ def _load_signals(conn, category_key: str | None = None) -> list[dict[str, Any]]
                  symbol,
                  received_at,
                  id
-        """
+    """
     rows = conn.execute(sql).fetchall()
 
     return [
@@ -183,6 +188,38 @@ def _load_signals(conn, category_key: str | None = None) -> list[dict[str, Any]]
         }
         for r in rows
     ]
+
+
+def _category_symbol_counts(conn) -> dict[str, int]:
+    """상단 시장 탭 종목 수만 가볍게 조회한다.
+
+    선택하지 않은 시장까지 상세 신호를 읽지 않으면서 기존 UI의
+    '국장 22 / 미장 22 / 코인 9' 같은 탭 숫자는 유지한다.
+    """
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(DISTINCT CASE WHEN strategy = 'STARFLOWER' THEN symbol END) AS coin_count,
+            COUNT(DISTINCT CASE WHEN strategy = '1Q' AND (
+                UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
+                    '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
+                ]) OR symbol ~ '^[0-9]{6}$'
+            ) THEN symbol END) AS korea_count,
+            COUNT(DISTINCT CASE WHEN strategy = '1Q' AND NOT (
+                UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
+                    '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
+                ]) OR symbol ~ '^[0-9]{6}$'
+            ) THEN symbol END) AS us_count
+        FROM performance_signals
+        WHERE signal_price IS NOT NULL
+          AND signal_type IN ('LOW', 'HIGH')
+        """
+    ).fetchone()
+    return {
+        "COIN": int(row[0] or 0),
+        "KOREA_1Q": int(row[1] or 0),
+        "US_1Q": int(row[2] or 0),
+    }
 
 
 def _build_cycles(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -373,7 +410,7 @@ def rebuild_individual_pairs() -> dict[str, Any]:
     mode_counts: dict[str, int] = defaultdict(int)
 
     with _connect() as conn:
-        signals = _load_signals(conn, category_key)
+        signals = _load_signals(conn)
         cycles = _build_cycles(signals)
         cycle_count = len(cycles)
 
@@ -613,7 +650,8 @@ def visual_cycle_data(limit_symbols: int = 30, category_key: str | None = None) 
     safe_limit = max(1, min(int(limit_symbols), 100))
 
     with _connect() as conn:
-        signals = _load_signals(conn)
+        signals = _load_signals(conn, category_key)
+        category_symbol_counts = _category_symbol_counts(conn)
 
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for signal in signals:
@@ -1159,7 +1197,11 @@ def visual_cycle_data(limit_symbols: int = 30, category_key: str | None = None) 
                 "category_key": category_key,
                 "category_label": category_labels[category_key],
                 "anchor": category_key.lower(),
-                "symbol_count": len(category_symbols),
+                "symbol_count": (
+                    category_symbol_counts.get(category_key, len(category_symbols))
+                    if category_key in {"COIN", "KOREA_1Q", "US_1Q"}
+                    else len(category_symbols)
+                ),
                 "completed_cycle_count": sum(
                     item["completed_cycle_count"]
                     for item in category_symbols

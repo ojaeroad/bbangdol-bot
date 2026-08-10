@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -206,7 +207,7 @@ def _load_signals(market: str | None = None) -> list[dict[str, Any]]:
     korea_sql = """(strategy = '1Q' AND (
         UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
             '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
-        ]) OR (strategy = '1Q' AND symbol ~ '^[0-9]{6}$')))"""
+        ]) OR (strategy = '1Q' AND symbol ~ '^[0-9]{6}$'))"""
     if selected == "COIN":
         market_where = "AND strategy = 'STARFLOWER'"
     elif selected == "KOREA":
@@ -560,11 +561,28 @@ def _attach_exit_results(
     highs: list[dict[str, Any]],
     lows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """첫 유효 HIGH 결과를 붙인다.
+
+    v69 memory/time fix:
+    과거 구현은 포지션 × 종료시간봉마다 모든 HIGH를 새 리스트로 만들고,
+    다시 모든 LOW를 adverse_candidates 리스트로 복제했다. 신호가 수만 건으로
+    늘면 짧은 요청 하나가 큰 임시 리스트를 반복 생성해 512MB OOM/timeout을
+    유발할 수 있다.
+
+    여기서는 시간 정렬 + bisect로 첫 HIGH를 O(log n)에 찾고, LOW 구간은
+    슬라이스 복사 없이 인덱스 범위만 순회한다. 결과 규칙은 기존과 같다.
+    """
     highs_by_tf: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for high in sorted(highs, key=lambda item: (item["time"], item["id"])):
         highs_by_tf[high["timeframe"]].append(high)
+    high_times_by_tf = {
+        tf: [row["time"] for row in rows]
+        for tf, rows in highs_by_tf.items()
+    }
 
     sorted_lows = sorted(lows, key=lambda item: (item["time"], item["id"]))
+    low_times = [row["time"] for row in sorted_lows]
+
     output: list[dict[str, Any]] = []
     for position in positions:
         entries = position["entries"]
@@ -583,30 +601,30 @@ def _attach_exit_results(
             position["market"],
             position["entry_group"],
         ):
-            candidates = [
-                high
-                for high in highs_by_tf.get(exit_timeframe, [])
-                if high["time"] > last_time
-            ]
-            if not candidates:
+            tf_highs = highs_by_tf.get(exit_timeframe) or []
+            if not tf_highs:
                 continue
+            tf_times = high_times_by_tf[exit_timeframe]
+            high_index = bisect_right(tf_times, last_time)
+            if high_index >= len(tf_highs):
+                continue
+            exit_signal = tf_highs[high_index]
 
-            exit_signal = candidates[0]
             holding_minutes = int(
                 (exit_signal["time"] - last_time).total_seconds() / 60
             )
-            adverse_candidates = [
-                low for low in sorted_lows
-                if low["time"] >= first_time
-                and low["time"] <= exit_signal["time"]
-            ]
-            adverse_signal = (
-                min(adverse_candidates, key=lambda row: row["price"])
-                if adverse_candidates else None
-            )
-            adverse_price = (
-                adverse_signal["price"] if adverse_signal else average_price
-            )
+
+            low_start = bisect_left(low_times, first_time)
+            low_end = bisect_right(low_times, exit_signal["time"])
+            adverse_signal = None
+            adverse_price = average_price
+            for low_index in range(low_start, low_end):
+                candidate = sorted_lows[low_index]
+                if adverse_signal is None or candidate["price"] < adverse_signal["price"]:
+                    adverse_signal = candidate
+            if adverse_signal is not None:
+                adverse_price = adverse_signal["price"]
+
             signal_adverse_pct = float(
                 (adverse_price - average_price)
                 / average_price * Decimal("100")
@@ -865,6 +883,8 @@ def group_analysis_market_data(
     rows_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in market_rows:
         rows_by_symbol[row["symbol"]].append(row)
+    # rows_by_symbol가 각 dict 객체를 참조하므로 바깥 list 컨테이너는 즉시 해제 가능.
+    market_rows.clear()
 
     symbol_data: dict[str, dict[str, Any]] = {}
     for symbol, symbol_rows in sorted(rows_by_symbol.items()):
