@@ -1,6 +1,6 @@
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
-import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile
+import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile, gc
 import csv
 import io
 from datetime import datetime, timedelta, timezone
@@ -2641,10 +2641,20 @@ def _cached_calculation(key: tuple, factory):
             return cached[1]
     value = factory()
     with _PERFORMANCE_CALC_CACHE_LOCK:
+        # V63_MEMORY_FIX: 대형 분석 결과를 시장별로 계속 보관하면
+        # KOREA→US→COIN을 클릭하는 동안 512MB를 빠르게 소모한다.
+        # 같은 종류의 무거운 계산은 가장 최근 1개만 유지한다.
+        family = key[0] if key else None
+        if family in {"visual_cycle_data", "group_analysis_market_data"}:
+            for old_key in list(_PERFORMANCE_CALC_CACHE):
+                if old_key != key and old_key and old_key[0] == family:
+                    _PERFORMANCE_CALC_CACHE.pop(old_key, None)
         _PERFORMANCE_CALC_CACHE[key] = (now_ts, value)
-        if len(_PERFORMANCE_CALC_CACHE) > 30:
+        # cadence까지 포함한 전체 캐시도 작게 제한한다.
+        while len(_PERFORMANCE_CALC_CACHE) > 8:
             oldest_key = min(_PERFORMANCE_CALC_CACHE, key=lambda k: _PERFORMANCE_CALC_CACHE[k][0])
             _PERFORMANCE_CALC_CACHE.pop(oldest_key, None)
+    gc.collect()
     return value
 
 
@@ -2687,7 +2697,7 @@ def member_page_cache(view_func):
             with _MEMBER_PAGE_CACHE_LOCK:
                 _MEMBER_PAGE_CACHE[cache_key] = (current, response)
                 # 무한 증가 방지
-                if len(_MEMBER_PAGE_CACHE) > 40:
+                if len(_MEMBER_PAGE_CACHE) > 12:
                     oldest = min(_MEMBER_PAGE_CACHE, key=lambda k: _MEMBER_PAGE_CACHE[k][0])
                     _MEMBER_PAGE_CACHE.pop(oldest, None)
         return response

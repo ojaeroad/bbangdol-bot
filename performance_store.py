@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -22,6 +23,22 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("bbangdol-performance")
 
 PERFORMANCE_DATABASE_URL = os.getenv("PERFORMANCE_DATABASE_URL", "").strip()
+
+# V63_MEMORY_FIX: webhook 1건마다 새 Thread를 만들지 않는다.
+# Render 512MB 인스턴스에서 반복 알람이 몰릴 때 수백 개의 스레드/DB 연결이
+# 동시에 생겨 OOM이 발생하는 것을 막기 위해 저장 작업을 고정 worker pool로 제한한다.
+_DB_SAVE_WORKERS = max(1, min(int(os.getenv("PERFORMANCE_DB_SAVE_WORKERS", "3") or 3), 6))
+_DB_SAVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_DB_SAVE_WORKERS,
+    thread_name_prefix="performance-db-save",
+)
+
+def _submit_db_save(fn, *args) -> None:
+    try:
+        _DB_SAVE_EXECUTOR.submit(fn, *args)
+    except RuntimeError:
+        log.exception("Performance DB executor submit failed")
+
 
 PERFORMANCE_ROUTES = {
     # 별꽃 타점
@@ -342,12 +359,7 @@ def queue_prediction_snapshot_save(payload: dict[str, Any]) -> None:
     if str(payload.get("event_type", "")).strip().upper() != "PREDICTION_SNAPSHOT_1Q":
         return
     snapshot = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
-    threading.Thread(
-        target=save_prediction_snapshot_safely,
-        args=(snapshot,),
-        daemon=True,
-        name="prediction-snapshot-save",
-    ).start()
+    _submit_db_save(save_prediction_snapshot_safely, snapshot)
 
 
 def _link_prediction_target_signal(symbol: str, timeframe: Optional[str], signal_id: int, signal_at: datetime) -> None:
@@ -535,12 +547,7 @@ def queue_signal_save(payload: dict[str, Any]) -> None:
     if not is_performance_route(str(payload.get("route", payload.get("type", "")))):
         return
     snapshot = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
-    threading.Thread(
-        target=save_signal_safely,
-        args=(snapshot,),
-        daemon=True,
-        name="performance-signal-save",
-    ).start()
+    _submit_db_save(save_signal_safely, snapshot)
 
 
 def health_summary() -> dict[str, Any]:
@@ -665,7 +672,7 @@ def queue_candle_save(payload: dict[str, Any]) -> None:
             save_candle(snapshot)
         except Exception:
             log.exception("Performance candle save failed event=%s", snapshot.get("event_type"))
-    threading.Thread(target=worker, daemon=True, name="performance-candle-save").start()
+    _submit_db_save(worker)
 
 
 def load_candles(
