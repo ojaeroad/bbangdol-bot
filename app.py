@@ -1,4 +1,4 @@
-# V59_PERFORMANCE_CENTER: 성과운영센터 공통UI + 완료결과 매수/매도 시각 + 실시간 완료 게시판
+# V59.1_PERFORMANCE_CENTER: Jinja if/endif 복구 + 성과운영센터 공통UI
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
 import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile
 import csv
@@ -76,7 +76,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v59-performance-center")
+APP_VERSION  = os.getenv("APP_VERSION", "v59.1-performance-center")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -3142,6 +3142,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
     {% endfor %}
   </div>
 </section>
+{% endif %}
 
 <div class="market member-view" data-member-view="overview">
 <div class="market-head">
@@ -4790,6 +4791,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
     {% endfor %}
   </div>
 </section>
+{% endif %}
 <details class="card collapsible-block" open><summary class="section-title">포지션별 성과</summary><div class="grid position-grid" style="margin-top:14px">
 {% for group in admin_group_stats %}
 <a class="metric position-card {{'life' if group.group_key == 'LIFE' else ''}}" style="color:#f4f4f4;text-decoration:none" href="/performance/dashboard/group?category={{selected_category}}&group={{group.group_key}}&period={{period_key}}">
