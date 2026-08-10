@@ -1,4 +1,4 @@
-# V59.1_PERFORMANCE_CENTER: Jinja if/endif 복구 + 성과운영센터 공통UI
+# V60_MASTER: 주식 시간봉 체계 + 1Q 전용 알람주기 + 코인 단타 심볼 확정
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
 import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile
 import csv
@@ -76,7 +76,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v59.1-performance-center")
+APP_VERSION  = os.getenv("APP_VERSION", "v60-master")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -124,14 +124,18 @@ _RECENT_MSG_HASH: Dict[Tuple[str, int], float]  = {}
 _CLEAN_EVERY = 100
 _opcount = 0
 
-_TF_RE = re.compile(r'\b(1w|1d|12h|6h|4h|2h|1h|30m|15m|5m|3m)\b', re.IGNORECASE)
+_TF_RE = re.compile(r'\b(1M|3d|1w|1d|12h|6h|4h|2h|1h|30m|15m|5m|3m)\b')
+
+def _canonical_timeframe(raw: str) -> str:
+    raw = (raw or "").strip()
+    return "1M" if raw == "1M" else raw.lower()
 
 def _extract_signature(msg: str) -> str:
     """타임프레임 + 내용 요약 해시로 시그니처 강화(과차단 방지)."""
     if not msg:
         return "unknown"
     m = _TF_RE.search(msg)
-    base = m.group(1).lower() if m else "unknown"
+    base = _canonical_timeframe(m.group(1)) if m else "unknown"
     core = re.sub(r'\d+(\.\d+)?', 'N', msg.lower())
     h = hashlib.sha1(core.encode()).hexdigest()[:6]
     return f"{base}:{h}"
@@ -159,11 +163,17 @@ TELEGRAM_CADENCE_BOUNDARY_GRACE_SEC = min(59, max(0, int(os.getenv("TELEGRAM_CAD
 # 실제 운영용 자연스러운 반복 간격. 15m의 절반 7.5분처럼 애매한 값은 5분으로 정리한다.
 _CADENCE_FULL_MIN = {
     "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60,
-    "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440, "1w": 10080,
+    "2h": 120, "4h": 240, "6h": 360, "12h": 720,
+    "1d": 1440, "3d": 4320, "1w": 10080, "1M": 43200,
 }
 _CADENCE_HALF_MIN = {
     "3m": 3, "5m": 5, "15m": 5, "30m": 15, "1h": 30,
-    "2h": 60, "4h": 120, "6h": 180, "12h": 360, "1d": 720, "1w": 5040,
+    "2h": 60, "4h": 120, "6h": 180, "12h": 360,
+    "1d": 720, "3d": 2160, "1w": 5040, "1M": 21600,
+}
+_CADENCE_1Q_CUSTOM_MIN = {
+    "30m": 15, "1h": 30, "4h": 60, "1d": 60,
+    "3d": 60, "1w": 60, "1M": 1440,
 }
 _CADENCE_STATE: Dict[str, Dict[str, Any]] = {}
 _CADENCE_LOCK = threading.Lock()
@@ -245,7 +255,7 @@ def _cadence_state_transaction():
 def _telegram_signal_parts(route: str, msg: str, symbol: str) -> Tuple[str, str, str, str]:
     """상태 키용 종목·방향·시간봉·라우트를 추출한다."""
     tf_m = _TF_RE.search(msg or "")
-    timeframe = tf_m.group(1).lower() if tf_m else "unknown"
+    timeframe = _canonical_timeframe(tf_m.group(1)) if tf_m else "unknown"
     text = (msg or "").lower()
     if "저점" in text or "buy" in (route or "").lower():
         direction = "LOW"
@@ -256,19 +266,17 @@ def _telegram_signal_parts(route: str, msg: str, symbol: str) -> Tuple[str, str,
     clean_symbol = (symbol or "").strip().upper() or "UNKNOWN"
     return clean_symbol, direction, timeframe, (route or "").strip().upper()
 
-def _cadence_minutes(timeframe: str) -> int:
-    """실제 텔레그램 반복 전송 주기.
-
-    FULL   : 각 원 시간봉 주기
-    HALF   : 기존 절반 주기 표
-    CUSTOM : 운영 확정값(5m=5분, 15m=5분, 나머지는 절반 주기)
+def _cadence_minutes(timeframe: str, route_key: str = "") -> int:
+    """Telegram 반복 전송 주기.
+    CUSTOM: 코인은 기존 운영값, 주식 1Q는 확정 운영값을 사용한다.
     """
     mode = TELEGRAM_CADENCE_MODE
     if mode == "FULL":
         return _CADENCE_FULL_MIN.get(timeframe, 0)
+    if mode == "CUSTOM" and "_1Q" in (route_key or "").upper():
+        return _CADENCE_1Q_CUSTOM_MIN.get(timeframe, _CADENCE_HALF_MIN.get(timeframe, 0))
     if mode in ("HALF", "CUSTOM"):
         return _CADENCE_HALF_MIN.get(timeframe, 0)
-    # 오타/미등록 값은 알람 폭주 방지를 위해 CUSTOM으로 안전 복귀
     return _CADENCE_HALF_MIN.get(timeframe, 0)
 
 def _signal_timeframe_icon(timeframe: str) -> str:
@@ -284,8 +292,10 @@ def _signal_timeframe_icon(timeframe: str) -> str:
         "6h": "💚",
         "12h": "⭐",
         "1d": "✨",
+        "3d": "🌟",
         "1w": "💎",
-    }.get((timeframe or "").lower(), "")
+        "1M": "👑",
+    }.get(_canonical_timeframe(timeframe or ""), "")
 
 
 def _normalize_signal_line(line: str) -> str:
@@ -294,7 +304,7 @@ def _normalize_signal_line(line: str) -> str:
     tf_m = _TF_RE.search(normalized)
     if not tf_m:
         return normalized
-    timeframe = tf_m.group(1).lower()
+    timeframe = _canonical_timeframe(tf_m.group(1))
     icon = _signal_timeframe_icon(timeframe)
     suffix = normalized[tf_m.start():].strip()
     return f"{icon}{suffix}" if icon else normalized
@@ -342,7 +352,7 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
         return True, msg, "disabled"
 
     sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
-    cadence = _cadence_minutes(timeframe)
+    cadence = _cadence_minutes(timeframe, route_key)
     if cadence <= 0 or direction == "UNKNOWN":
         return True, msg, "unsupported"
 
@@ -1330,8 +1340,8 @@ ENTRY_GROUP_TIMEFRAMES = {
     },
     "STOCK": {
         "SWING": {"30m", "1h"},
-        "LONG": {"4h", "6h"},
-        "LIFE": {"1d", "1w"},
+        "LONG": {"4h", "1d"},
+        "LIFE": {"3d", "1w", "1M"},
     },
 }
 
