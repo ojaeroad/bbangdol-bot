@@ -199,27 +199,36 @@ def _exit_timeframes(market: str, entry_group: str) -> list[str]:
     return result
 
 
-def _load_signals() -> list[dict[str, Any]]:
+def _load_signals(market: str | None = None) -> list[dict[str, Any]]:
+    # v66: 시장 화면 하나를 열 때 DB의 전체 시장 신호를 Python 메모리로 읽지 않는다.
+    # Render 512MB에서 KOREA -> US 전환 시 전체 신호 복제가 WORKER TIMEOUT/OOM의 핵심 원인이었다.
+    selected = str(market or "").upper()
+    korea_sql = """(strategy = '1Q' AND (
+        UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
+            '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
+        ]) OR (strategy = '1Q' AND symbol ~ '^[0-9]{6}$'))"""
+    if selected == "COIN":
+        market_where = "AND strategy = 'STARFLOWER'"
+    elif selected == "KOREA":
+        market_where = f"AND {korea_sql}"
+    elif selected == "US":
+        market_where = f"AND strategy = '1Q' AND NOT {korea_sql}"
+    else:
+        market_where = ""
+
+    sql = f"""
+        SELECT
+            id, strategy, COALESCE(exchange, raw_exchange), symbol, signal_type,
+            timeframe, timeframe_minutes, signal_price, received_at
+        FROM performance_signals
+        WHERE signal_price IS NOT NULL
+          AND signal_type IN ('LOW', 'HIGH')
+          AND timeframe IS NOT NULL
+          {market_where}
+        ORDER BY received_at, id
+    """
     with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                id,
-                strategy,
-                COALESCE(exchange, raw_exchange),
-                symbol,
-                signal_type,
-                timeframe,
-                timeframe_minutes,
-                signal_price,
-                received_at
-            FROM performance_signals
-            WHERE signal_price IS NOT NULL
-              AND signal_type IN ('LOW', 'HIGH')
-              AND timeframe IS NOT NULL
-            ORDER BY received_at, id
-            """
-        ).fetchall()
+        rows = conn.execute(sql).fetchall()
 
     output: list[dict[str, Any]] = []
     for row in rows:
@@ -799,16 +808,11 @@ def group_analysis_data(
     symbol: str | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
-    all_signals = _load_signals()
-    now = datetime.now(timezone.utc)
-
     available_markets = ["KOREA", "US", "COIN"]
-    selected_market = (
-        market if market in available_markets else "KOREA"
-    )
-    market_rows = [
-        row for row in all_signals if row["market"] == selected_market
-    ]
+    selected_market = (market if market in available_markets else "KOREA")
+    # v66: SQL 단계에서 현재 시장만 읽는다.
+    market_rows = _load_signals(selected_market)
+    now = datetime.now(timezone.utc)
 
     symbols = sorted({row["symbol"] for row in market_rows})
     selected_symbol = (
@@ -852,16 +856,11 @@ def group_analysis_market_data(
     회원 페이지에서 종목마다 DB 전체를 다시 읽지 않도록 사용하는 배치 API다.
     """
     settings = get_settings()
-    all_signals = _load_signals()
-    now = datetime.now(timezone.utc)
-
     available_markets = ["KOREA", "US", "COIN"]
-    selected_market = (
-        market if market in available_markets else "KOREA"
-    )
-    market_rows = [
-        row for row in all_signals if row["market"] == selected_market
-    ]
+    selected_market = (market if market in available_markets else "KOREA")
+    # v66: SQL 단계에서 현재 시장만 읽는다.
+    market_rows = _load_signals(selected_market)
+    now = datetime.now(timezone.utc)
 
     rows_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in market_rows:
