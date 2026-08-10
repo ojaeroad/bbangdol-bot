@@ -25,12 +25,16 @@ DATABASE_URL = os.getenv("PERFORMANCE_DATABASE_URL", "").strip()
 TF_MINUTES = {
     "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60,
     "2h": 120, "4h": 240, "6h": 360, "12h": 720,
-    "1d": 1440, "1w": 10080,
+    "1d": 1440, "3d": 4320, "1w": 10080, "1M": 43200,
 }
 HALF_MINUTES = {
     "3m": 3, "5m": 5, "15m": 5, "30m": 15, "1h": 30,
     "2h": 60, "4h": 120, "6h": 180, "12h": 360,
-    "1d": 720, "1w": 5040,
+    "1d": 720, "3d": 2160, "1w": 5040, "1M": 21600,
+}
+STOCK_OPERATING_MINUTES = {
+    "30m": 15, "1h": 30, "4h": 60, "1d": 60,
+    "3d": 60, "1w": 60, "1M": 1440,
 }
 GROUPS = {
     "COIN": {
@@ -41,13 +45,13 @@ GROUPS = {
     },
     "KOREA": {
         "SWING": ["30m", "1h"],
-        "LONG": ["4h", "6h"],
-        "LIFE": ["1d", "1w"],
+        "LONG": ["4h", "1d"],
+        "LIFE": ["3d", "1w", "1M"],
     },
     "US": {
         "SWING": ["30m", "1h"],
-        "LONG": ["4h", "6h"],
-        "LIFE": ["1d", "1w"],
+        "LONG": ["4h", "1d"],
+        "LIFE": ["3d", "1w", "1M"],
     },
 }
 GROUP_LABEL = {"SCALP": "단타", "SWING": "스윙", "LONG": "장기", "LIFE": "인생타점"}
@@ -60,6 +64,12 @@ EXIT_GROUPS = {
 EPISODE_GAP_SECONDS = 125
 CURRENT_ENTRY_COOLDOWN_SECONDS = 300
 MAX_ENTRIES = 3
+
+
+def _operating_minutes(market: str, tf: str) -> int:
+    if market in {"KOREA", "US"}:
+        return STOCK_OPERATING_MINUTES.get(tf, HALF_MINUTES.get(tf, TF_MINUTES.get(tf, 0)))
+    return HALF_MINUTES.get(tf, TF_MINUTES.get(tf, 0))
 
 
 def _connect():

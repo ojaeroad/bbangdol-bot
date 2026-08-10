@@ -43,10 +43,12 @@ _TIMEFRAME_MINUTES = {
     "6h": 360,
     "12h": 720,
     "1d": 1440,
+    "3d": 4320,
     "1w": 10080,
+    "1M": 43200,
 }
 
-_TF_RE = re.compile(r"\b(1w|1d|12h|6h|4h|2h|1h|30m|15m|5m|3m)\b", re.IGNORECASE)
+_TF_RE = re.compile(r"\b(1M|3d|1w|1d|12h|6h|4h|2h|1h|30m|15m|5m|3m)\b")
 _PRICE_RE = re.compile(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY = False
@@ -126,6 +128,31 @@ CREATE TABLE IF NOT EXISTS performance_candles_5m (
 CREATE INDEX IF NOT EXISTS idx_performance_candles_5m_symbol_time
     ON performance_candles_5m(symbol, bar_time);
 
+
+CREATE TABLE IF NOT EXISTS performance_prediction_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    strategy VARCHAR(30) NOT NULL DEFAULT '1Q',
+    exchange VARCHAR(30),
+    raw_exchange VARCHAR(30),
+    symbol VARCHAR(100) NOT NULL,
+    source_timeframe VARCHAR(10) NOT NULL,
+    target_timeframe VARCHAR(10) NOT NULL,
+    signal_price NUMERIC(30,10),
+    snapshot_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source_metrics JSONB NOT NULL,
+    target_metrics JSONB NOT NULL,
+    raw_payload JSONB NOT NULL,
+    snapshot_hash VARCHAR(64) NOT NULL UNIQUE,
+    first_target_signal_id BIGINT,
+    first_target_at TIMESTAMPTZ,
+    lead_minutes INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_symbol_pair_time
+    ON performance_prediction_snapshots(symbol, source_timeframe, target_timeframe, snapshot_at);
+CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_unmatched
+    ON performance_prediction_snapshots(symbol, target_timeframe, first_target_at);
+
 CREATE TABLE IF NOT EXISTS performance_page_visits (
     id BIGSERIAL PRIMARY KEY,
     page_path VARCHAR(200) NOT NULL,
@@ -194,7 +221,7 @@ def _parse_timeframe(message: str) -> tuple[Optional[str], Optional[int]]:
     match = _TF_RE.search(message or "")
     if not match:
         return None, None
-    timeframe = match.group(1).lower()
+    timeframe = "1M" if match.group(1) == "1M" else match.group(1).lower()
     return timeframe, _TIMEFRAME_MINUTES.get(timeframe)
 
 
@@ -234,6 +261,170 @@ def _collection_requirements(route: str) -> tuple[bool, bool]:
     if "LONG" in route or "LIFE" in route:
         return False, True
     return False, False
+
+
+
+def _prediction_hash(payload: dict[str, Any]) -> str:
+    symbol = str(payload.get("symbol", "")).strip()
+    source_tf = str(payload.get("source_timeframe", "")).strip()
+    target_tf = str(payload.get("target_timeframe", "")).strip()
+    signal_time = str(payload.get("signal_time", "")).strip()
+    return hashlib.sha256(f"{symbol}|{source_tf}|{target_tf}|{signal_time}".encode("utf-8")).hexdigest()
+
+
+def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
+    if str(payload.get("event_type", "")).strip().upper() != "PREDICTION_SNAPSHOT_1Q":
+        return False
+
+    symbol = str(payload.get("symbol", "")).strip()
+    source_tf = str(payload.get("source_timeframe", "")).strip()
+    target_tf = str(payload.get("target_timeframe", "")).strip()
+    if not symbol or not source_tf or not target_tf:
+        raise ValueError("prediction snapshot missing symbol/source_timeframe/target_timeframe")
+
+    try:
+        signal_price = Decimal(str(payload.get("signal_price"))) if payload.get("signal_price") is not None else None
+    except (InvalidOperation, ValueError):
+        signal_price = None
+
+    snapshot_at = datetime.now(timezone.utc)
+    try:
+        if payload.get("signal_time") is not None:
+            snapshot_at = datetime.fromtimestamp(int(payload["signal_time"]) / 1000.0, tz=timezone.utc)
+    except Exception:
+        pass
+
+    ensure_schema()
+    params = {
+        "exchange": str(payload.get("exchange", "")).strip() or None,
+        "raw_exchange": str(payload.get("raw_exchange", "")).strip() or None,
+        "symbol": symbol,
+        "source_tf": source_tf,
+        "target_tf": target_tf,
+        "signal_price": signal_price,
+        "snapshot_at": snapshot_at,
+        "source_metrics": Jsonb(payload.get("source_metrics") or {}),
+        "target_metrics": Jsonb(payload.get("target_metrics") or {}),
+        "raw_payload": Jsonb(payload),
+        "snapshot_hash": _prediction_hash(payload),
+    }
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO performance_prediction_snapshots(
+                strategy, exchange, raw_exchange, symbol,
+                source_timeframe, target_timeframe, signal_price, snapshot_at,
+                source_metrics, target_metrics, raw_payload, snapshot_hash
+            ) VALUES (
+                '1Q', %(exchange)s, %(raw_exchange)s, %(symbol)s,
+                %(source_tf)s, %(target_tf)s, %(signal_price)s, %(snapshot_at)s,
+                %(source_metrics)s, %(target_metrics)s, %(raw_payload)s, %(snapshot_hash)s
+            )
+            ON CONFLICT (snapshot_hash) DO NOTHING
+            RETURNING id
+            """,
+            params,
+        ).fetchone()
+    if row:
+        log.info("Prediction snapshot saved id=%s symbol=%s %s->%s", row[0], symbol, source_tf, target_tf)
+        return True
+    return False
+
+
+def save_prediction_snapshot_safely(payload: dict[str, Any]) -> None:
+    try:
+        save_prediction_snapshot(payload)
+    except Exception:
+        log.exception("Prediction snapshot DB save failed")
+
+
+def queue_prediction_snapshot_save(payload: dict[str, Any]) -> None:
+    if str(payload.get("event_type", "")).strip().upper() != "PREDICTION_SNAPSHOT_1Q":
+        return
+    snapshot = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    threading.Thread(
+        target=save_prediction_snapshot_safely,
+        args=(snapshot,),
+        daemon=True,
+        name="prediction-snapshot-save",
+    ).start()
+
+
+def _link_prediction_target_signal(symbol: str, timeframe: Optional[str], signal_id: int, signal_at: datetime) -> None:
+    if not symbol or not timeframe:
+        return
+    ensure_schema()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE performance_prediction_snapshots
+            SET first_target_signal_id=%s,
+                first_target_at=%s,
+                lead_minutes=GREATEST(
+                    0,
+                    FLOOR(EXTRACT(EPOCH FROM (%s - snapshot_at)) / 60.0)::INTEGER
+                )
+            WHERE symbol=%s
+              AND target_timeframe=%s
+              AND first_target_at IS NULL
+              AND snapshot_at <= %s
+            """,
+            (signal_id, signal_at, signal_at, symbol, timeframe, signal_at),
+        )
+
+
+def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit), 1000))
+    if not PERFORMANCE_DATABASE_URL:
+        return {"ok": False, "database": "not_configured", "count": 0, "pairs": [], "recent": []}
+    ensure_schema()
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM performance_prediction_snapshots").fetchone()[0]
+        pairs_raw = conn.execute(
+            """
+            SELECT source_timeframe, target_timeframe, COUNT(*), COUNT(first_target_at),
+                   AVG(lead_minutes) FILTER (WHERE first_target_at IS NOT NULL)
+            FROM performance_prediction_snapshots
+            GROUP BY source_timeframe, target_timeframe
+            ORDER BY
+              CASE source_timeframe
+                WHEN '30m' THEN 1 WHEN '1h' THEN 2 WHEN '4h' THEN 3
+                WHEN '1d' THEN 4 WHEN '3d' THEN 5 WHEN '1w' THEN 6 ELSE 99 END
+            """
+        ).fetchall()
+        recent_raw = conn.execute(
+            """
+            SELECT id, exchange, symbol, source_timeframe, target_timeframe,
+                   signal_price, snapshot_at, source_metrics, target_metrics,
+                   first_target_at, lead_minutes
+            FROM performance_prediction_snapshots
+            ORDER BY snapshot_at DESC, id DESC
+            LIMIT %s
+            """,
+            (safe_limit,),
+        ).fetchall()
+    return {
+        "ok": True,
+        "count": int(total),
+        "pairs": [
+            {
+                "source_timeframe": r[0], "target_timeframe": r[1],
+                "snapshots": int(r[2]), "matched": int(r[3]),
+                "average_lead_minutes": float(r[4]) if r[4] is not None else None,
+            } for r in pairs_raw
+        ],
+        "recent": [
+            {
+                "id": r[0], "exchange": r[1], "symbol": r[2],
+                "source_timeframe": r[3], "target_timeframe": r[4],
+                "signal_price": float(r[5]) if r[5] is not None else None,
+                "snapshot_at": r[6].isoformat() if r[6] else None,
+                "source_metrics": r[7] or {}, "target_metrics": r[8] or {},
+                "first_target_at": r[9].isoformat() if r[9] else None,
+                "lead_minutes": r[10],
+            } for r in recent_raw
+        ],
+    }
 
 
 def save_signal(payload: dict[str, Any]) -> bool:
@@ -289,6 +480,7 @@ def save_signal(payload: dict[str, Any]) -> bool:
         inserted = conn.execute(sql, params).fetchone()
     if inserted:
         if row["signal_type"] == "LOW":
+            _link_prediction_target_signal(symbol, timeframe, int(inserted[0]), received_at)
             need_1m, need_5m = _collection_requirements(route)
             if need_1m or need_5m:
                 with _connect() as conn:

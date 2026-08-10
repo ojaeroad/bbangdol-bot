@@ -41,7 +41,9 @@ TF_MINUTES = {
     "6h": 360,
     "12h": 720,
     "1d": 1440,
+    "3d": 4320,
     "1w": 10080,
+    "1M": 43200,
 }
 
 GROUP_RANK = {"SCALP": 0, "SWING": 1, "LONG": 2, "LIFE": 3}
@@ -61,13 +63,13 @@ MARKET_GROUPS = {
     },
     "KOREA": {
         "SWING": ["30m", "1h"],
-        "LONG": ["4h", "6h"],
-        "LIFE": ["1d", "1w"],
+        "LONG": ["4h", "1d"],
+        "LIFE": ["3d", "1w", "1M"],
     },
     "US": {
         "SWING": ["30m", "1h"],
-        "LONG": ["4h", "6h"],
-        "LIFE": ["1d", "1w"],
+        "LONG": ["4h", "1d"],
+        "LIFE": ["3d", "1w", "1M"],
     },
 }
 
