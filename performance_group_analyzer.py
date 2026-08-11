@@ -207,7 +207,8 @@ def _load_signals(market: str | None = None) -> list[dict[str, Any]]:
     korea_sql = """(strategy = '1Q' AND (
         UPPER(COALESCE(exchange, raw_exchange, '')) LIKE ANY (ARRAY[
             '%KRX%','%KOSPI%','%KOSDAQ%','%KONEX%','%KOREA%'
-        ]) OR (strategy = '1Q' AND symbol ~ '^[0-9]{6}$'))"""
+        ]) OR symbol ~ '^[0-9]{6}$'
+    ))"""
     if selected == "COIN":
         market_where = "AND strategy = 'STARFLOWER'"
     elif selected == "KOREA":
