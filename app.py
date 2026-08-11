@@ -282,17 +282,16 @@ def _cadence_minutes(timeframe: str, route_key: str = "") -> int:
 
 def _signal_timeframe_icon(timeframe: str) -> str:
     """
-    v71R 텔레그램 시간봉 시각 체계.
+    v74 텔레그램 시간봉 시각 체계.
 
-    최대 시간봉만 보여주는 현재 운영 방식에 맞춰 시간봉마다 서로 다른
-    이모지를 쓰지 않고, 각 포지션 방의 작은 시간봉/큰 시간봉/최상위만
-    같은 계열로 통일한다.
+    각 전략 방에서 낮은 시간봉/높은 시간봉/최대 시간봉만 같은 계열로
+    통일해 한눈에 계층을 구분한다.
 
-    - 작은 시간봉: 🟡  (5m, 30m, 4h, 12h, 3d)
-    - 큰 시간봉:   🟢  (15m, 1h, 6h, 1d, 1w)
-    - 최상위:      ❤️  (1M)
-    
-    2h/3m은 현재 최대 후보가 아니거나 보조용이므로 인접 계열로 표시한다.
+    - 낮은 시간봉: 🟡  (단타 5m / 스윙 30m / 장기 4h / 인생타점 3d)
+    - 높은 시간봉: 🟢  (단타 15m / 스윙 1h / 장기 1d / 인생타점 1w)
+    - 최대 시간봉: 🏹  (1M · 인생타점 최고 기회/행동 강조)
+
+    보조/레거시 시간봉은 가장 가까운 계열로 유지한다.
     """
     return {
         "3m": "🟡",
@@ -300,14 +299,14 @@ def _signal_timeframe_icon(timeframe: str) -> str:
         "15m": "🟢",
         "30m": "🟡",
         "1h": "🟢",
-        "2h": "🟡",
+        "2h": "🟢",
         "4h": "🟡",
         "6h": "🟢",
         "12h": "🟡",
         "1d": "🟢",
         "3d": "🟡",
         "1w": "🟢",
-        "1M": "❤️",
+        "1M": "🏹",
     }.get(_canonical_timeframe(timeframe or ""), "")
 
 
@@ -326,9 +325,10 @@ def _normalize_signal_line(line: str) -> str:
 def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     """시간봉과 매수·매도 목적이 한눈에 구분되도록 문구를 정리한다."""
     labels = {
-        "FOCUS": "💰 매수 집중",
-        "HOLD": "✅ 매수 유효",
-        "EXIT": "💸 매도 집중 1/3",
+        # v74: 돈 이모지보다 '지금 이 종목에 집중' 의미가 즉시 들어오는 표적 사용
+        "FOCUS": "🎯 매수 집중 1/3",
+        "HOLD": f"✅ 매수 유효 {ordinal}/3",
+        "EXIT": "🎯 매도 집중 1/3",
         "EXIT_RECHECK": f"🚨 매도 유효 {ordinal}/3",
         "EXIT_FINAL": f"🚨 매도 유효 {ordinal}/3",
     }
@@ -341,7 +341,9 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
             for old_label in (
                 " · 집중", " · 유지 확인", " · 🚨 신규 집중", " · 🔁 신호 유지",
                 " · ✅ 종료 신호 1/3", " · ⚠️ 종료 재확인 2/3", " · 🚨 최종 종료 알림 3/3",
-                " · 💰 매수 집중", " · ✅ 매수 유효", " · 💸 매도 집중 1/3",
+                " · 💰 매수 집중", " · 🎯 매수 집중", " · 🎯 매수 집중 1/3",
+                " · ✅ 매수 유효", " · ✅ 매수 유효 2/3", " · ✅ 매수 유효 3/3",
+                " · 💸 매도 집중 1/3", " · 🎯 매도 집중 1/3",
                 " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
             ):
                 normalized = normalized.replace(old_label, "")
@@ -397,8 +399,16 @@ def _telegram_hashtag_token(symbol: str, msg: str = "") -> str:
 
 def _decorate_asset_header(msg: str, symbol: str) -> str:
     """
-    기존 Pine 메시지는 그대로 보존하고 맨 앞에 종목 해시태그 한 줄만 추가한다.
-    Pine 알람을 다시 리비전하지 않고 서버 코드만 교체해도 적용된다.
+    v74 종목 헤더 강조.
+
+    Telegram 일반 Bot 메시지는 임의의 font-size를 지정할 수 없으므로
+    해시태그의 파란 링크 색상은 그대로 살리고, 양쪽 굵은 구분선 + 빈 줄로
+    '헤더 밴드'처럼 보이게 한다. 별도 Custom Emoji/이미지 전송은 없다.
+
+    예)
+      ━━ #BTC ━━
+
+      [BINANCE] BTCUSDT : ...
     """
     text = (msg or "").strip()
     if not text:
@@ -406,10 +416,13 @@ def _decorate_asset_header(msg: str, symbol: str) -> str:
     tag = _telegram_hashtag_token(symbol, text)
     if not tag:
         return text
+
+    # 이미 v71R/v74 헤더가 붙은 메시지는 중복 장식을 하지 않는다.
     first_nonempty = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
-    if first_nonempty.startswith("#"):
+    if first_nonempty.startswith("#") or ("#" in first_nonempty and "━━" in first_nonempty):
         return text
-    return f"{tag}\n{text}"
+
+    return f"━━ {tag} ━━\n\n{text}"
 
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
@@ -472,13 +485,21 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                     prev = None
 
             if direction == "LOW":
+                # 매수도 매도와 동일하게 3단계로 명확히 표기한다.
+                # 1/3: 최초 집중, 2/3·3/3: 유효주기 경계에서 들어온 첫 신호만 전송.
                 if prev is None:
+                    episode_count = 1
                     phase = "FOCUS"
                     should_send = True
                     next_due_slot = current_slot + 1
                 else:
+                    episode_count = int(prev.get("episode_count", 1) or 1)
                     next_due_slot = int(prev.get("next_due_slot", current_slot + 1))
-                    if current_slot >= next_due_slot:
+                    if episode_count >= 3:
+                        phase = "SUPPRESS"
+                        should_send = False
+                    elif current_slot >= next_due_slot:
+                        episode_count += 1
                         phase = "HOLD"
                         should_send = True
                         next_due_slot = current_slot + 1
@@ -493,11 +514,13 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                     "timeframe": timeframe,
                     "cadence_minutes": cadence,
                     "phase": phase,
+                    "episode_count": episode_count,
                 }
                 commit_state(state)
                 if not should_send:
-                    return False, msg, f"waiting_boundary_{cadence}m"
-                return True, _decorate_cadence_message(msg, phase), phase.lower()
+                    reason = "low_max_3_reached" if episode_count >= 3 else f"waiting_boundary_{cadence}m"
+                    return False, msg, reason
+                return True, _decorate_cadence_message(msg, phase, episode_count), f"low_{episode_count}_of_3"
 
             # HIGH: 첫 매도 집중 + cadence마다 최대 3회.
             if prev is None:
