@@ -281,21 +281,33 @@ def _cadence_minutes(timeframe: str, route_key: str = "") -> int:
     return _CADENCE_HALF_MIN.get(timeframe, 0)
 
 def _signal_timeframe_icon(timeframe: str) -> str:
-    """텔레그램에서 시간봉 심볼을 서로 확실히 구분한다."""
+    """
+    v71R 텔레그램 시간봉 시각 체계.
+
+    최대 시간봉만 보여주는 현재 운영 방식에 맞춰 시간봉마다 서로 다른
+    이모지를 쓰지 않고, 각 포지션 방의 작은 시간봉/큰 시간봉/최상위만
+    같은 계열로 통일한다.
+
+    - 작은 시간봉: 🟡  (5m, 30m, 4h, 12h, 3d)
+    - 큰 시간봉:   🟢  (15m, 1h, 6h, 1d, 1w)
+    - 최상위:      ❤️  (1M)
+    
+    2h/3m은 현재 최대 후보가 아니거나 보조용이므로 인접 계열로 표시한다.
+    """
     return {
-        "3m": "▽",
-        "5m": "△",
-        "15m": "🔺",
-        "30m": "🟠",
+        "3m": "🟡",
+        "5m": "🟡",
+        "15m": "🟢",
+        "30m": "🟡",
         "1h": "🟢",
-        "2h": "❤️",
-        "4h": "🧡",
-        "6h": "💚",
-        "12h": "⭐",
-        "1d": "✨",
-        "3d": "🌟",
-        "1w": "💎",
-        "1M": "👑",
+        "2h": "🟡",
+        "4h": "🟡",
+        "6h": "🟢",
+        "12h": "🟡",
+        "1d": "🟢",
+        "3d": "🟡",
+        "1w": "🟢",
+        "1M": "❤️",
     }.get(_canonical_timeframe(timeframe or ""), "")
 
 
@@ -337,6 +349,67 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
             break
         lines[i] = normalized
     return "\n".join(lines)
+
+
+def _telegram_hashtag_token(symbol: str, msg: str = "") -> str:
+    """
+    종목을 텔레그램 첫 줄에서 바로 알아볼 수 있도록 검색 가능한 해시태그를 만든다.
+
+    예)
+      XRPUSDT.P -> #XRP
+      005930    -> #삼성전자
+      NVDA      -> #NVDA
+
+    별도 커스텀 이모지/이미지를 쓰지 않으므로 서버 메모리와 전송 용량 증가는
+    사실상 없다. Telegram이 해시태그를 링크 색상으로 표시하는 효과를 이용한다.
+    """
+    raw = (symbol or "").strip()
+    upper = raw.upper()
+    if ":" in upper:
+        upper = upper.split(":")[-1]
+
+    # TradingView perpetual 표기(.P) 제거
+    if upper.endswith(".P"):
+        upper = upper[:-2]
+
+    # 국장 6자리 코드는 서버 공통 종목명 매핑을 우선 사용한다.
+    if upper.isdigit() and len(upper) == 6:
+        name_map = globals().get("KRX_SYMBOL_NAMES", {})
+        label = str(name_map.get(upper) or upper)
+    else:
+        first_line = next((ln.strip() for ln in (msg or "").splitlines() if ln.strip()), "")
+        first_upper = first_line.upper()
+        is_coin = any(mark in first_upper for mark in (
+            "[BINANCE]", "[BYBIT]", "[OKX]", "[BITGET]", "[UPBIT]", "[BITHUMB]"
+        ))
+        label = upper
+        if is_coin:
+            # XRPUSDT / XRPUSDT.P -> XRP. 긴 suffix부터 제거한다.
+            for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "KRW", "USD"):
+                if label.endswith(quote) and len(label) > len(quote):
+                    label = label[:-len(quote)]
+                    break
+
+    # Telegram hashtag에서 보기 좋고 검색 가능한 문자만 남긴다.
+    label = re.sub(r"[^0-9A-Za-z_가-힣]", "", str(label))
+    return f"#{label}" if label else ""
+
+
+def _decorate_asset_header(msg: str, symbol: str) -> str:
+    """
+    기존 Pine 메시지는 그대로 보존하고 맨 앞에 종목 해시태그 한 줄만 추가한다.
+    Pine 알람을 다시 리비전하지 않고 서버 코드만 교체해도 적용된다.
+    """
+    text = (msg or "").strip()
+    if not text:
+        return text
+    tag = _telegram_hashtag_token(symbol, text)
+    if not tag:
+        return text
+    first_nonempty = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if first_nonempty.startswith("#"):
+        return text
+    return f"{tag}\n{text}"
 
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
@@ -5364,6 +5437,10 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not cadence_ok:
         log.info(f"TG cadence skipped route={route} symbol={symbol} reason={cadence_reason}")
         return jsonify({"ok": True, "skipped": "cadence", "reason": cadence_reason}), 200
+
+    # v71R: 커스텀 이모지 없이 Telegram 해시태그 색상 효과로 종목을 첫 줄에 강조.
+    # 예: #XRP / #삼성전자 / #NVDA
+    cadence_msg = _decorate_asset_header(cadence_msg, symbol)
 
     bucket = _bucket_key(chat_id, symbol, route, cadence_msg)
     msg_norm = safe_text(cadence_msg)
