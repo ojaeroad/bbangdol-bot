@@ -163,8 +163,8 @@ def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, A
     state: dict[tuple[str, str, str], dict[str, Any]] = {}
     for signal in signals:
         key = (signal["symbol"], signal["type"], signal["tf"])
-        cadence = signal["mins"] if mode == "FULL" else HALF_MINUTES.get(
-            signal["tf"], max(5, signal["mins"] // 2)
+        cadence = signal["mins"] if mode == "FULL" else _operating_minutes(
+            signal["market"], signal["tf"]
         )
         previous = state.get(key)
         new_episode = (
@@ -198,8 +198,8 @@ def _entry_allowed(
         last_entry_time = position["entries"][-1]["time"] if position else episode["focus_time"]
         return (signal["time"] - last_entry_time).total_seconds() >= CURRENT_ENTRY_COOLDOWN_SECONDS
 
-    cadence = signal["mins"] if mode == "FULL" else HALF_MINUTES.get(
-        signal["tf"], max(5, signal["mins"] // 2)
+    cadence = signal["mins"] if mode == "FULL" else _operating_minutes(
+        signal["market"], signal["tf"]
     )
     current_slot = _slot(signal["time"], cadence)
     # 최초 집중 신호가 속한 슬롯은 진입하지 않고, 다음 자연 경계부터 진입한다.
@@ -228,8 +228,8 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
                 or (signal["time"] - previous["last_time"]).total_seconds() > EPISODE_GAP_SECONDS
             )
             if new_episode:
-                cadence = signal["mins"] if mode != "HALF" else HALF_MINUTES.get(
-                    signal["tf"], max(5, signal["mins"] // 2)
+                cadence = signal["mins"] if mode != "HALF" else _operating_minutes(
+                    signal["market"], signal["tf"]
                 )
                 episode = {
                     "id": next_episode_id,

@@ -77,7 +77,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v62-prediction-research")
+APP_VERSION  = os.getenv("APP_VERSION", "v73-cadence-lazy-speed")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -2754,6 +2754,162 @@ def _cached_simulate_cadence(market: str, period_key: str):
     return _cached_calculation(("simulate_cadence", market, period_key), lambda: simulate_cadence(market, period_key))
 
 
+
+def _cadence_occurrence_groups(market_analysis: dict, market: str) -> list[dict]:
+    # v73: 종목 -> 시간봉 순서로 발생주기 통계를 묶는다.
+    # 초기 대시보드에서는 호출하지 않고 알람 분석을 실제로 열었을 때만 계산한다.
+    rows = []
+    default_exchange = "KRX" if market == "KOREA" else "BINANCE" if market == "COIN" else ""
+    for symbol, symbol_data in (market_analysis.get("symbol_data") or {}).items():
+        for occurrence in (symbol_data.get("occurrence_stats") or []):
+            row = dict(occurrence)
+            row["symbol"] = symbol
+            row["exchange"] = default_exchange
+            rows.append(row)
+    rows.sort(key=lambda row: (
+        str(row.get("symbol") or ""),
+        TIMEFRAME_ORDER_MINUTES.get(str(row.get("timeframe") or "").lower(), 999999),
+        str(row.get("group_label") or ""),
+    ))
+    grouped = {}
+    for row in rows:
+        key = str(row.get("symbol") or "")
+        bucket = grouped.setdefault(key, {"symbol": key, "exchange": row.get("exchange") or "", "rows": []})
+        bucket["rows"].append(row)
+    return [grouped[key] for key in sorted(grouped)]
+
+
+@app.get("/performance/cadence-fragment")
+@member_required
+def performance_cadence_fragment():
+    category = request.args.get("category", "KOREA_1Q").strip().upper()
+    if category not in {"KOREA_1Q", "US_1Q", "COIN"}:
+        category = "KOREA_1Q"
+    period_key = request.args.get("period", "all").strip().lower()
+    if period_key not in {"today", "7d", "30d", "all"}:
+        period_key = "all"
+    market = {"KOREA_1Q": "KOREA", "US_1Q": "US", "COIN": "COIN"}[category]
+    try:
+        cadence_simulation = _cached_simulate_cadence(market, period_key)
+        market_analysis = _cached_group_analysis_market_data(market)
+        occurrence_groups = _cadence_occurrence_groups(market_analysis, market)
+        return render_template_string(r'''
+<div class="cadence-lazy-wrap">
+  <div class="analysis-note" style="margin-bottom:14px">
+    <b>알람 주기 비교 기준</b><br>
+    ① 1분 원본 = TradingView에서 들어온 원본 반복 신호 ·
+    ② 자기 시간봉 주기 = 해당 시간봉의 자연 경계 ·
+    ③ 절반/운영 주기 = 현재 운영용 유효 알람 경계입니다.
+  </div>
+  <h3>전체 비교</h3>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>비교 방식</th><th>알람 수</th><th>감소율</th><th>완료 사이클</th><th>평균 진입 횟수</th><th>승률</th><th>평균 수익률</th></tr></thead>
+    <tbody>{% for v in cadence_simulation.variants %}<tr>
+      <td><b>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FULL' %}자기 시간봉 주기{% else %}절반/운영 주기{% endif %}</b></td>
+      <td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.completed_cycles}}회</td>
+      <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
+      <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+
+  <h3 style="margin-top:22px">시간봉별 3가지 주기 비교</h3>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>시간봉</th><th>1분 원본</th><th>자기 시간봉 주기</th><th>절반/운영 주기</th><th>자기시간봉 감소율</th><th>절반주기 감소율</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.timeframes %}<tr><td><b>{{r.timeframe}}</b></td><td>{{r.raw_count}}건</td><td>{{r.full_count}}건</td><td>{{r.half_count}}건</td><td>{{'%.1f'|format(r.full_reduction_pct)}}%</td><td>{{'%.1f'|format(r.half_reduction_pct)}}%</td></tr>{% endfor %}</tbody>
+  </table></div>
+
+  <h3 style="margin-top:22px">포지션별 주기 비교</h3>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>포지션</th><th>방식</th><th>알람 수</th><th>감소율</th><th>집중 구간</th><th>진입 포착률</th><th>완료 사이클</th></tr></thead>
+    <tbody>{% for g in cadence_simulation.groups %}{% for v in g.variants %}<tr><td><b>{{g.group_label}}</b></td><td>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FULL' %}자기 시간봉{% else %}절반/운영{% endif %}</td><td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.focus_count}}회</td><td>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</td><td>{{v.completed_cycles}}회</td></tr>{% endfor %}{% endfor %}</tbody>
+  </table></div>
+
+  <h3 style="margin-top:22px">종목별 실제 발생 주기</h3>
+  <div class="small" style="margin-bottom:12px">종목을 먼저 묶고, 같은 종목 안에서는 작은 시간봉부터 정렬합니다.</div>
+  {% for item in occurrence_groups %}<div class="cadence-symbol-card" style="margin-bottom:12px">
+    <div class="cadence-symbol-title" style="font-weight:900;font-size:18px;margin-bottom:8px">{{symbol_display(item.symbol, item.exchange)}}</div>
+    <div style="overflow-x:auto"><table class="cadence-table"><thead><tr><th>시간봉</th><th>포지션</th><th>누적 알람</th><th>누적 평균 주기</th><th>최근 평균 주기</th><th>마지막 발생 후</th><th>현재 상태</th></tr></thead>
+    <tbody>{% for row in item.rows %}<tr><td><b>{{row.timeframe}}</b></td><td>{{row.group_label}}</td><td>{{row.occurrence_count}}회</td><td>{{row.overall_average_text}}</td><td>{{row.recent_average_text}}</td><td>{{row.elapsed_text}}</td><td>{{row.readiness_label}}</td></tr>{% endfor %}</tbody></table></div>
+  </div>{% else %}<div class="empty-note">발생 주기 데이터가 아직 없습니다.</div>{% endfor %}
+</div>
+        ''', cadence_simulation=cadence_simulation, occurrence_groups=occurrence_groups), 200
+    except Exception as exc:
+        log.exception("Cadence fragment failed")
+        return f'<div class="analysis-note neg">알람 분석 로딩 실패: {type(exc).__name__}</div>', 500
+
+# =========================================================
+# v73 warm navigation 최적화 (cold start와 분리)
+# =========================================================
+_VISIT_SUMMARY_CACHE = {"ts": 0.0, "value": {
+    "total_views": 0, "today_views": 0, "total_visitors": 0, "today_visitors": 0
+}}
+_VISIT_SUMMARY_CACHE_LOCK = threading.Lock()
+_VISIT_SUMMARY_CACHE_TTL = max(30, int(os.getenv("PERFORMANCE_VISIT_CACHE_SECONDS", "300") or 300))
+_VISIT_WRITE_LOCK = threading.Lock()
+_VISIT_WRITE_PENDING = set()
+
+
+def _record_page_visit_async(page_path: str, visitor_hash: str) -> None:
+    key = (str(page_path), str(visitor_hash))
+    with _VISIT_WRITE_LOCK:
+        if key in _VISIT_WRITE_PENDING:
+            return
+        _VISIT_WRITE_PENDING.add(key)
+    def _worker():
+        try:
+            record_page_visit(page_path, visitor_hash)
+        except Exception:
+            log.exception("Async performance page visit save failed")
+        finally:
+            with _VISIT_WRITE_LOCK:
+                _VISIT_WRITE_PENDING.discard(key)
+    threading.Thread(target=_worker, name="performance-visit-writer", daemon=True).start()
+
+
+def _cached_page_visit_summary() -> dict:
+    now_ts = time.time()
+    with _VISIT_SUMMARY_CACHE_LOCK:
+        if now_ts - _VISIT_SUMMARY_CACHE["ts"] < _VISIT_SUMMARY_CACHE_TTL:
+            return dict(_VISIT_SUMMARY_CACHE["value"])
+    try:
+        value = page_visit_summary()
+    except Exception:
+        log.exception("Cached performance visit summary failed")
+        with _VISIT_SUMMARY_CACHE_LOCK:
+            return dict(_VISIT_SUMMARY_CACHE["value"])
+    with _VISIT_SUMMARY_CACHE_LOCK:
+        _VISIT_SUMMARY_CACHE["ts"] = now_ts
+        _VISIT_SUMMARY_CACHE["value"] = dict(value)
+    return dict(value)
+
+
+_ADMIN_PAGE_CACHE = {}
+_ADMIN_PAGE_CACHE_LOCK = threading.Lock()
+_ADMIN_PAGE_CACHE_TTL = max(15, int(os.getenv("PERFORMANCE_ADMIN_CACHE_SECONDS", "60") or 60))
+
+
+def admin_page_cache(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        cache_key = request.full_path.rstrip("?")
+        current = time.time()
+        with _ADMIN_PAGE_CACHE_LOCK:
+            cached = _ADMIN_PAGE_CACHE.get(cache_key)
+            if cached and current - cached[0] < _ADMIN_PAGE_CACHE_TTL:
+                return cached[1]
+        response = view_func(*args, **kwargs)
+        status = response[1] if isinstance(response, tuple) and len(response) > 1 else 200
+        if status == 200:
+            with _ADMIN_PAGE_CACHE_LOCK:
+                _ADMIN_PAGE_CACHE[cache_key] = (current, response)
+                while len(_ADMIN_PAGE_CACHE) > 4:
+                    oldest = min(_ADMIN_PAGE_CACHE, key=lambda k: _ADMIN_PAGE_CACHE[k][0])
+                    _ADMIN_PAGE_CACHE.pop(oldest, None)
+        return response
+    return wrapped
+
+
 # 회원 메인 화면 단기 캐시: 무료 Render에서도 반복 클릭 시 전체 통계를 매번 재계산하지 않는다.
 # 신호 데이터는 계속 저장되며, 화면 캐시는 기본 45초 뒤 자동 갱신된다.
 _MEMBER_PAGE_CACHE = {}
@@ -2792,8 +2948,8 @@ def performance_member():
     try:
         visitor_source = f"{request.remote_addr or ''}|{request.headers.get('User-Agent','')}|{app.secret_key}"
         visitor_hash = hashlib.sha256(visitor_source.encode("utf-8")).hexdigest()
-        record_page_visit("/performance/member", visitor_hash)
-        visit_stats = page_visit_summary()
+        _record_page_visit_async("/performance/member", visitor_hash)
+        visit_stats = _cached_page_visit_summary()
         try:
             limit = int(request.args.get("limit", "100"))
         except ValueError:
@@ -2853,48 +3009,15 @@ def performance_member():
             market_analysis = _cached_group_analysis_market_data(
                 category_market[selected_category]
             )
-            try:
-                cadence_simulation = _cached_simulate_cadence(
-                    category_market[selected_category], period_key
-                )
-            except Exception:
-                log.exception("Cadence simulation failed")
-                cadence_simulation = None
+            # v73: 알람 분석은 필요할 때만 지연 로딩한다.
+            cadence_simulation = None
             analysis_by_symbol = market_analysis.get(
                 "symbol_data", {}
             )
 
-            # 회원 알람 분석에서 과거 전체 평균 주기와 최근 5회 평균 주기를
-            # 종목·포지션·시간봉별로 바로 확인할 수 있도록 펼친 목록을 만든다.
-            exchange_by_symbol = {
-                str(item.get("symbol") or ""): item.get("exchange")
-                for item in (selected.get("symbols") or [])
-            }
-            for occurrence_symbol, occurrence_data in analysis_by_symbol.items():
-                for occurrence in (occurrence_data.get("occurrence_stats") or []):
-                    occurrence_row = dict(occurrence)
-                    occurrence_row["symbol"] = occurrence_symbol
-                    occurrence_row["exchange"] = exchange_by_symbol.get(str(occurrence_symbol), "")
-                    member_occurrence_rows.append(occurrence_row)
-            member_occurrence_rows.sort(
-                key=lambda row: (
-                    str(row.get("symbol") or ""),
-                    TIMEFRAME_ORDER_MINUTES.get(str(row.get("timeframe") or "").lower(), 999999),
-                    str(row.get("group_label") or ""),
-                )
-            )
-            occurrence_group_map = {}
-            for row in member_occurrence_rows:
-                key = str(row.get("symbol") or "")
-                bucket = occurrence_group_map.setdefault(key, {
-                    "symbol": key,
-                    "exchange": row.get("exchange") or "",
-                    "rows": [],
-                })
-                bucket["rows"].append(row)
-            member_occurrence_groups = [
-                occurrence_group_map[key] for key in sorted(occurrence_group_map)
-            ]
+            # v73: 발생주기 표도 알람 분석 메뉴에서만 계산한다.
+            member_occurrence_rows = []
+            member_occurrence_groups = []
 
             symbol_stats = []
             for item in selected["symbols"]:
@@ -3609,52 +3732,11 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 {% endif %}
 {% endif %}
 
-{% if cadence_simulation %}
 <details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="cadence" open>
 <summary class="section-title">알람 분석</summary>
-<div style="margin-top:14px">
-<div class="notice" style="margin-bottom:14px"><b>현재 적용 중인 알람 기준</b><br>회원 화면에는 실제 운영 중인 알람의 횟수와 발생 주기만 표시합니다.</div>
-{% for v in cadence_simulation.variants %}{% if v.code == 'HALF' %}
-<div class="group-card">
-<div class="group-title"><span>전체 알람</span><span>{{v.alert_count}}건</span></div>
-<div class="small" style="margin-top:8px">선택한 기간에 회원 채널로 전달되는 운영 기준 알람 수입니다.</div>
-</div>{% endif %}{% endfor %}
+<div id="memberCadenceBody" data-cadence-url="/performance/cadence-fragment?category={{selected_category}}&period={{period_key}}" style="margin-top:14px"><div class="notice">알람 분석은 필요할 때만 계산합니다.</div></div>
+</details>
 
-<h3 style="margin-top:22px">시간봉별 알람 횟수</h3>
-<div class="member-alpha-table">
-<div class="member-alpha-head" style="grid-template-columns:1.3fr 1fr"><span>시간봉</span><span>알람 수</span></div>
-{% for r in cadence_simulation.timeframes %}<div class="member-alpha-row" style="grid-template-columns:1.3fr 1fr"><span>{{r.timeframe}}</span><span>{{r.half_count}}건</span></div>{% endfor %}
-</div>
-
-<h3 style="margin-top:22px">알람 발생 주기</h3>
-<div class="small" style="margin-bottom:12px">종목별로 먼저 묶고, 각 종목 안에서 시간봉별 알람 횟수와 누적 평균 주기·최근 5회 평균 주기를 비교합니다.</div>
-<div class="cadence-symbol-list">
-{% for item in member_occurrence_groups %}
-<div class="cadence-symbol-card">
-<div class="cadence-symbol-title">{{symbol_display(item.symbol, item.exchange)}}</div>
-<div style="overflow-x:auto">
-<table class="cadence-table">
-<thead><tr><th>시간봉</th><th>포지션</th><th>누적 알람</th><th>전체 평균 주기</th><th>최근 5회 평균 주기</th></tr></thead>
-<tbody>
-{% for row in item.rows %}
-<tr>
-<td><b>{{row.timeframe}}</b></td>
-<td>{{row.group_label}}</td>
-<td>{{row.occurrence_count}}회</td>
-<td>{{row.overall_average_text}}</td>
-<td>{{row.recent_average_text}}</td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-</div>
-</div>
-{% else %}
-<div class="notice">발생 주기 데이터가 아직 없습니다.</div>
-{% endfor %}
-</div>
-</div></details>
-{% endif %}
 
 <div class="disclaimer member-view" data-member-view="overview">
 표시 수익률은 저장된 알람 신호를 가정 매수·종료 방식으로 계산한 통계이며,
@@ -3670,6 +3752,15 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
  const mobileButton=document.getElementById('mobileMenuButton');
  const views=[...document.querySelectorAll('[data-member-view]')];
  function closeMenu(){side.classList.remove('open');backdrop.classList.remove('open');}
+ async function loadCadenceIfNeeded(name){
+   if(name!=='cadence') return;
+   const body=document.getElementById('memberCadenceBody');
+   if(!body || body.dataset.loaded==='1' || body.dataset.loading==='1') return;
+   body.dataset.loading='1'; body.innerHTML='<div class="notice">알람 주기 데이터를 계산 중입니다…</div>';
+   try{const res=await fetch(body.dataset.cadenceUrl,{credentials:'same-origin'});body.innerHTML=await res.text();if(res.ok)body.dataset.loaded='1';}
+   catch(e){body.innerHTML='<div class="notice neg">알람 분석을 불러오지 못했습니다. 다시 눌러주세요.</div>';}
+   finally{body.dataset.loading='0';}
+ }
  function showView(name, updateHash=true){
    views.forEach(el=>el.classList.toggle('member-view-hidden',el.dataset.memberView!==name));
    nav.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===name));
@@ -3678,6 +3769,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
    if(updateHash) history.replaceState(null,'','#'+name);
    closeMenu(); window.scrollTo({top:0,behavior:'smooth'});
    try{sessionStorage.setItem('memberSelectedView',name);}catch(e){}
+   loadCadenceIfNeeded(name);
  }
  nav.addEventListener('click',e=>{const b=e.target.closest('[data-view]');if(b)showView(b.dataset.view)});
  document.querySelectorAll('[data-jump]').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.jump)));
@@ -4524,6 +4616,7 @@ def performance_export_csv():
 
 @app.get("/performance/dashboard")
 @admin_required
+@admin_page_cache
 def performance_dashboard():
     try:
         try:
@@ -4846,6 +4939,7 @@ summary{cursor:pointer;font-weight:bold}
 .matrix-cell .main{font-size:20px;font-weight:bold;margin-bottom:5px}
 .matrix-cell .sub{font-size:12px;color:#aaa;line-height:1.45}
 .analysis-note{background:#141416;border-left:4px solid var(--yellow);padding:12px 14px;border-radius:8px;color:#bbb;margin:14px 0}
+.cadence-table{width:100%;border-collapse:collapse;min-width:760px}.cadence-table th,.cadence-table td{padding:9px;border-bottom:1px solid #303035;text-align:left}.cadence-symbol-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.cadence-symbol-title{color:var(--blue)}
 
 .section-title{cursor:pointer;letter-spacing:-.3px;margin:0;color:var(--blue);font-size:25px;font-weight:900;letter-spacing:-.4px;cursor:pointer;list-style:none}.section-title::-webkit-details-marker{display:none}.section-title:before{content:"▶";font-size:16px;margin-right:9px}.collapsible-block[open]>.section-title:before{content:"▼"}.life-title{color:var(--yellow)}.titled-section{margin-bottom:20px}.titled-section>.section-title{cursor:pointer;letter-spacing:-.3px;margin-bottom:14px}.collapsible-content{margin-top:16px}.trust-guide-layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr);gap:22px;align-items:center;margin-top:12px}.guide-visual{position:relative;min-height:190px;border:1px solid #353539;border-radius:14px;background:linear-gradient(145deg,#111318,#171719);overflow:hidden}.guide-line{position:absolute;left:12%;right:12%;top:48%;height:5px;background:linear-gradient(90deg,#ffc857,#7ed2ff,#55e69a);transform:rotate(-8deg);border-radius:99px}.guide-node{position:absolute;width:86px;height:86px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px solid;background:#151517}.guide-node b{font-size:16px}.guide-node span{font-size:13px;color:#aaa;margin-top:4px}.guide-node.buy{left:7%;bottom:18px;border-color:#ffc857}.guide-node.split{left:42%;top:22px;border-color:#7ed2ff}.guide-node.exit{right:7%;top:12px;border-color:#55e69a}.guide-result{position:absolute;right:7%;bottom:18px;color:#55e69a;font-weight:bold}.explain{margin-bottom:12px;border:1px solid #555;color:#ddd}.detail-symbol{background:#111113;border-radius:10px;padding:12px;margin:10px 0}.detail-symbol>summary{cursor:pointer;font-size:18px;font-weight:bold}.detail-line{display:grid;grid-template-columns:1fr .6fr 1fr 1fr;gap:8px;padding:7px 0;border-bottom:1px solid #29292d;font-size:13px}
 @media(max-width:800px){.trust-guide-layout{grid-template-columns:1fr}.guide-visual{min-height:170px}.section-title{cursor:pointer;letter-spacing:-.3px;font-size:22px}.detail-line{grid-template-columns:1fr 1fr}}
@@ -4864,7 +4958,7 @@ summary{cursor:pointer;font-weight:bold}
 <button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리센터 메뉴</button>
 <div class="admin-backdrop" id="adminBackdrop"></div>
 <aside class="admin-side" id="adminSide"><div class="admin-side-title">관리센터 메뉴</div><nav class="admin-nav" id="adminNav">
-<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a class="admin-only" href="{% if selected_category == 'COIN' %}#admin-scalp{% else %}/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp{% endif %}">관리자 전용 분석</a>
+<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a href="#admin-cadence">알람 분석</a><a class="admin-only" href="{% if selected_category == 'COIN' %}#admin-scalp{% else %}/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp{% endif %}">관리자 전용 분석</a>
 </nav></aside>
 <h1>성과운영센터 · 관리센터</h1>
 <div class="toplinks">
@@ -5155,6 +5249,11 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 </details>
 {% endif %}
+<details id="admin-cadence" class="card collapsible-block">
+<summary class="section-title">알람 분석 · 1분 / 자기시간봉 / 절반주기</summary>
+<div id="adminCadenceBody" data-cadence-url="/performance/cadence-fragment?category={{selected_category}}&period={{period_key}}" class="collapsible-content"><div class="analysis-note">처음 접속 속도를 위해 이 메뉴를 열 때만 계산합니다.</div></div>
+</details>
+
 {% else %}
 <a class="back-link" href="/performance/dashboard?category={{selected_category}}">← 종목 목록으로</a>
 {% set s = selected_symbol %}
@@ -5229,6 +5328,14 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endif %}
 {% endif %}
 {% endif %}
+<script>
+(function(){
+ const cadence=document.getElementById('admin-cadence'), body=document.getElementById('adminCadenceBody');
+ async function load(){if(!body||body.dataset.loaded==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="analysis-note">알람 주기 데이터를 계산 중입니다…</div>';try{const r=await fetch(body.dataset.cadenceUrl,{credentials:'same-origin'});body.innerHTML=await r.text();if(r.ok)body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="analysis-note neg">알람 분석을 불러오지 못했습니다. 다시 열어주세요.</div>';}finally{body.dataset.loading='0';}}
+ if(cadence)cadence.addEventListener('toggle',()=>{if(cadence.open)load();});
+ document.querySelectorAll('a[href="#admin-cadence"]').forEach(a=>a.addEventListener('click',()=>{if(cadence){cadence.open=true;setTimeout(load,0);}}));
+})();
+</script>
 </body>
 </html>
         """,
