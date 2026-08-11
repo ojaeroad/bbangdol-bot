@@ -1,3 +1,4 @@
+# V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
 import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile, gc
@@ -77,7 +78,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v73-cadence-lazy-speed")
+APP_VERSION  = os.getenv("APP_VERSION", "v76-cadence-outcome-prediction-admin")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -395,6 +396,35 @@ def _telegram_hashtag_token(symbol: str, msg: str = "") -> str:
     # Telegram hashtag에서 보기 좋고 검색 가능한 문자만 남긴다.
     label = re.sub(r"[^0-9A-Za-z_가-힣]", "", str(label))
     return f"#{label}" if label else ""
+
+
+def _route_uses_asset_hashtag(route: str) -> bool:
+    """
+    종목 해시태그는 실제 매수/매도 알람방에서만 사용한다.
+
+    중요:
+    - 주요지표/지수/보조(AUX) 방은 종목 검색용 해시태그를 붙이지 않는다.
+    - 향후 국장/미장 주요지표 방을 추가해도 BUY/SELL 계열 라우트가 아니면
+      자동으로 해시태그 대상에서 제외된다.
+    - 기존 매수/매도 라우트는 그대로 유지한다.
+    """
+    r = (route or "").strip().upper()
+    if not r:
+        return False
+
+    # 주요지표/보조 라우트는 무조건 제외. 현재 코인 주요지표 AUX_4INDEX 포함.
+    if r == "AUX_4INDEX" or r.startswith("AUX_") or "INDICATOR" in r or r.endswith("_INDEX"):
+        return False
+
+    # 신형 별꽃/1Q 매수·매도 라우트
+    if r.startswith(("BD_BUY_", "BD_SELL_", "BUY_", "SELL_")):
+        return True
+
+    # 기존 호환 매수·매도 알람 라우트(OS/OB)
+    if r.startswith(("OS_", "OB_")):
+        return True
+
+    return False
 
 
 def _decorate_asset_header(msg: str, symbol: str) -> str:
@@ -2842,6 +2872,34 @@ def performance_cadence_fragment():
     <tbody>{% for r in cadence_simulation.timeframes %}<tr><td><b>{{r.timeframe}}</b></td><td>{{r.raw_count}}건</td><td>{{r.full_count}}건</td><td>{{r.half_count}}건</td><td>{{'%.1f'|format(r.full_reduction_pct)}}%</td><td>{{'%.1f'|format(r.half_reduction_pct)}}%</td></tr>{% endfor %}</tbody>
   </table></div>
 
+  <h3 style="margin-top:22px">시간봉별 실제 매수 결과 비교</h3>
+  <div class="small" style="margin-bottom:10px">같은 원본 신호에서 각 주기를 실제 매수 규칙으로 적용했을 때의 완료 사이클 결과입니다. 승률과 수익률을 함께 봐야 주기 우열을 판단할 수 있습니다.</div>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>포지션</th><th>시간봉</th><th>방식</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>최고</th><th>최저</th><th>평균 진입</th><th>평균 보유</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.timeframe_performance %}{% for v in r.variants %}<tr>
+      <td>{{r.group_label}}</td><td><b>{{r.timeframe}}</b></td><td>{{v.label}}</td><td>{{v.completed_cycles}}회</td>
+      <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if v.best_return_pct is not none %}{{'%+.2f'|format(v.best_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if v.worst_return_pct is not none %}{{'%+.2f'|format(v.worst_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
+      <td>{% if v.average_holding_minutes is not none %}{{format_minutes_compact(v.average_holding_minutes)}}{% else %}-{% endif %}</td>
+    </tr>{% endfor %}{% endfor %}</tbody>
+  </table></div>
+
+  <h3 style="margin-top:22px">최근 실제 진입 타점 비교</h3>
+  <div class="small" style="margin-bottom:10px">1분 원본·자기 시간봉·절반/운영 방식이 실제로 어느 가격에서 분할진입했는지 최근 완료 사례를 보여줍니다.</div>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>방식</th><th>종목</th><th>포지션</th><th>매수→매도</th><th>실제 진입 타점</th><th>평균 진입가</th><th>매도가</th><th>수익률</th></tr></thead>
+    <tbody>{% for c in cadence_simulation.recent_cycles %}<tr>
+      <td>{% if c.code == 'ALL' %}1분 원본{% elif c.code == 'FULL' %}자기 시간봉{% else %}<b>절반/운영</b>{% endif %}</td>
+      <td><b>{{c.symbol}}</b></td><td>{{c.group_label}}</td><td>{{c.entry_tf}} → {{c.exit_tf}}</td>
+      <td>{% for e in c.entry_points %}<div>{{loop.index}}차 {{'%.6g'|format(e.price)}} · {{e.time.strftime('%m.%d %H:%M') if e.time else '-'}}</div>{% endfor %}</td>
+      <td>{{'%.6g'|format(c.entry_price)}}</td><td>{{'%.6g'|format(c.exit_price)}}</td>
+      <td class="{{'pos' if c.return_pct >= 0 else 'neg'}}"><b>{{'%+.2f'|format(c.return_pct)}}%</b></td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+
   <h3 style="margin-top:22px">포지션별 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
     <thead><tr><th>포지션</th><th>방식</th><th>알람 수</th><th>감소율</th><th>집중 구간</th><th>진입 포착률</th><th>완료 사이클</th></tr></thead>
@@ -4981,7 +5039,7 @@ summary{cursor:pointer;font-weight:bold}
 <button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리센터 메뉴</button>
 <div class="admin-backdrop" id="adminBackdrop"></div>
 <aside class="admin-side" id="adminSide"><div class="admin-side-title">관리센터 메뉴</div><nav class="admin-nav" id="adminNav">
-<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a href="#admin-cadence">알람 분석</a><a class="admin-only" href="{% if selected_category == 'COIN' %}#admin-scalp{% else %}/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp{% endif %}">관리자 전용 분석</a>
+<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a href="#admin-cadence">알람 분석</a><a href="#admin-prediction">상위시간봉 예측 연구</a><a class="admin-only" href="{% if selected_category == 'COIN' %}#admin-scalp{% else %}/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp{% endif %}">관리자 전용 분석</a>
 </nav></aside>
 <h1>성과운영센터 · 관리센터</h1>
 <div class="toplinks">
@@ -5277,6 +5335,11 @@ class="{{'active-category' if category.category_key == selected_category else ''
 <div id="adminCadenceBody" data-cadence-url="/performance/cadence-fragment?category={{selected_category}}&period={{period_key}}" class="collapsible-content"><div class="analysis-note">처음 접속 속도를 위해 이 메뉴를 열 때만 계산합니다.</div></div>
 </details>
 
+<details id="admin-prediction" class="card collapsible-block">
+<summary class="section-title">상위 시간봉 저점 예측 연구</summary>
+<div id="adminPredictionBody" data-prediction-url="/performance/prediction-fragment" class="collapsible-content"><div class="analysis-note">1시간→4시간 등 상위 시간봉 예측 연구 데이터는 이 메뉴를 열 때만 계산합니다.</div></div>
+</details>
+
 {% else %}
 <a class="back-link" href="/performance/dashboard?category={{selected_category}}">← 종목 목록으로</a>
 {% set s = selected_symbol %}
@@ -5357,6 +5420,12 @@ class="{{'active-category' if category.category_key == selected_category else ''
  async function load(){if(!body||body.dataset.loaded==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="analysis-note">알람 주기 데이터를 계산 중입니다…</div>';try{const r=await fetch(body.dataset.cadenceUrl,{credentials:'same-origin'});body.innerHTML=await r.text();if(r.ok)body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="analysis-note neg">알람 분석을 불러오지 못했습니다. 다시 열어주세요.</div>';}finally{body.dataset.loading='0';}}
  if(cadence)cadence.addEventListener('toggle',()=>{if(cadence.open)load();});
  document.querySelectorAll('a[href="#admin-cadence"]').forEach(a=>a.addEventListener('click',()=>{if(cadence){cadence.open=true;setTimeout(load,0);}}));
+})();
+(()=>{
+ const panel=document.getElementById('admin-prediction'), body=document.getElementById('adminPredictionBody');
+ async function loadPrediction(){if(!body||body.dataset.loaded==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="analysis-note">상위 시간봉 예측 연구 데이터를 계산 중입니다…</div>';try{const r=await fetch(body.dataset.predictionUrl,{credentials:'same-origin'});body.innerHTML=await r.text();if(r.ok)body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="analysis-note neg">예측 연구 데이터를 불러오지 못했습니다. 다시 열어주세요.</div>';}finally{body.dataset.loading='0';}}
+ if(panel)panel.addEventListener('toggle',()=>{if(panel.open)loadPrediction();});
+ document.querySelectorAll('a[href="#admin-prediction"]').forEach(a=>a.addEventListener('click',()=>{if(panel){panel.open=true;setTimeout(loadPrediction,0);}}));
 })();
 </script>
 </body>
@@ -5526,6 +5595,61 @@ summary{cursor:pointer;font-weight:bold}
 """, data=data), 200
 
 
+
+@app.get("/performance/prediction-fragment")
+@member_required
+def performance_prediction_fragment():
+    try:
+        data = prediction_research_summary(500)
+        return render_template_string(r'''
+<div class="prediction-research-wrap">
+  <div class="analysis-note" style="margin-bottom:14px">
+    <b>상위 시간봉 저점 예측 연구</b><br>
+    현재 시간봉 저점이 발생한 순간, 바로 위 상위 시간봉의 RSI·스토캐스틱·20/60 SMA·20/60 EMA·아랫꼬리 상태를 저장한 연구 데이터입니다.<br>
+    <span class="small">예: 1h 저점 발생 → 4h 저점이 실제로 뒤따랐는지와 걸린 시간을 연결합니다. 이 표는 아직 실제 회원 알람 판정에는 사용하지 않습니다.</span>
+  </div>
+  {% if not data.ok %}<div class="analysis-note neg">예측 연구 DB를 불러오지 못했습니다.</div>{% else %}
+  <h3>시간봉 전환 성과</h3>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>현재 → 상위</th><th>스냅샷</th><th>상위저점 연결</th><th>전체 연결률</th><th>엄격 성공률</th><th>2배시간 성공률</th><th>평균 대기</th><th>중앙 대기</th></tr></thead>
+    <tbody>{% for p in data.pairs %}<tr>
+      <td><b>{{p.source_timeframe}} → {{p.target_timeframe}}</b></td><td>{{p.snapshots}}건</td><td>{{p.matched}}건</td>
+      <td>{% if p.conversion_rate_pct is not none %}{{'%.1f'|format(p.conversion_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if p.strict_match_rate_pct is not none %}<b>{{'%.1f'|format(p.strict_match_rate_pct)}}%</b><div class="small">≤ {{format_minutes_compact(p.strict_window_minutes)}}</div>{% else %}-{% endif %}</td>
+      <td>{% if p.extended_match_rate_pct is not none %}{{'%.1f'|format(p.extended_match_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if p.average_lead_minutes is not none %}{{format_minutes_compact(p.average_lead_minutes)}}{% else %}-{% endif %}</td>
+      <td>{% if p.median_lead_minutes is not none %}{{format_minutes_compact(p.median_lead_minutes)}}{% else %}-{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+
+  <h3 style="margin-top:22px">조건 조합별 성공률</h3>
+  <div class="small" style="margin-bottom:10px">상위 시간봉 자체가 그 순간 어떤 방향이었는지 묶은 표입니다. 표본 수가 충분히 쌓인 조합부터 실제 대기 안내 후보로 검토하면 됩니다.</div>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>전환</th><th>상위시간봉 조건</th><th>표본</th><th>엄격 성공</th><th>전체 연결</th><th>평균 대기</th></tr></thead>
+    <tbody>{% for r in data.patterns %}<tr><td><b>{{r.source_timeframe}}→{{r.target_timeframe}}</b></td><td class="small">{{r.signature}}</td><td>{{r.samples}}</td><td>{% if r.strict_success_rate_pct is not none %}{{'%.1f'|format(r.strict_success_rate_pct)}}%{% else %}-{% endif %}</td><td>{% if r.matched_rate_pct is not none %}{{'%.1f'|format(r.matched_rate_pct)}}%{% else %}-{% endif %}</td><td>{% if r.average_lead_minutes is not none %}{{format_minutes_compact(r.average_lead_minutes)}}{% else %}-{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>
+
+  <h3 style="margin-top:22px">최근 스냅샷 원자료</h3>
+  <div class="small" style="margin-bottom:10px">상위 저점이 아직 안 왔으면 대기로 남습니다.</div>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>종목</th><th>전환</th><th>신호가</th><th>현재봉</th><th>상위봉 당시 상태</th><th>아랫꼬리</th><th>결과</th></tr></thead>
+    <tbody>{% for r in data.recent[:80] %}<tr>
+      <td><b>{{r.symbol}}</b><div class="small">{{r.snapshot_at[:16].replace('T',' ') if r.snapshot_at else '-'}}</div></td><td>{{r.source_timeframe}}→{{r.target_timeframe}}</td><td>{{r.signal_price if r.signal_price is not none else '-'}}</td>
+      <td class="small">RSI {{r.source_metrics.get('rsi_dir','NA')}} · K5 {{r.source_metrics.get('stoch_5_3_dir','NA')}} · K20 {{r.source_metrics.get('stoch_20_12_dir','NA')}}<br>SMA {{r.source_metrics.get('sma_state','NA')}} · EMA {{r.source_metrics.get('ema_state','NA')}}</td>
+      <td class="small">RSI {{r.target_metrics.get('rsi_dir','NA')}} · K5 {{r.target_metrics.get('stoch_5_3_dir','NA')}} · K20 {{r.target_metrics.get('stoch_20_12_dir','NA')}}<br>SMA {{r.target_metrics.get('sma_state','NA')}} · EMA {{r.target_metrics.get('ema_state','NA')}}</td>
+      <td>{{'%.3f'|format(r.target_metrics.get('lower_wick_ratio',0)|float)}}</td>
+      <td>{% if r.first_target_at %}<b class="pos">상위 저점 발생</b><div>{{format_minutes_compact(r.lead_minutes)}} 후</div>{% if r.strict_success %}<div class="small">엄격 성공</div>{% endif %}{% else %}<span class="warn">대기</span>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <div class="analysis-note" style="margin-top:14px">{{data.window_note}}</div>
+  {% endif %}
+</div>
+        ''', data=data), 200
+    except Exception as exc:
+        log.exception("Prediction fragment failed")
+        return f'<div class="analysis-note neg">상위 시간봉 예측 연구 로딩 실패: {type(exc).__name__}</div>', 500
+
+
 @app.get("/performance/prediction/research")
 @admin_required
 def performance_prediction_research():
@@ -5568,9 +5692,11 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
         log.info(f"TG cadence skipped route={route} symbol={symbol} reason={cadence_reason}")
         return jsonify({"ok": True, "skipped": "cadence", "reason": cadence_reason}), 200
 
-    # v71R: 커스텀 이모지 없이 Telegram 해시태그 색상 효과로 종목을 첫 줄에 강조.
-    # 예: #XRP / #삼성전자 / #NVDA
-    cadence_msg = _decorate_asset_header(cadence_msg, symbol)
+    # v77: 종목 해시태그는 매수/매도 알람방에서만 표시한다.
+    # 주요지표(AUX/INDEX/INDICATOR) 라우트에는 해시태그를 붙이지 않는다.
+    # 향후 국장/미장 주요지표 방을 추가해도 같은 규칙이 자동 적용된다.
+    if _route_uses_asset_hashtag(route):
+        cadence_msg = _decorate_asset_header(cadence_msg, symbol)
 
     bucket = _bucket_key(chat_id, symbol, route, cadence_msg)
     msg_norm = safe_text(cadence_msg)
