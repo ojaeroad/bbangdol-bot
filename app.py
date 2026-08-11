@@ -323,12 +323,16 @@ def _normalize_signal_line(line: str) -> str:
     return f"{icon}{suffix}" if icon else normalized
 
 
+def _buy_valid_stage_emoji(ordinal: int) -> str:
+    stage=max(1,min(int(ordinal or 1),3))
+    return {1:"❗", 2:"‼️", 3:"🏹"}[stage]
+
 def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     """시간봉과 매수·매도 목적이 한눈에 구분되도록 문구를 정리한다."""
     labels = {
         # v74: 돈 이모지보다 '지금 이 종목에 집중' 의미가 즉시 들어오는 표적 사용
-        "FOCUS": "🎯 매수 집중 1/3",
-        "HOLD": f"✅ 매수 유효 {ordinal}/3",
+        "FOCUS": "🎯 매수 집중",
+        "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 매수 유효 {ordinal}/3",
         "EXIT": "🎯 매도 집중 1/3",
         "EXIT_RECHECK": f"🚨 매도 유효 {ordinal}/3",
         "EXIT_FINAL": f"🚨 매도 유효 {ordinal}/3",
@@ -343,7 +347,10 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
                 " · 집중", " · 유지 확인", " · 🚨 신규 집중", " · 🔁 신호 유지",
                 " · ✅ 종료 신호 1/3", " · ⚠️ 종료 재확인 2/3", " · 🚨 최종 종료 알림 3/3",
                 " · 💰 매수 집중", " · 🎯 매수 집중", " · 🎯 매수 집중 1/3",
-                " · ✅ 매수 유효", " · ✅ 매수 유효 2/3", " · ✅ 매수 유효 3/3",
+                " · ✅ 매수 유효", " · ✅ 매수 유효 1/3", " · ✅ 매수 유효 2/3", " · ✅ 매수 유효 3/3",
+                " · 🟣 매수 유효 1/3", " · 🟣🟣 매수 유효 2/3", " · 🟣🟣🟣 매수 유효 3/3",
+                " · ⚡ 매수 유효 1/3", " · ⚡⚡ 매수 유효 2/3", " · ⚡⚡⚡ 매수 유효 3/3",
+                " · ❗ 매수 유효 1/3", " · ‼️ 매수 유효 2/3", " · 🏹 매수 유효 3/3",
                 " · 💸 매도 집중 1/3", " · 🎯 매도 집중 1/3",
                 " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
             ):
@@ -427,33 +434,23 @@ def _route_uses_asset_hashtag(route: str) -> bool:
     return False
 
 
-def _decorate_asset_header(msg: str, symbol: str) -> str:
-    """
-    v74 종목 헤더 강조.
+def _asset_header_frame(route: str) -> tuple[str, str]:
+    r=(route or "").upper()
+    if "LIFE" in r: return "✦ ", " ✦"
+    if "LONG" in r: return "【 ", " 】"
+    if "SWING" in r or "SWINGA" in r or "SWINGB" in r: return "━ ", " ━"
+    return "─ ", " ─"
 
-    Telegram 일반 Bot 메시지는 임의의 font-size를 지정할 수 없으므로
-    해시태그의 파란 링크 색상은 그대로 살리고, 양쪽 굵은 구분선 + 빈 줄로
-    '헤더 밴드'처럼 보이게 한다. 별도 Custom Emoji/이미지 전송은 없다.
-
-    예)
-      ━━ #BTC ━━
-
-      [BINANCE] BTCUSDT : ...
-    """
-    text = (msg or "").strip()
-    if not text:
-        return text
-    tag = _telegram_hashtag_token(symbol, text)
-    if not tag:
-        return text
-
-    # 이미 v71R/v74 헤더가 붙은 메시지는 중복 장식을 하지 않는다.
-    first_nonempty = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
-    if first_nonempty.startswith("#") or ("#" in first_nonempty and "━━" in first_nonempty):
-        return text
-
-    return f"━━ {tag} ━━\n\n{text}"
-
+def _decorate_asset_header(msg: str, symbol: str, route: str = "") -> str:
+    """v78: 방 미리보기 전략 구분 + 빈 줄 제거."""
+    text=(msg or "").strip()
+    if not text: return text
+    tag=_telegram_hashtag_token(symbol,text)
+    if not tag: return text
+    first=next((ln.strip() for ln in text.splitlines() if ln.strip()),"")
+    if first.startswith(("#","─","━","【","《")) and "#" in first: return text
+    left,right=_asset_header_frame(route)
+    return f"{left}{tag}{right}\n{text}"
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
     """Telegram 집중/유효 전송 판정 v70.
@@ -1468,6 +1465,7 @@ ENTRY_GROUP_ORDER = {
 
 ENTRY_GROUP_TIMEFRAMES = {
     "COIN": {
+        "SCALP": {"5m", "15m"},
         "SWING": {"30m", "1h"},
         "LONG": {"4h", "6h"},
         "LIFE": {"12h", "1d", "1w"},
@@ -5696,7 +5694,7 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
     # 주요지표(AUX/INDEX/INDICATOR) 라우트에는 해시태그를 붙이지 않는다.
     # 향후 국장/미장 주요지표 방을 추가해도 같은 규칙이 자동 적용된다.
     if _route_uses_asset_hashtag(route):
-        cadence_msg = _decorate_asset_header(cadence_msg, symbol)
+        cadence_msg = _decorate_asset_header(cadence_msg, symbol, route)
 
     bucket = _bucket_key(chat_id, symbol, route, cadence_msg)
     msg_norm = safe_text(cadence_msg)

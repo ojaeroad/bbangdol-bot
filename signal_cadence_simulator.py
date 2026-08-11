@@ -292,6 +292,10 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
                     "entries": len(position["entries"]),
                     "entry_price": avg_price,
                     "entry_time": position["entries"][0]["time"],
+                    "entry_points": [
+                        {"price": item["price"], "time": item["time"]}
+                        for item in position["entries"]
+                    ],
                     "exit_price": signal["price"],
                     "exit_time": signal["time"],
                 })
@@ -338,6 +342,42 @@ def _stats(
         "worst_return_pct": min(values) if values else None,
     }
 
+
+
+def _cycle_stats(cycles: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [float(c["return_pct"]) for c in cycles]
+    entries = [int(c.get("entries") or 0) for c in cycles]
+    holds = [
+        max(0.0, (c["exit_time"] - c["entry_time"]).total_seconds() / 60.0)
+        for c in cycles if c.get("entry_time") and c.get("exit_time")
+    ]
+    return {
+        "completed_cycles": len(cycles),
+        "win_rate_pct": (sum(v > 0 for v in values) / len(values) * 100.0) if values else None,
+        "average_return_pct": (sum(values) / len(values)) if values else None,
+        "best_return_pct": max(values) if values else None,
+        "worst_return_pct": min(values) if values else None,
+        "average_entries": (sum(entries) / len(entries)) if entries else None,
+        "average_holding_minutes": (sum(holds) / len(holds)) if holds else None,
+    }
+
+
+def _serialise_cycle(cycle: dict[str, Any], code: str) -> dict[str, Any]:
+    return {
+        "code": code,
+        "symbol": cycle.get("symbol"),
+        "group": cycle.get("group"),
+        "group_label": GROUP_LABEL.get(cycle.get("group"), cycle.get("group")),
+        "entry_tf": cycle.get("entry_tf"),
+        "exit_tf": cycle.get("exit_tf"),
+        "entries": int(cycle.get("entries") or 0),
+        "entry_price": float(cycle.get("entry_price") or 0),
+        "entry_time": cycle.get("entry_time"),
+        "entry_points": cycle.get("entry_points") or [],
+        "exit_price": float(cycle.get("exit_price") or 0),
+        "exit_time": cycle.get("exit_time"),
+        "return_pct": float(cycle.get("return_pct") or 0),
+    }
 
 def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     signals = _load(market, period_key)
@@ -412,6 +452,23 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
             })
         group_rows.append(item)
 
+    # 같은 시간봉에서 1분 원본/자기 시간봉/절반 운영 주기를 적용했을 때의
+    # 실제 진입가격·완료 수익률·승률을 직접 비교한다.
+    timeframe_performance: list[dict[str, Any]] = []
+    for tf in sorted({s["tf"] for s in signals}, key=lambda value: TF_MINUTES.get(value, 999999)):
+        row = {"timeframe": tf, "group": _group(market, tf), "group_label": GROUP_LABEL.get(_group(market, tf), ""), "variants": []}
+        for code, label in (("ALL", "1분 원본"), ("FULL", "자기 시간봉"), ("HALF", "절반/운영")):
+            tf_cycles = [c for c in simulations[code]["cycles"] if c["entry_tf"] == tf]
+            row["variants"].append({"code": code, "label": label, **_cycle_stats(tf_cycles)})
+        timeframe_performance.append(row)
+
+    recent_cycles: list[dict[str, Any]] = []
+    for code in ("ALL", "FULL", "HALF"):
+        for cycle in simulations[code]["cycles"]:
+            recent_cycles.append(_serialise_cycle(cycle, code))
+    recent_cycles.sort(key=lambda c: c.get("exit_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    recent_cycles = recent_cycles[:36]
+
     return {
         "market": market,
         "period_key": period_key,
@@ -419,6 +476,8 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "variants": variants,
         "timeframes": timeframe_rows,
         "groups": group_rows,
+        "timeframe_performance": timeframe_performance,
+        "recent_cycles": recent_cycles,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "

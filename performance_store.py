@@ -385,17 +385,40 @@ def _link_prediction_target_signal(symbol: str, timeframe: Optional[str], signal
         )
 
 
+def _tf_minutes_for_prediction(tf: str) -> int:
+    mapping = {
+        "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120,
+        "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
+        "3d": 4320, "1w": 10080, "1m": 43200, "1M": 43200,
+    }
+    return mapping.get(str(tf or ""), 0)
+
+
+def _prediction_signature(metrics: dict[str, Any]) -> str:
+    m = metrics or {}
+    parts = [
+        f"RSI:{m.get('rsi_dir','NA')}",
+        f"K5:{m.get('stoch_5_3_dir','NA')}",
+        f"K20:{m.get('stoch_20_12_dir','NA')}",
+        f"SMA:{m.get('sma_state','NA')}",
+        f"EMA:{m.get('ema_state','NA')}",
+    ]
+    return " | ".join(parts)
+
+
 def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 1000))
     if not PERFORMANCE_DATABASE_URL:
-        return {"ok": False, "database": "not_configured", "count": 0, "pairs": [], "recent": []}
+        return {"ok": False, "database": "not_configured", "count": 0, "pairs": [], "recent": [], "patterns": []}
     ensure_schema()
     with _connect() as conn:
         total = conn.execute("SELECT COUNT(*) FROM performance_prediction_snapshots").fetchone()[0]
         pairs_raw = conn.execute(
             """
             SELECT source_timeframe, target_timeframe, COUNT(*), COUNT(first_target_at),
-                   AVG(lead_minutes) FILTER (WHERE first_target_at IS NOT NULL)
+                   AVG(lead_minutes) FILTER (WHERE first_target_at IS NOT NULL),
+                   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lead_minutes)
+                     FILTER (WHERE first_target_at IS NOT NULL)
             FROM performance_prediction_snapshots
             GROUP BY source_timeframe, target_timeframe
             ORDER BY
@@ -415,27 +438,75 @@ def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
             """,
             (safe_limit,),
         ).fetchall()
+
+    pairs = []
+    for r in pairs_raw:
+        target_minutes = _tf_minutes_for_prediction(r[1])
+        snapshots = int(r[2])
+        matched = int(r[3])
+        pair_recent = [x for x in recent_raw if x[3] == r[0] and x[4] == r[1]]
+        strict = sum(1 for x in pair_recent if x[10] is not None and target_minutes and int(x[10]) <= target_minutes)
+        extended = sum(1 for x in pair_recent if x[10] is not None and target_minutes and int(x[10]) <= target_minutes * 2)
+        denom = len(pair_recent)
+        pairs.append({
+            "source_timeframe": r[0], "target_timeframe": r[1],
+            "snapshots": snapshots, "matched": matched,
+            "conversion_rate_pct": (matched / snapshots * 100.0) if snapshots else None,
+            "average_lead_minutes": float(r[4]) if r[4] is not None else None,
+            "median_lead_minutes": float(r[5]) if r[5] is not None else None,
+            "strict_window_minutes": target_minutes or None,
+            "strict_match_rate_pct": (strict / denom * 100.0) if denom and target_minutes else None,
+            "extended_match_rate_pct": (extended / denom * 100.0) if denom and target_minutes else None,
+            "sampled_for_window": denom,
+        })
+
+    recent = []
+    pattern_bucket: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for r in recent_raw:
+        source_metrics = r[7] or {}
+        target_metrics = r[8] or {}
+        target_minutes = _tf_minutes_for_prediction(r[4])
+        strict_success = bool(r[10] is not None and target_minutes and int(r[10]) <= target_minutes)
+        sig = _prediction_signature(target_metrics)
+        key = (r[3], r[4], sig)
+        b = pattern_bucket.setdefault(key, {"source_timeframe": r[3], "target_timeframe": r[4], "signature": sig, "samples": 0, "strict_successes": 0, "matched": 0, "lead_values": []})
+        b["samples"] += 1
+        if strict_success:
+            b["strict_successes"] += 1
+        if r[9] is not None:
+            b["matched"] += 1
+        if r[10] is not None:
+            b["lead_values"].append(float(r[10]))
+        recent.append({
+            "id": r[0], "exchange": r[1], "symbol": r[2],
+            "source_timeframe": r[3], "target_timeframe": r[4],
+            "signal_price": float(r[5]) if r[5] is not None else None,
+            "snapshot_at": r[6].isoformat() if r[6] else None,
+            "source_metrics": source_metrics, "target_metrics": target_metrics,
+            "source_signature": _prediction_signature(source_metrics),
+            "target_signature": sig,
+            "first_target_at": r[9].isoformat() if r[9] else None,
+            "lead_minutes": r[10],
+            "strict_window_minutes": target_minutes or None,
+            "strict_success": strict_success,
+        })
+
+    patterns = []
+    for b in pattern_bucket.values():
+        leads = b.pop("lead_values")
+        b["strict_success_rate_pct"] = (b["strict_successes"] / b["samples"] * 100.0) if b["samples"] else None
+        b["matched_rate_pct"] = (b["matched"] / b["samples"] * 100.0) if b["samples"] else None
+        b["average_lead_minutes"] = (sum(leads) / len(leads)) if leads else None
+        patterns.append(b)
+    patterns.sort(key=lambda x: (-x["samples"], -(x["strict_success_rate_pct"] or 0)))
+
     return {
         "ok": True,
         "count": int(total),
-        "pairs": [
-            {
-                "source_timeframe": r[0], "target_timeframe": r[1],
-                "snapshots": int(r[2]), "matched": int(r[3]),
-                "average_lead_minutes": float(r[4]) if r[4] is not None else None,
-            } for r in pairs_raw
-        ],
-        "recent": [
-            {
-                "id": r[0], "exchange": r[1], "symbol": r[2],
-                "source_timeframe": r[3], "target_timeframe": r[4],
-                "signal_price": float(r[5]) if r[5] is not None else None,
-                "snapshot_at": r[6].isoformat() if r[6] else None,
-                "source_metrics": r[7] or {}, "target_metrics": r[8] or {},
-                "first_target_at": r[9].isoformat() if r[9] else None,
-                "lead_minutes": r[10],
-            } for r in recent_raw
-        ],
+        "pairs": pairs,
+        "patterns": patterns[:30],
+        "recent": recent,
+        "window_note": "엄격 성공은 상위 목표 시간봉 길이 안에 실제 목표 저점이 처음 발생한 경우입니다. 확장 성공은 그 2배 시간 안에 발생한 경우입니다.",
     }
 
 
