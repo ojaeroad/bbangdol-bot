@@ -631,7 +631,11 @@ def _prediction_market_where(category_key: str | None) -> str:
     exch = "UPPER(COALESCE(exchange,''))"
     raw = "UPPER(COALESCE(raw_exchange,''))"
     sym = "UPPER(COALESCE(symbol,''))"
-    coin = f"(({exch} ~ '(BINANCE|BYBIT|OKX|BITGET|UPBIT|BITHUMB|COINBASE|KRAKEN)') OR ({raw} ~ '(BINANCE|BYBIT|OKX|BITGET|UPBIT|BITHUMB|COINBASE|KRAKEN)') OR ({sym} LIKE '%USDT%' OR {sym} LIKE '%USDC%' OR {sym} LIKE '%.P'))"
+    # IMPORTANT: Avoid literal '%' wildcards here. Psycopg parses '%' in a query
+    # that also has bound parameters (the recent LIMIT query below), which can raise
+    # ProgrammingError before PostgreSQL sees the SQL. POSITION/RIGHT are equivalent
+    # for this market classification and don't conflict with parameter binding.
+    coin = f"(({exch} ~ '(BINANCE|BYBIT|OKX|BITGET|UPBIT|BITHUMB|COINBASE|KRAKEN)') OR ({raw} ~ '(BINANCE|BYBIT|OKX|BITGET|UPBIT|BITHUMB|COINBASE|KRAKEN)') OR (POSITION('USDT' IN {sym}) > 0 OR POSITION('USDC' IN {sym}) > 0 OR RIGHT({sym}, 2) = '.P'))"
     korea = f"(({exch} ~ '(KRX|KOSPI|KOSDAQ|KONEX|KOREA)') OR ({raw} ~ '(KRX|KOSPI|KOSDAQ|KONEX|KOREA)') OR ({sym} ~ '^[0-9]{{6}}$'))"
     us = f"(({exch} ~ '(NASDAQ|NYSE|AMEX|ARCA|BATS|CBOE|OTC|USA|US)') OR ({raw} ~ '(NASDAQ|NYSE|AMEX|ARCA|BATS|CBOE|OTC|USA|US)') OR (NOT {coin} AND NOT {korea} AND {sym} ~ '^[A-Z][A-Z0-9.\\-]{{0,14}}$'))"
     if category == "COIN":

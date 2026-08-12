@@ -79,7 +79,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v87-prediction-rich-metrics-collector")
+APP_VERSION  = os.getenv("APP_VERSION", "v90-prediction-loading-fix")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
