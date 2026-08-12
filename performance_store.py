@@ -281,6 +281,220 @@ def _collection_requirements(route: str) -> tuple[bool, bool]:
 
 
 
+
+# =========================================================
+# v87: 상위시간봉 예측 연구용 확장 지표 정규화
+# - 기존 payload/DB 스키마를 깨지 않고 source_metrics / target_metrics JSONB 안에 저장
+# - Pine이 새 수치들을 보내기 시작하는 즉시 과거/신규 코드와 호환하여 누적
+# - 기존 방향/상태 필드(rsi_dir, stoch_*_dir, sma_state, ema_state)는 그대로 유지
+# =========================================================
+def _metric_first(m: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in m and m.get(key) is not None:
+            return m.get(key)
+    return None
+
+
+def _metric_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value), 8)
+    except (TypeError, ValueError):
+        return None
+
+
+def _metric_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "above", "up"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "below", "down"}:
+        return False
+    return None
+
+
+def _rsi_zone(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if value < 20: return "0-20"
+    if value < 30: return "20-30"
+    if value < 40: return "30-40"
+    if value < 50: return "40-50"
+    if value < 60: return "50-60"
+    if value < 70: return "60-70"
+    if value < 80: return "70-80"
+    return "80-100"
+
+
+def _stoch_zone(k: float | None) -> str | None:
+    if k is None:
+        return None
+    if k <= 20: return "LOW_0_20"
+    if k >= 80: return "HIGH_80_100"
+    return "MID_20_80"
+
+
+def _cross_from_values(k: float | None, d: float | None, k_prev: float | None, d_prev: float | None) -> str | None:
+    if None in (k, d, k_prev, d_prev):
+        return None
+    if k > d and k_prev <= d_prev:
+        return "GOLDEN"
+    if k < d and k_prev >= d_prev:
+        return "DEAD"
+    return "NONE"
+
+
+def _normalize_cross(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    text = str(value).strip().upper()
+    if text in {"GC", "GOLDEN", "GOLDEN_CROSS", "GOLDENCROSS", "UP_CROSS"}:
+        return "GOLDEN"
+    if text in {"DC", "DEAD", "DEAD_CROSS", "DEADCROSS", "DOWN_CROSS"}:
+        return "DEAD"
+    if text in {"NONE", "NO", "FLAT", "0"}:
+        return "NONE"
+    return text[:24]
+
+
+def _price_position(price: float | None, ma: float | None) -> str | None:
+    if price is None or ma is None:
+        return None
+    if price > ma: return "ABOVE"
+    if price < ma: return "BELOW"
+    return "ON"
+
+
+def _pct_gap(a: float | None, b: float | None) -> float | None:
+    if a is None or b in (None, 0):
+        return None
+    return round((a - b) / abs(b) * 100.0, 6)
+
+
+def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
+    """Normalize old/new Pine metric payloads into one research schema.
+
+    This function is deliberately tolerant: unknown keys are preserved, while
+    common aliases are copied to canonical v88 names. This lets us deploy the
+    backend first and start collecting richer Pine fields without another DB
+    migration.
+    """
+    src = dict(metrics or {}) if isinstance(metrics, dict) else {}
+    out: dict[str, Any] = dict(src)
+
+    # RSI: actual level + 1/3/5-bar changes + 50-line / zones.
+    rsi = _metric_float(_metric_first(src, "rsi_value", "rsi", "rsi14", "rsi_14"))
+    if rsi is not None:
+        out["rsi_value"] = rsi
+        out["rsi_zone"] = _rsi_zone(rsi)
+        out["rsi_above_50"] = rsi >= 50.0
+        out["rsi_below_30"] = rsi <= 30.0
+        out["rsi_above_70"] = rsi >= 70.0
+    for n in (1, 3, 5):
+        dv = _metric_float(_metric_first(src, f"rsi_delta_{n}", f"rsi_change_{n}", f"rsi_d{n}"))
+        if dv is not None:
+            out[f"rsi_delta_{n}"] = dv
+    if "rsi_above_50" not in out:
+        v = _metric_bool(_metric_first(src, "rsi_above_50", "rsi_gt_50"))
+        if v is not None: out["rsi_above_50"] = v
+
+    # Stochastic 5,3,3 and 20,12,12: K/D levels, spread, cross, zone, slope deltas.
+    for prefix, aliases in (
+        ("stoch_5_3", ("stoch_5_3", "stoch5", "k5")),
+        ("stoch_20_12", ("stoch_20_12", "stoch20", "k20")),
+    ):
+        k_keys = [f"{a}_k" for a in aliases] + [prefix + "_value"]
+        d_keys = [f"{a}_d" for a in aliases]
+        kp_keys = [f"{a}_k_prev" for a in aliases]
+        dp_keys = [f"{a}_d_prev" for a in aliases]
+        k = _metric_float(_metric_first(src, *k_keys))
+        d = _metric_float(_metric_first(src, *d_keys))
+        kp = _metric_float(_metric_first(src, *kp_keys))
+        dp = _metric_float(_metric_first(src, *dp_keys))
+        if k is not None:
+            out[prefix + "_k"] = k
+            out[prefix + "_zone"] = _stoch_zone(k)
+        if d is not None: out[prefix + "_d"] = d
+        if kp is not None: out[prefix + "_k_prev"] = kp
+        if dp is not None: out[prefix + "_d_prev"] = dp
+        if k is not None and d is not None:
+            out[prefix + "_spread"] = round(k - d, 8)
+        explicit_cross = _normalize_cross(_metric_first(src, prefix + "_cross", *(f"{a}_cross" for a in aliases)))
+        derived_cross = _cross_from_values(k, d, kp, dp)
+        if explicit_cross is not None:
+            out[prefix + "_cross"] = explicit_cross
+        elif derived_cross is not None:
+            out[prefix + "_cross"] = derived_cross
+        for n in (1, 3, 5):
+            kd = _metric_float(_metric_first(src, prefix + f"_k_delta_{n}", *(f"{a}_k_delta_{n}" for a in aliases)))
+            dd = _metric_float(_metric_first(src, prefix + f"_d_delta_{n}", *(f"{a}_d_delta_{n}" for a in aliases)))
+            if kd is not None: out[prefix + f"_k_delta_{n}"] = kd
+            if dd is not None: out[prefix + f"_d_delta_{n}"] = dd
+
+    # Moving averages: actual 20/60 values, state, just-crossed flag, spacing and slopes.
+    price = _metric_float(_metric_first(src, "price", "close", "close_price"))
+    if price is not None: out["price"] = price
+    for family in ("sma", "ema"):
+        ma20 = _metric_float(_metric_first(src, family + "20", family + "_20"))
+        ma60 = _metric_float(_metric_first(src, family + "60", family + "_60"))
+        if ma20 is not None: out[family + "20"] = ma20
+        if ma60 is not None: out[family + "60"] = ma60
+        if ma20 is not None and ma60 is not None:
+            out[family + "_gap_pct"] = _pct_gap(ma20, ma60)
+            out.setdefault(family + "_state", "GOLDEN" if ma20 >= ma60 else "DEAD")
+        cross = _normalize_cross(_metric_first(src, family + "_cross", family + "_cross_now"))
+        if cross is not None: out[family + "_cross"] = cross
+        bars = _metric_float(_metric_first(src, family + "_bars_since_cross", family + "_cross_bars"))
+        if bars is not None: out[family + "_bars_since_cross"] = int(max(0, bars))
+        for n in (1, 3):
+            s20 = _metric_float(_metric_first(src, family + f"20_delta_{n}", family + f"_20_delta_{n}"))
+            s60 = _metric_float(_metric_first(src, family + f"60_delta_{n}", family + f"_60_delta_{n}"))
+            if s20 is not None: out[family + f"20_delta_{n}"] = s20
+            if s60 is not None: out[family + f"60_delta_{n}"] = s60
+        if price is not None:
+            if ma20 is not None:
+                out["price_vs_" + family + "20"] = _price_position(price, ma20)
+                out["price_gap_" + family + "20_pct"] = _pct_gap(price, ma20)
+            if ma60 is not None:
+                out["price_vs_" + family + "60"] = _price_position(price, ma60)
+                out["price_gap_" + family + "60_pct"] = _pct_gap(price, ma60)
+
+    # Candle / volatility / volume context. These are optional, but store now if Pine sends them.
+    for key in (
+        "body_ratio", "upper_wick_ratio", "lower_wick_ratio", "volume_ratio",
+        "atr", "atr_pct", "range_pct",
+    ):
+        v = _metric_float(_metric_first(src, key))
+        if v is not None: out[key] = v
+
+    out["metrics_schema_version"] = 88
+    return out
+
+
+def _prediction_detail_signature(metrics: dict[str, Any]) -> str:
+    """Human-readable rich signature for later ranking; not used as the main grouping yet."""
+    m = metrics or {}
+    bits = []
+    rv = m.get("rsi_value")
+    bits.append(f"RSI={rv:.1f}" if isinstance(rv, (int, float)) else f"RSI={m.get('rsi_dir','NA')}")
+    bits.append(f"R50={'UP' if m.get('rsi_above_50') else 'DOWN'}" if m.get("rsi_above_50") is not None else "R50=NA")
+    for label, pfx in (("K5", "stoch_5_3"), ("K20", "stoch_20_12")):
+        k, d = m.get(pfx + "_k"), m.get(pfx + "_d")
+        if isinstance(k, (int, float)) and isinstance(d, (int, float)):
+            bits.append(f"{label}={k:.1f}/{d:.1f}:{m.get(pfx+'_cross','NONE')}")
+        else:
+            bits.append(f"{label}={m.get(pfx+'_dir','NA')}")
+    bits.append(f"SMA={m.get('sma_state','NA')}/{m.get('sma_cross','NONE')}")
+    bits.append(f"EMA={m.get('ema_state','NA')}/{m.get('ema_cross','NONE')}")
+    return " | ".join(bits)
+
+
 def _prediction_hash(payload: dict[str, Any]) -> str:
     symbol = str(payload.get("symbol", "")).strip()
     source_tf = str(payload.get("source_timeframe", "")).strip()
@@ -320,8 +534,8 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
         "target_tf": target_tf,
         "signal_price": signal_price,
         "snapshot_at": snapshot_at,
-        "source_metrics": Jsonb(payload.get("source_metrics") or {}),
-        "target_metrics": Jsonb(payload.get("target_metrics") or {}),
+        "source_metrics": Jsonb(normalize_prediction_metrics(payload.get("source_metrics") or {})),
+        "target_metrics": Jsonb(normalize_prediction_metrics(payload.get("target_metrics") or {})),
         "raw_payload": Jsonb(payload),
         "snapshot_hash": _prediction_hash(payload),
     }
@@ -522,6 +736,8 @@ def prediction_research_summary(limit: int = 100, category_key: str | None = Non
             "snapshot_at": r[6].isoformat() if r[6] else None,
             "source_metrics": source_metrics, "target_metrics": target_metrics,
             "source_signature": _prediction_signature(source_metrics),
+            "source_detail_signature": _prediction_detail_signature(source_metrics),
+            "target_detail_signature": _prediction_detail_signature(target_metrics),
             "target_signature": sig,
             "first_target_at": r[9].isoformat() if r[9] else None,
             "lead_minutes": r[10],

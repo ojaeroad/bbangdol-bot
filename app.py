@@ -79,7 +79,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v84-prediction-market-filter-same-stage")
+APP_VERSION  = os.getenv("APP_VERSION", "v87-prediction-rich-metrics-collector")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -5635,8 +5635,8 @@ def performance_prediction_fragment():
 <div class="prediction-research-wrap">
   <div class="analysis-note" style="margin-bottom:14px">
     <b>상위 시간봉 저점 예측 연구</b><br>
-    현재 시간봉 저점이 발생한 순간, 바로 위 상위 시간봉의 RSI·스토캐스틱·20/60 SMA·20/60 EMA·아랫꼬리 상태를 저장한 연구 데이터입니다.<br>
-    <span class="small">예: 1h 저점 발생 → 4h 저점이 실제로 뒤따랐는지와 걸린 시간을 연결합니다. 이 표는 아직 실제 회원 알람 판정에는 사용하지 않습니다.</span>
+    현재 시간봉 저점이 발생한 순간, 바로 위 상위 시간봉의 상태를 저장하고 실제 상위 저점 발생 여부와 대기시간을 연결합니다.<br>
+    <span class="small">v87부터 RSI 실제값·50선 위치·1/3/5봉 변화량, Stoch 5·3·3 / 20·12·12의 K/D값·골든/데드크로스·변화량, SMA/EMA 20·60 이격·교차·기울기·가격 위치, 캔들/거래량/ATR 문맥까지 수신되는 값은 모두 JSONB로 누적합니다. 기존 데이터는 그대로 유지됩니다.</span>
   </div>
   {% if not data.ok %}<div class="analysis-note neg">예측 연구 DB를 불러오지 못했습니다.</div>{% else %}
   <h3>시간봉 전환 성과</h3>
@@ -5665,8 +5665,20 @@ def performance_prediction_fragment():
     <thead><tr><th>종목</th><th>전환</th><th>신호가</th><th>현재봉</th><th>상위봉 당시 상태</th><th>아랫꼬리</th><th>결과</th></tr></thead>
     <tbody>{% for r in data.recent[:80] %}<tr>
       <td><b>{{r.symbol}}</b><div class="small">{{r.snapshot_at[:16].replace('T',' ') if r.snapshot_at else '-'}}</div></td><td>{{r.source_timeframe}}→{{r.target_timeframe}}</td><td>{{r.signal_price if r.signal_price is not none else '-'}}</td>
-      <td class="small">RSI {{r.source_metrics.get('rsi_dir','NA')}} · K5 {{r.source_metrics.get('stoch_5_3_dir','NA')}} · K20 {{r.source_metrics.get('stoch_20_12_dir','NA')}}<br>SMA {{r.source_metrics.get('sma_state','NA')}} · EMA {{r.source_metrics.get('ema_state','NA')}}</td>
-      <td class="small">RSI {{r.target_metrics.get('rsi_dir','NA')}} · K5 {{r.target_metrics.get('stoch_5_3_dir','NA')}} · K20 {{r.target_metrics.get('stoch_20_12_dir','NA')}}<br>SMA {{r.target_metrics.get('sma_state','NA')}} · EMA {{r.target_metrics.get('ema_state','NA')}}</td>
+      <td class="small">
+        RSI {% if r.source_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.source_metrics.get('rsi_value')|float)}}{% else %}{{r.source_metrics.get('rsi_dir','NA')}}{% endif %}
+        {% if r.source_metrics.get('rsi_above_50') is not none %}· 50선 {{'위' if r.source_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>
+        K5 {% if r.source_metrics.get('stoch_5_3_k') is not none %}{{'%.1f'|format(r.source_metrics.get('stoch_5_3_k')|float)}}/{{'%.1f'|format(r.source_metrics.get('stoch_5_3_d')|float)}} {{r.source_metrics.get('stoch_5_3_cross','NONE')}}{% else %}{{r.source_metrics.get('stoch_5_3_dir','NA')}}{% endif %} ·
+        K20 {% if r.source_metrics.get('stoch_20_12_k') is not none %}{{'%.1f'|format(r.source_metrics.get('stoch_20_12_k')|float)}}/{{'%.1f'|format(r.source_metrics.get('stoch_20_12_d')|float)}} {{r.source_metrics.get('stoch_20_12_cross','NONE')}}{% else %}{{r.source_metrics.get('stoch_20_12_dir','NA')}}{% endif %}<br>
+        SMA {{r.source_metrics.get('sma_state','NA')}}{% if r.source_metrics.get('sma_cross') %}/{{r.source_metrics.get('sma_cross')}}{% endif %} · EMA {{r.source_metrics.get('ema_state','NA')}}{% if r.source_metrics.get('ema_cross') %}/{{r.source_metrics.get('ema_cross')}}{% endif %}
+      </td>
+      <td class="small">
+        RSI {% if r.target_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.target_metrics.get('rsi_value')|float)}}{% else %}{{r.target_metrics.get('rsi_dir','NA')}}{% endif %}
+        {% if r.target_metrics.get('rsi_above_50') is not none %}· 50선 {{'위' if r.target_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>
+        K5 {% if r.target_metrics.get('stoch_5_3_k') is not none %}{{'%.1f'|format(r.target_metrics.get('stoch_5_3_k')|float)}}/{{'%.1f'|format(r.target_metrics.get('stoch_5_3_d')|float)}} {{r.target_metrics.get('stoch_5_3_cross','NONE')}}{% else %}{{r.target_metrics.get('stoch_5_3_dir','NA')}}{% endif %} ·
+        K20 {% if r.target_metrics.get('stoch_20_12_k') is not none %}{{'%.1f'|format(r.target_metrics.get('stoch_20_12_k')|float)}}/{{'%.1f'|format(r.target_metrics.get('stoch_20_12_d')|float)}} {{r.target_metrics.get('stoch_20_12_cross','NONE')}}{% else %}{{r.target_metrics.get('stoch_20_12_dir','NA')}}{% endif %}<br>
+        SMA {{r.target_metrics.get('sma_state','NA')}}{% if r.target_metrics.get('sma_cross') %}/{{r.target_metrics.get('sma_cross')}}{% endif %} · EMA {{r.target_metrics.get('ema_state','NA')}}{% if r.target_metrics.get('ema_cross') %}/{{r.target_metrics.get('ema_cross')}}{% endif %}
+      </td>
       <td>{{'%.3f'|format(r.target_metrics.get('lower_wick_ratio',0)|float)}}</td>
       <td>{% if r.first_target_at %}<b class="pos">상위 저점 발생</b><div>{{format_minutes_compact(r.lead_minutes)}} 후</div>{% if r.strict_success %}<div class="small">엄격 성공</div>{% endif %}{% else %}<span class="warn">대기</span>{% endif %}</td>
     </tr>{% endfor %}</tbody>
