@@ -1,3 +1,4 @@
+# V81_INDICATOR_CADENCE_SCOPE_AND_BUY_COUNTER: 주요지표 cadence 제외 + 집중 카운터 제외 + 👓 집중
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
@@ -331,9 +332,9 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     """시간봉과 매수·매도 목적이 한눈에 구분되도록 문구를 정리한다."""
     labels = {
         # v74: 돈 이모지보다 '지금 이 종목에 집중' 의미가 즉시 들어오는 표적 사용
-        "FOCUS": "🎯 매수 집중",
+        "FOCUS": "👓 매수 집중",
         "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 매수 유효 {ordinal}/3",
-        "EXIT": "🎯 매도 집중 1/3",
+        "EXIT": "👓 매도 집중 1/3",
         "EXIT_RECHECK": f"🚨 매도 유효 {ordinal}/3",
         "EXIT_FINAL": f"🚨 매도 유효 {ordinal}/3",
     }
@@ -346,12 +347,12 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
             for old_label in (
                 " · 집중", " · 유지 확인", " · 🚨 신규 집중", " · 🔁 신호 유지",
                 " · ✅ 종료 신호 1/3", " · ⚠️ 종료 재확인 2/3", " · 🚨 최종 종료 알림 3/3",
-                " · 💰 매수 집중", " · 🎯 매수 집중", " · 🎯 매수 집중 1/3",
+                " · 💰 매수 집중", " · 🎯 매수 집중", " · 🎯 매수 집중 1/3", " · 👓 매수 집중", " · 👓 매수 집중 1/3",
                 " · ✅ 매수 유효", " · ✅ 매수 유효 1/3", " · ✅ 매수 유효 2/3", " · ✅ 매수 유효 3/3",
                 " · 🟣 매수 유효 1/3", " · 🟣🟣 매수 유효 2/3", " · 🟣🟣🟣 매수 유효 3/3",
                 " · ⚡ 매수 유효 1/3", " · ⚡⚡ 매수 유효 2/3", " · ⚡⚡⚡ 매수 유효 3/3",
                 " · ❗ 매수 유효 1/3", " · ‼️ 매수 유효 2/3", " · 🏹 매수 유효 3/3",
-                " · 💸 매도 집중 1/3", " · 🎯 매도 집중 1/3",
+                " · 💸 매도 집중 1/3", " · 🎯 매도 집중 1/3", " · 👓 매도 집중 1/3",
                 " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
             ):
                 normalized = normalized.replace(old_label, "")
@@ -455,15 +456,21 @@ def _decorate_asset_header(msg: str, symbol: str, route: str = "") -> str:
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
     """Telegram 집중/유효 전송 판정 v70.
 
-    LOW: 첫 신호는 즉시 '매수 집중'. 이후 같은 조건이 계속 들어와도
+    LOW: 첫 신호는 즉시 '매수 집중'(카운터 제외). 이후 같은 조건이 계속 들어와도
     정해진 cadence 경계 전에는 전부 차단하고, 다음 경계 이후 처음 들어온
-    신호 1건만 '매수 유효'로 전송한다.
+    신호를 '매수 유효 1/3 → 2/3 → 3/3' 순서로 전송한다.
 
     HIGH: 첫 신호 1/3 즉시, 이후 cadence 경계마다 2/3, 3/3까지만 전송한다.
     가격 변화 및 Pine의 매분 재호출은 새 집중으로 보지 않는다.
     """
     if not TELEGRAM_CADENCE_ENABLED:
         return True, msg, "disabled"
+
+    # v81: 집중/유효 cadence는 실제 매수/매도 알람방에만 적용한다.
+    # AUX/INDEX/INDICATOR 등 주요지표방은 원문 그대로 통과시켜,
+    # 지표 문장 안의 저점/고점 문자열이 매수·매도 알람으로 오인되지 않게 한다.
+    if not _route_uses_asset_hashtag(route):
+        return True, msg, "non_trade_route"
 
     sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
     cadence = _cadence_minutes(timeframe, route_key)
@@ -512,15 +519,15 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                     prev = None
 
             if direction == "LOW":
-                # 매수도 매도와 동일하게 3단계로 명확히 표기한다.
-                # 1/3: 최초 집중, 2/3·3/3: 유효주기 경계에서 들어온 첫 신호만 전송.
+                # v81: 최초 집중은 카운터에 포함하지 않는다.
+                # 집중(0) → 유효 1/3 → 유효 2/3 → 유효 3/3 순서로 최대 4회 전송한다.
                 if prev is None:
-                    episode_count = 1
+                    episode_count = 0
                     phase = "FOCUS"
                     should_send = True
                     next_due_slot = current_slot + 1
                 else:
-                    episode_count = int(prev.get("episode_count", 1) or 1)
+                    episode_count = int(prev.get("episode_count", 0) or 0)
                     next_due_slot = int(prev.get("next_due_slot", current_slot + 1))
                     if episode_count >= 3:
                         phase = "SUPPRESS"
@@ -547,7 +554,8 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                 if not should_send:
                     reason = "low_max_3_reached" if episode_count >= 3 else f"waiting_boundary_{cadence}m"
                     return False, msg, reason
-                return True, _decorate_cadence_message(msg, phase, episode_count), f"low_{episode_count}_of_3"
+                reason = "low_focus" if phase == "FOCUS" else f"low_valid_{episode_count}_of_3"
+                return True, _decorate_cadence_message(msg, phase, episode_count), reason
 
             # HIGH: 첫 매도 집중 + cadence마다 최대 3회.
             if prev is None:
