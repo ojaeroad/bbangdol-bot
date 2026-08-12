@@ -379,6 +379,85 @@ def _serialise_cycle(cycle: dict[str, Any], code: str) -> dict[str, Any]:
         "return_pct": float(cycle.get("return_pct") or 0),
     }
 
+
+
+def _latest_cycle_detail(cycles: list[dict[str, Any]], code: str) -> dict[str, Any] | None:
+    if not cycles:
+        return None
+    latest = max(cycles, key=lambda c: c.get("exit_time") or datetime.min.replace(tzinfo=timezone.utc))
+    return _serialise_cycle(latest, code)
+
+
+def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """종목별로 1분원본/자기시간봉/절반운영의 최근 실제 진입 타점을 같은 조합에서 비교한다.
+
+    동일 종목·포지션·매수TF→매도TF 조합 중 세 방식 어느 하나라도 완료 결과가 있으면 한 줄을 만들고,
+    아직 결과가 없는 방식은 None으로 남겨 화면에서 빈칸(-)으로 보여준다.
+    """
+    symbols = sorted({str(s.get("symbol") or "") for s in signals if s.get("symbol")})
+    by_code: dict[str, dict[tuple[str, str, str, str], list[dict[str, Any]]]] = {}
+    all_keys: set[tuple[str, str, str, str]] = set()
+    for code in ("ALL", "FULL", "HALF"):
+        bucket: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for cycle in simulations.get(code, {}).get("cycles", []):
+            key = (
+                str(cycle.get("symbol") or ""),
+                str(cycle.get("group") or ""),
+                str(cycle.get("entry_tf") or ""),
+                str(cycle.get("exit_tf") or ""),
+            )
+            bucket.setdefault(key, []).append(cycle)
+            all_keys.add(key)
+        by_code[code] = bucket
+
+    output: list[dict[str, Any]] = []
+    for symbol in symbols:
+        symbol_keys = [k for k in all_keys if k[0] == symbol]
+        if not symbol_keys:
+            continue
+        groups_out = []
+        group_names = sorted({k[1] for k in symbol_keys}, key=lambda g: list(GROUPS.get(market, {})).index(g) if g in GROUPS.get(market, {}) else 99)
+        for group in group_names:
+            rows = []
+            group_keys = [k for k in symbol_keys if k[1] == group]
+            group_keys.sort(key=lambda k: (TF_MINUTES.get(k[2], 999999), TF_MINUTES.get(k[3], 999999)))
+            for key in group_keys:
+                _, _, entry_tf, exit_tf = key
+                variants = []
+                for code, label in (("ALL", "1분 원본"), ("FULL", "자기 시간봉"), ("HALF", "절반/운영")):
+                    detail = _latest_cycle_detail(by_code[code].get(key, []), code)
+                    variants.append({"code": code, "label": label, "detail": detail})
+                rows.append({"entry_tf": entry_tf, "exit_tf": exit_tf, "variants": variants})
+            groups_out.append({"group": group, "group_label": GROUP_LABEL.get(group, group), "rows": rows})
+        output.append({"symbol": symbol, "groups": groups_out})
+    return output
+
+
+def _coin_scalp_combinations(simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """현재 운영(HALF) 기준 코인 단타 5m/15m 매수×매도 4개 조합 성과."""
+    cycles = simulations.get("HALF", {}).get("cycles", [])
+    rows: list[dict[str, Any]] = []
+    for entry_tf in ("5m", "15m"):
+        for exit_tf in ("5m", "15m"):
+            matched = [c for c in cycles if c.get("group") == "SCALP" and c.get("entry_tf") == entry_tf and c.get("exit_tf") == exit_tf]
+            stats = _cycle_stats(matched)
+            values = [float(c.get("return_pct") or 0.0) for c in matched]
+            rows.append({
+                "entry_timeframe": entry_tf,
+                "exit_timeframe": exit_tf,
+                "has_results": bool(matched),
+                "result_count": len(matched),
+                "symbol_count": len({c.get("symbol") for c in matched if c.get("symbol")}),
+                "average_return_pct": stats.get("average_return_pct"),
+                "best_return_pct": stats.get("best_return_pct"),
+                "worst_return_pct": stats.get("worst_return_pct"),
+                "win_rate_pct": stats.get("win_rate_pct"),
+                "win_count": sum(1 for v in values if v > 0),
+                "loss_count": sum(1 for v in values if v <= 0),
+                "average_holding_minutes": stats.get("average_holding_minutes"),
+            })
+    return rows
+
 def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     signals = _load(market, period_key)
     variants: list[dict[str, Any]] = []
@@ -468,6 +547,8 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
             recent_cycles.append(_serialise_cycle(cycle, code))
     recent_cycles.sort(key=lambda c: c.get("exit_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     recent_cycles = recent_cycles[:36]
+    symbol_recent_comparison = _symbol_recent_comparison(market, signals, simulations)
+    scalp_combinations = _coin_scalp_combinations(simulations) if market == "COIN" else []
 
     return {
         "market": market,
@@ -478,6 +559,8 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "groups": group_rows,
         "timeframe_performance": timeframe_performance,
         "recent_cycles": recent_cycles,
+        "symbol_recent_comparison": symbol_recent_comparison,
+        "scalp_combinations": scalp_combinations,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "

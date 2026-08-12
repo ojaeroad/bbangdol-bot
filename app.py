@@ -79,7 +79,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v90-prediction-loading-fix")
+APP_VERSION  = os.getenv("APP_VERSION", "v91-admin-ui-speed-scalp-fix")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -2912,18 +2912,25 @@ def performance_cadence_fragment():
     </tr>{% endfor %}{% endfor %}</tbody>
   </table></div>
 
-  <h3 style="margin-top:22px">최근 실제 진입 타점 비교</h3>
-  <div class="small" style="margin-bottom:10px">1분 원본·자기 시간봉·절반/운영 방식이 실제로 어느 가격에서 분할진입했는지 최근 완료 사례를 보여줍니다.</div>
-  <div style="overflow-x:auto"><table class="cadence-table">
-    <thead><tr><th>방식</th><th>종목</th><th>포지션</th><th>매수→매도</th><th>실제 진입 타점</th><th>평균 진입가</th><th>매도가</th><th>수익률</th></tr></thead>
-    <tbody>{% for c in cadence_simulation.recent_cycles %}<tr>
-      <td>{% if c.code == 'ALL' %}1분 원본{% elif c.code == 'FULL' %}자기 시간봉{% else %}<b>절반/운영</b>{% endif %}</td>
-      <td><b>{{c.symbol}}</b></td><td>{{c.group_label}}</td><td>{{c.entry_tf}} → {{c.exit_tf}}</td>
-      <td>{% for e in c.entry_points %}<div>{{loop.index}}차 {{'%.6g'|format(e.price)}} · {{e.time.strftime('%m.%d %H:%M') if e.time else '-'}}</div>{% endfor %}</td>
-      <td>{{'%.6g'|format(c.entry_price)}}</td><td>{{'%.6g'|format(c.exit_price)}}</td>
-      <td class="{{'pos' if c.return_pct >= 0 else 'neg'}}"><b>{{'%+.2f'|format(c.return_pct)}}%</b></td>
-    </tr>{% endfor %}</tbody>
-  </table></div>
+  <h3 style="margin-top:22px">최근 실제 진입 타점 비교 · 종목별</h3>
+  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 같은 조합에서 1분 원본·자기 시간봉·절반/운영을 나란히 비교하며 아직 결과가 없는 방식은 빈칸(-)으로 둡니다.</div>
+  {% for item in cadence_simulation.symbol_recent_comparison %}
+  <details class="cadence-symbol-card" style="margin-bottom:12px">
+    <summary class="cadence-symbol-title" style="cursor:pointer;font-weight:900;font-size:18px">{{symbol_display(item.symbol, 'KRX' if category == 'KOREA_1Q' else '')}}</summary>
+    {% for g in item.groups %}
+    <div class="cadence-group-label" style="margin:14px 0 6px">{{g.group_label}}</div>
+    <div style="overflow-x:auto"><table class="cadence-table">
+      <thead><tr><th>매수→매도</th><th>1분 원본</th><th>자기 시간봉</th><th>절반/운영</th></tr></thead>
+      <tbody>{% for row in g.rows %}<tr><td><b>{{row.entry_tf}} → {{row.exit_tf}}</b></td>
+      {% for v in row.variants %}<td class="cadence-compare-cell">{% if v.detail %}
+        <div class="entry">{% for e in v.detail.entry_points %}{{loop.index}}차 {{'%.6g'|format(e.price)}} · {{e.time.strftime('%m.%d %H:%M') if e.time else '-'}}{% if not loop.last %}<br>{% endif %}{% endfor %}</div>
+        <div class="small">평균 {{'%.6g'|format(v.detail.entry_price)}} → 매도 {{'%.6g'|format(v.detail.exit_price)}}</div>
+        <div class="ret {{'pos' if v.detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(v.detail.return_pct)}}%</div>
+      {% else %}-{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
+    </table></div>
+    {% endfor %}
+  </details>
+  {% else %}<div class="empty-note">완료된 실제 진입 비교 데이터가 아직 없습니다.</div>{% endfor %}
 
   <h3 style="margin-top:22px">포지션별 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
@@ -2939,7 +2946,7 @@ def performance_cadence_fragment():
     <tbody>{% for row in item.rows %}<tr><td><b>{{row.timeframe}}</b></td><td>{{row.group_label}}</td><td>{{row.occurrence_count}}회</td><td>{{row.overall_average_text}}</td><td>{{row.recent_average_text}}</td><td>{{row.elapsed_text}}</td><td>{{row.readiness_label}}</td></tr>{% endfor %}</tbody></table></div>
   </div>{% else %}<div class="empty-note">발생 주기 데이터가 아직 없습니다.</div>{% endfor %}
 </div>
-        ''', cadence_simulation=cadence_simulation, occurrence_groups=occurrence_groups), 200
+        ''', cadence_simulation=cadence_simulation, occurrence_groups=occurrence_groups, category=category), 200
     except Exception as exc:
         log.exception("Cadence fragment failed")
         return f'<div class="analysis-note neg">알람 분석 로딩 실패: {type(exc).__name__}</div>', 500
@@ -2992,7 +2999,7 @@ def _cached_page_visit_summary() -> dict:
 
 _ADMIN_PAGE_CACHE = {}
 _ADMIN_PAGE_CACHE_LOCK = threading.Lock()
-_ADMIN_PAGE_CACHE_TTL = max(15, int(os.getenv("PERFORMANCE_ADMIN_CACHE_SECONDS", "60") or 60))
+_ADMIN_PAGE_CACHE_TTL = max(30, int(os.getenv("PERFORMANCE_ADMIN_CACHE_SECONDS", "300") or 300))
 
 
 def admin_page_cache(view_func):
@@ -3009,7 +3016,7 @@ def admin_page_cache(view_func):
         if status == 200:
             with _ADMIN_PAGE_CACHE_LOCK:
                 _ADMIN_PAGE_CACHE[cache_key] = (current, response)
-                while len(_ADMIN_PAGE_CACHE) > 4:
+                while len(_ADMIN_PAGE_CACHE) > 12:
                     oldest = min(_ADMIN_PAGE_CACHE, key=lambda k: _ADMIN_PAGE_CACHE[k][0])
                     _ADMIN_PAGE_CACHE.pop(oldest, None)
         return response
@@ -4808,10 +4815,8 @@ def performance_dashboard():
 
             selected = dict(selected)
             selected["symbols"] = enriched_symbols
-            if selected_category == "COIN":
-                coin_scalp_combinations = _coin_scalp_combination_stats(
-                    enriched_symbols, period_key
-                )
+            # v91: 코인 단타 4개 조합은 무거운 메인 분석과 분리해
+            # 해당 메뉴를 열 때 signal_cadence_simulator에서 지연 계산한다.
 
             result_symbols = [
                 item
@@ -5056,15 +5061,15 @@ summary{cursor:pointer;font-weight:bold}
 .group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#141416)!important;box-shadow:0 0 14px rgba(255,200,87,.08)!important}.life-metric{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#151517)!important}.life-metric .title{color:var(--yellow)!important}.scalp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.scalp-card{background:#151517;border:1px solid #35353a;border-radius:14px;padding:15px}.scalp-card h3{margin:0 0 12px;color:var(--blue);font-size:19px}.scalp-main{font-size:27px;font-weight:900;margin:7px 0}.scalp-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.scalp-stat{background:#101012;border-radius:9px;padding:9px}.scalp-stat small{display:block;color:#aaa;margin-bottom:5px}.scalp-empty{min-height:150px;display:flex;align-items:center;justify-content:center;color:#777}@media(max-width:1100px){.scalp-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.scalp-grid{grid-template-columns:1fr}}
 
 /* v47 관리자 목차: 기존 관리자 전용 기능은 삭제하지 않고 빠른 이동만 추가 */
-.admin-menu-button{display:none;position:sticky;top:8px;z-index:95;width:100%;border:1px solid #56c5fa;background:#12384b;color:#fff;border-radius:11px;padding:11px;font-weight:900;margin-bottom:10px}.admin-side{position:fixed;left:12px;top:150px;width:210px;max-height:calc(100vh - 170px);overflow:auto;background:#15171b;border:1px solid #353943;border-radius:15px;padding:11px;z-index:80}.admin-side-title{color:var(--blue);font-size:18px;font-weight:950;padding:7px 8px 11px}.admin-nav{display:grid;gap:5px}.admin-nav a{display:block;border:0;border-radius:9px;background:transparent;color:#d8dbe1;text-align:left;padding:10px;font-weight:800;cursor:pointer;text-decoration:none}.admin-nav a:hover,.admin-nav a:focus{background:#113b50;color:#fff}.admin-nav a.life{color:var(--yellow)}.admin-nav .admin-only{border-top:1px solid #343840;margin-top:5px;padding-top:12px;color:#ffbf69}.admin-backdrop{display:none}body.admin-menu-ready{padding-left:246px}.admin-target{scroll-margin-top:16px}
+.admin-menu-button{display:none;position:sticky;top:8px;z-index:95;width:100%;border:1px solid #56c5fa;background:#12384b;color:#fff;border-radius:11px;padding:11px;font-weight:900;margin-bottom:10px}.admin-side{position:fixed;left:12px;top:150px;width:210px;max-height:calc(100vh - 170px);overflow:auto;background:#15171b;border:1px solid #353943;border-radius:15px;padding:11px;z-index:80}.admin-side-title{color:var(--blue);font-size:18px;font-weight:950;padding:7px 8px 11px}.admin-nav{display:grid;gap:5px}.admin-nav a{display:block;border:0;border-radius:9px;background:transparent;color:#d8dbe1;text-align:left;padding:10px;font-weight:800;cursor:pointer;text-decoration:none}.admin-nav a:hover,.admin-nav a:focus{background:#113b50;color:#fff}.admin-nav a.life{color:var(--yellow)}.admin-nav .admin-only{border-top:1px solid #343840;margin-top:5px;padding-top:12px;color:#ffbf69}.admin-nav .top-link{border-top:1px solid #343840;margin-top:8px;color:#8ed7ff}.cadence-compare-cell{min-width:220px;line-height:1.45}.cadence-compare-cell .ret{font-size:16px;font-weight:900}.cadence-compare-cell .entry{font-size:12px;color:#ddd}.cadence-group-label{color:var(--yellow);font-weight:900}.admin-backdrop{display:none}body.admin-menu-ready{padding-left:246px}.admin-target{scroll-margin-top:16px}
 @media(max-width:1050px){body.admin-menu-ready{padding-left:12px}.admin-side{display:none;left:12px;right:12px;top:62px;width:auto;max-height:calc(100vh - 80px);box-shadow:0 18px 55px rgba(0,0,0,.58)}.admin-side.open{display:block}.admin-menu-button{display:block}.admin-backdrop.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:70}}
 </style>
 </head>
-<body class="admin-menu-ready">
+<body class="admin-menu-ready" id="admin-top">
 <button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리센터 메뉴</button>
 <div class="admin-backdrop" id="adminBackdrop"></div>
 <aside class="admin-side" id="adminSide"><div class="admin-side-title">관리센터 메뉴</div><nav class="admin-nav" id="adminNav">
-<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a href="#admin-cadence">알람 분석</a><a href="#admin-prediction">상위시간봉 예측 연구</a><a class="admin-only" href="{% if selected_category == 'COIN' %}#admin-scalp{% else %}/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp{% endif %}">관리자 전용 분석</a>
+<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a href="#admin-cadence">알람 분석</a><a href="#admin-prediction">상위시간봉 예측 연구</a>{% if selected_category == 'COIN' %}<a href="#admin-scalp">코인 단타 4개 조합</a>{% endif %}<a class="admin-only" href="#admin-only-analysis">관리자 전용 분석</a><a class="top-link" href="#admin-top">↑ 맨 위로</a>
 </nav></aside>
 <h1>성과운영센터 · 관리센터</h1>
 <div class="toplinks">
@@ -5327,32 +5332,11 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </a>
 {% endfor %}
 </div></div></details>
+<div id="admin-only-analysis" class="admin-target"></div>
 {% if selected_category == 'COIN' %}
-<details class="card collapsible-block" open>
-<summary id="admin-scalp" class="section-title">코인 단타 4개 조합 성과</summary>
-<div class="collapsible-content">
-<div class="small">단타 매수 5m·15m와 단타 종료 5m·15m 조합만 별도로 집계합니다. 완료 사이클의 실제 종료 결과 기준입니다.</div>
-<div class="scalp-grid">
-{% for combo in coin_scalp_combinations %}
-<div class="scalp-card">
-<h3>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}}</h3>
-{% if combo.has_results %}
-<div class="scalp-main {{'pos' if combo.average_return_pct >= 0 else 'neg'}}">평균 {{'%+.2f'|format(combo.average_return_pct)}}%</div>
-<div class="small">{{combo.result_count}}사이클 · {{combo.symbol_count}}종목</div>
-<div class="scalp-stats">
-<div class="scalp-stat"><small>승률</small><b class="{{'pos' if combo.win_rate_pct >= 50 else 'neg'}}">{{'%.1f'|format(combo.win_rate_pct)}}%</b></div>
-<div class="scalp-stat"><small>승·패</small><b>{{combo.win_count}}승 {{combo.loss_count}}패</b></div>
-<div class="scalp-stat"><small>최고 수익률</small><b class="{{'pos' if combo.best_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(combo.best_return_pct)}}%</b></div>
-<div class="scalp-stat"><small>최저 수익률</small><b class="{{'pos' if combo.worst_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(combo.worst_return_pct)}}%</b></div>
-<div class="scalp-stat" style="grid-column:1/-1"><small>평균 보유기간</small><b>{% if combo.average_holding_minutes is not none %}{{format_minutes_compact(combo.average_holding_minutes)}}{% else %}-{% endif %}</b></div>
-</div>
-{% else %}
-<div class="scalp-empty">완료 결과 대기</div>
-{% endif %}
-</div>
-{% endfor %}
-</div>
-</div>
+<details id="admin-scalp" class="card collapsible-block">
+<summary class="section-title">코인 단타 4개 조합 성과</summary>
+<div id="adminScalpBody" data-scalp-url="/performance/scalp-fragment?category=COIN&period={{period_key}}" class="collapsible-content"><div class="analysis-note">단타 5m/15m 운영 결과는 이 메뉴를 열 때만 계산합니다.</div></div>
 </details>
 {% endif %}
 <details id="admin-cadence" class="card collapsible-block">
@@ -5447,12 +5431,25 @@ class="{{'active-category' if category.category_key == selected_category else ''
  document.querySelectorAll('a[href="#admin-cadence"]').forEach(a=>a.addEventListener('click',()=>{if(cadence){cadence.open=true;setTimeout(load,0);}}));
 })();
 (()=>{
+ const panel=document.getElementById('admin-scalp'), body=document.getElementById('adminScalpBody');
+ async function loadScalp(){if(!body||body.dataset.loaded==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="analysis-note">코인 단타 4개 조합을 계산 중입니다…</div>';try{const r=await fetch(body.dataset.scalpUrl,{credentials:'same-origin'});body.innerHTML=await r.text();if(r.ok)body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="analysis-note neg">코인 단타 조합 성과를 불러오지 못했습니다. 다시 열어주세요.</div>';}finally{body.dataset.loading='0';}}
+ if(panel)panel.addEventListener('toggle',()=>{if(panel.open)loadScalp();});
+ document.querySelectorAll('a[href="#admin-scalp"]').forEach(a=>a.addEventListener('click',()=>{if(panel){panel.open=true;setTimeout(loadScalp,0);}}));
+})();
+(()=>{
  const panel=document.getElementById('admin-prediction'), body=document.getElementById('adminPredictionBody');
  async function loadPrediction(){if(!body||body.dataset.loaded==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="analysis-note">상위 시간봉 예측 연구 데이터를 계산 중입니다…</div>';try{const r=await fetch(body.dataset.predictionUrl,{credentials:'same-origin'});body.innerHTML=await r.text();if(r.ok)body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="analysis-note neg">예측 연구 데이터를 불러오지 못했습니다. 다시 열어주세요.</div>';}finally{body.dataset.loading='0';}}
  if(panel)panel.addEventListener('toggle',()=>{if(panel.open)loadPrediction();});
  document.querySelectorAll('a[href="#admin-prediction"]').forEach(a=>a.addEventListener('click',()=>{if(panel){panel.open=true;setTimeout(loadPrediction,0);}}));
  // v83: 화면 진입 후 브라우저가 한가할 때 미리 불러와 메뉴 클릭 체감 대기를 줄인다.
  if(window.requestIdleCallback){requestIdleCallback(()=>loadPrediction(),{timeout:2500});}else{setTimeout(loadPrediction,1400);}
+})();
+// v91: 시장 전환 체감 속도 개선. 현재 화면이 안정된 뒤 다른 두 시장 HTML을 순차적으로 미리 계산해 서버 페이지 캐시에 올린다.
+(()=>{
+ const current='{{selected_category}}', period='{{period_key}}';
+ const targets=['KOREA_1Q','US_1Q','COIN'].filter(v=>v!==current);
+ async function prewarm(){for(const category of targets){try{await fetch('/performance/dashboard?category='+encodeURIComponent(category)+'&period='+encodeURIComponent(period),{credentials:'same-origin',cache:'no-store'});}catch(e){}}}
+ if(window.requestIdleCallback){requestIdleCallback(()=>prewarm(),{timeout:5000});}else{setTimeout(prewarm,2200);}
 })();
 </script>
 </body>
@@ -5623,6 +5620,43 @@ summary{cursor:pointer;font-weight:bold}
 
 
 
+@app.get("/performance/scalp-fragment")
+@member_required
+def performance_scalp_fragment():
+    try:
+        period_key = request.args.get("period", "all").strip().lower()
+        if period_key not in {"today", "7d", "30d", "all"}:
+            period_key = "all"
+        simulation = _cached_simulate_cadence("COIN", period_key)
+        rows = simulation.get("scalp_combinations") or []
+        return render_template_string(r'''
+<div class="scalp-lazy-wrap">
+  <div class="small">현재 운영 기준(절반/운영 주기)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
+  <div class="scalp-grid">
+  {% for combo in rows %}
+    <div class="scalp-card">
+      <h3>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}}</h3>
+      {% if combo.has_results %}
+      <div class="scalp-main {{'pos' if combo.average_return_pct >= 0 else 'neg'}}">평균 {{'%+.2f'|format(combo.average_return_pct)}}%</div>
+      <div class="small">{{combo.result_count}}사이클 · {{combo.symbol_count}}종목</div>
+      <div class="scalp-stats">
+        <div class="scalp-stat"><small>승률</small><b class="{{'pos' if combo.win_rate_pct >= 50 else 'neg'}}">{{'%.1f'|format(combo.win_rate_pct)}}%</b></div>
+        <div class="scalp-stat"><small>승·패</small><b>{{combo.win_count}}승 {{combo.loss_count}}패</b></div>
+        <div class="scalp-stat"><small>최고 수익률</small><b class="{{'pos' if combo.best_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(combo.best_return_pct)}}%</b></div>
+        <div class="scalp-stat"><small>최저 수익률</small><b class="{{'pos' if combo.worst_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(combo.worst_return_pct)}}%</b></div>
+        <div class="scalp-stat" style="grid-column:1/-1"><small>평균 보유기간</small><b>{% if combo.average_holding_minutes is not none %}{{format_minutes_compact(combo.average_holding_minutes)}}{% else %}-{% endif %}</b></div>
+      </div>
+      {% else %}<div class="scalp-empty">완료 결과 대기</div>{% endif %}
+    </div>
+  {% endfor %}
+  </div>
+</div>
+        ''', rows=rows), 200
+    except Exception as exc:
+        log.exception("Scalp fragment failed")
+        return f'<div class="analysis-note neg">코인 단타 4개 조합 로딩 실패: {type(exc).__name__}</div>', 500
+
+
 @app.get("/performance/prediction-fragment")
 @member_required
 def performance_prediction_fragment():
@@ -5664,7 +5698,7 @@ def performance_prediction_fragment():
   <div style="overflow-x:auto"><table class="cadence-table">
     <thead><tr><th>종목</th><th>전환</th><th>신호가</th><th>현재봉</th><th>상위봉 당시 상태</th><th>아랫꼬리</th><th>결과</th></tr></thead>
     <tbody>{% for r in data.recent[:80] %}<tr>
-      <td><b>{{r.symbol}}</b><div class="small">{{r.snapshot_at[:16].replace('T',' ') if r.snapshot_at else '-'}}</div></td><td>{{r.source_timeframe}}→{{r.target_timeframe}}</td><td>{{r.signal_price if r.signal_price is not none else '-'}}</td>
+      <td><b>{{symbol_display(r.symbol, 'KRX' if category == 'KOREA_1Q' else '')}}</b><div class="small">{{r.snapshot_at[:16].replace('T',' ') if r.snapshot_at else '-'}}</div></td><td>{{r.source_timeframe}}→{{r.target_timeframe}}</td><td>{{r.signal_price if r.signal_price is not none else '-'}}</td>
       <td class="small">
         RSI {% if r.source_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.source_metrics.get('rsi_value')|float)}}{% else %}{{r.source_metrics.get('rsi_dir','NA')}}{% endif %}
         {% if r.source_metrics.get('rsi_above_50') is not none %}· 50선 {{'위' if r.source_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>
@@ -5686,7 +5720,7 @@ def performance_prediction_fragment():
   <div class="analysis-note" style="margin-top:14px">{{data.window_note}}</div>
   {% endif %}
 </div>
-        ''', data=data), 200
+        ''', data=data, category=category), 200
     except Exception as exc:
         log.exception("Prediction fragment failed")
         return f'<div class="analysis-note neg">상위 시간봉 예측 연구 로딩 실패: {type(exc).__name__}</div>', 500
