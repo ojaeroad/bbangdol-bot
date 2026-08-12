@@ -458,6 +458,42 @@ def _coin_scalp_combinations(simulations: dict[str, dict[str, Any]]) -> list[dic
             })
     return rows
 
+
+
+def _coin_scalp_details(simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """운영(HALF) 기준 단타 4개 조합의 종목별/사이클별 상세 데이터."""
+    cycles = simulations.get("HALF", {}).get("cycles", [])
+    output: list[dict[str, Any]] = []
+    for entry_tf in ("5m", "15m"):
+        for exit_tf in ("5m", "15m"):
+            matched = [c for c in cycles if c.get("group") == "SCALP" and c.get("entry_tf") == entry_tf and c.get("exit_tf") == exit_tf]
+            by_symbol: dict[str, list[dict[str, Any]]] = {}
+            for cycle in matched:
+                symbol = str(cycle.get("symbol") or "")
+                if symbol:
+                    by_symbol.setdefault(symbol, []).append(cycle)
+            symbols_out = []
+            for symbol in sorted(by_symbol):
+                items = sorted(by_symbol[symbol], key=lambda c: c.get("exit_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+                stats = _cycle_stats(items)
+                symbols_out.append({
+                    "symbol": symbol,
+                    "result_count": len(items),
+                    "average_return_pct": stats.get("average_return_pct"),
+                    "win_rate_pct": stats.get("win_rate_pct"),
+                    "best_return_pct": stats.get("best_return_pct"),
+                    "worst_return_pct": stats.get("worst_return_pct"),
+                    "average_holding_minutes": stats.get("average_holding_minutes"),
+                    "cycles": [_serialise_cycle(c, "HALF") for c in items],
+                })
+            output.append({
+                "entry_timeframe": entry_tf,
+                "exit_timeframe": exit_tf,
+                "symbols": symbols_out,
+                "result_count": len(matched),
+            })
+    return output
+
 def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     signals = _load(market, period_key)
     variants: list[dict[str, Any]] = []
@@ -549,6 +585,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     recent_cycles = recent_cycles[:36]
     symbol_recent_comparison = _symbol_recent_comparison(market, signals, simulations)
     scalp_combinations = _coin_scalp_combinations(simulations) if market == "COIN" else []
+    scalp_details = _coin_scalp_details(simulations) if market == "COIN" else []
 
     return {
         "market": market,
@@ -561,6 +598,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "recent_cycles": recent_cycles,
         "symbol_recent_comparison": symbol_recent_comparison,
         "scalp_combinations": scalp_combinations,
+        "scalp_details": scalp_details,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "
