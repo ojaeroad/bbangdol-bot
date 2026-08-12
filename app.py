@@ -1,4 +1,4 @@
-# V81_INDICATOR_CADENCE_SCOPE_AND_BUY_COUNTER: 주요지표 cadence 제외 + 집중 카운터 제외 + 👓 집중
+# V82_FOCUS_ZERO_AND_SELL_VALID_RESTORE: 주요지표 분리 유지 + 매수/매도 집중 카운터 제외 + 👓 집중 + 매도 유효 이모지 복구
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
@@ -328,15 +328,20 @@ def _buy_valid_stage_emoji(ordinal: int) -> str:
     stage=max(1,min(int(ordinal or 1),3))
     return {1:"❗", 2:"‼️", 3:"🏹"}[stage]
 
+def _sell_valid_stage_emoji(ordinal: int) -> str:
+    # 기존 매도 유효 단계 이모지 복구: 1/3 ✅ → 2/3 ⚠️ → 3/3 🚨
+    stage=max(1,min(int(ordinal or 1),3))
+    return {1:"✅", 2:"⚠️", 3:"🚨"}[stage]
+
 def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     """시간봉과 매수·매도 목적이 한눈에 구분되도록 문구를 정리한다."""
     labels = {
-        # v74: 돈 이모지보다 '지금 이 종목에 집중' 의미가 즉시 들어오는 표적 사용
+        # v82: 집중은 관찰 시작이므로 매수/매도 모두 카운터를 붙이지 않는다.
         "FOCUS": "👓 매수 집중",
         "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 매수 유효 {ordinal}/3",
-        "EXIT": "👓 매도 집중 1/3",
-        "EXIT_RECHECK": f"🚨 매도 유효 {ordinal}/3",
-        "EXIT_FINAL": f"🚨 매도 유효 {ordinal}/3",
+        "EXIT": "👓 매도 집중",
+        "EXIT_RECHECK": f"{_sell_valid_stage_emoji(ordinal)} 매도 유효 {ordinal}/3",
+        "EXIT_FINAL": f"{_sell_valid_stage_emoji(ordinal)} 매도 유효 {ordinal}/3",
     }
     phase_label = labels.get(phase, "")
 
@@ -352,8 +357,12 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
                 " · 🟣 매수 유효 1/3", " · 🟣🟣 매수 유효 2/3", " · 🟣🟣🟣 매수 유효 3/3",
                 " · ⚡ 매수 유효 1/3", " · ⚡⚡ 매수 유효 2/3", " · ⚡⚡⚡ 매수 유효 3/3",
                 " · ❗ 매수 유효 1/3", " · ‼️ 매수 유효 2/3", " · 🏹 매수 유효 3/3",
-                " · 💸 매도 집중 1/3", " · 🎯 매도 집중 1/3", " · 👓 매도 집중 1/3",
-                " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
+                " · 💸 매도 집중", " · 💸 매도 집중 1/3",
+                " · 🎯 매도 집중", " · 🎯 매도 집중 1/3",
+                " · 👓 매도 집중", " · 👓 매도 집중 1/3",
+                " · ✅ 매도 유효 1/3", " · ✅ 매도 유효 2/3", " · ✅ 매도 유효 3/3",
+                " · ⚠️ 매도 유효 1/3", " · ⚠️ 매도 유효 2/3", " · ⚠️ 매도 유효 3/3",
+                " · 🚨 매도 유효 1/3", " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
             ):
                 normalized = normalized.replace(old_label, "")
             lines[i] = f"{normalized}\n{phase_label}"
@@ -460,7 +469,8 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
     정해진 cadence 경계 전에는 전부 차단하고, 다음 경계 이후 처음 들어온
     신호를 '매수 유효 1/3 → 2/3 → 3/3' 순서로 전송한다.
 
-    HIGH: 첫 신호 1/3 즉시, 이후 cadence 경계마다 2/3, 3/3까지만 전송한다.
+    HIGH: 첫 신호는 즉시 '매도 집중'(카운터 제외). 이후 cadence 경계마다
+    '매도 유효 1/3 → 2/3 → 3/3' 순서로 전송한다.
     가격 변화 및 Pine의 매분 재호출은 새 집중으로 보지 않는다.
     """
     if not TELEGRAM_CADENCE_ENABLED:
@@ -557,14 +567,14 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                 reason = "low_focus" if phase == "FOCUS" else f"low_valid_{episode_count}_of_3"
                 return True, _decorate_cadence_message(msg, phase, episode_count), reason
 
-            # HIGH: 첫 매도 집중 + cadence마다 최대 3회.
+            # HIGH v82: 집중은 카운터 0. 이후 유효 1/3 → 2/3 → 3/3.
             if prev is None:
-                episode_count = 1
+                episode_count = 0
                 phase = "EXIT"
                 should_send = True
                 next_due_slot = current_slot + 1
             else:
-                episode_count = int(prev.get("episode_count", 1) or 1)
+                episode_count = int(prev.get("episode_count", 0) or 0)
                 next_due_slot = int(prev.get("next_due_slot", current_slot + 1))
                 if episode_count >= 3:
                     phase = "SUPPRESS"
@@ -591,7 +601,8 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
             if not should_send:
                 reason = "high_max_3_reached" if episode_count >= 3 else f"waiting_boundary_{cadence}m"
                 return False, msg, reason
-            return True, _decorate_cadence_message(msg, phase, episode_count), f"high_{episode_count}_of_3"
+            reason = "high_focus" if phase == "EXIT" else f"high_valid_{episode_count}_of_3"
+            return True, _decorate_cadence_message(msg, phase, episode_count), reason
         finally:
             close_state()
 
