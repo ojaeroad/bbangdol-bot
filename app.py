@@ -1,4 +1,4 @@
-# V82_FOCUS_ZERO_AND_SELL_VALID_RESTORE: 주요지표 분리 유지 + 매수/매도 집중 카운터 제외 + 👓 집중 + 매도 유효 이모지 복구
+# V84_PREDICTION_MARKET_AND_SAME_STAGE: 상위시간봉 시장분리/캐시 + 매수·매도 집중 무카운트 + 동일 유효 단계 이모지
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
 # app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
@@ -79,7 +79,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v76-cadence-outcome-prediction-admin")
+APP_VERSION  = os.getenv("APP_VERSION", "v84-prediction-market-filter-same-stage")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -326,20 +326,20 @@ def _normalize_signal_line(line: str) -> str:
 
 def _buy_valid_stage_emoji(ordinal: int) -> str:
     stage=max(1,min(int(ordinal or 1),3))
-    return {1:"❗", 2:"‼️", 3:"🏹"}[stage]
+    return {1:"❗", 2:"‼️", 3:"❗❗❗"}[stage]
 
 def _sell_valid_stage_emoji(ordinal: int) -> str:
-    # 기존 매도 유효 단계 이모지 복구: 1/3 ✅ → 2/3 ⚠️ → 3/3 🚨
-    stage=max(1,min(int(ordinal or 1),3))
-    return {1:"✅", 2:"⚠️", 3:"🚨"}[stage]
+    # v84 고정 규칙: 매도도 매수와 동일한 유효 단계 이모지를 사용한다.
+    # 집중은 ✍🏻 단독(카운터 제외), 이후 ❗ 1/3 → ‼️ 2/3 → ❗❗❗ 3/3.
+    return _buy_valid_stage_emoji(ordinal)
 
 def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     """시간봉과 매수·매도 목적이 한눈에 구분되도록 문구를 정리한다."""
     labels = {
         # v82: 집중은 관찰 시작이므로 매수/매도 모두 카운터를 붙이지 않는다.
-        "FOCUS": "👓 매수 집중",
+        "FOCUS": "✍🏻 매수 집중",
         "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 매수 유효 {ordinal}/3",
-        "EXIT": "👓 매도 집중",
+        "EXIT": "✍🏻 매도 집중",
         "EXIT_RECHECK": f"{_sell_valid_stage_emoji(ordinal)} 매도 유효 {ordinal}/3",
         "EXIT_FINAL": f"{_sell_valid_stage_emoji(ordinal)} 매도 유효 {ordinal}/3",
     }
@@ -352,14 +352,14 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
             for old_label in (
                 " · 집중", " · 유지 확인", " · 🚨 신규 집중", " · 🔁 신호 유지",
                 " · ✅ 종료 신호 1/3", " · ⚠️ 종료 재확인 2/3", " · 🚨 최종 종료 알림 3/3",
-                " · 💰 매수 집중", " · 🎯 매수 집중", " · 🎯 매수 집중 1/3", " · 👓 매수 집중", " · 👓 매수 집중 1/3",
+                " · 💰 매수 집중", " · 🎯 매수 집중", " · 🎯 매수 집중 1/3", " · ✍🏻 매수 집중", " · ✍🏻 매수 집중 1/3",
                 " · ✅ 매수 유효", " · ✅ 매수 유효 1/3", " · ✅ 매수 유효 2/3", " · ✅ 매수 유효 3/3",
                 " · 🟣 매수 유효 1/3", " · 🟣🟣 매수 유효 2/3", " · 🟣🟣🟣 매수 유효 3/3",
                 " · ⚡ 매수 유효 1/3", " · ⚡⚡ 매수 유효 2/3", " · ⚡⚡⚡ 매수 유효 3/3",
                 " · ❗ 매수 유효 1/3", " · ‼️ 매수 유효 2/3", " · 🏹 매수 유효 3/3",
                 " · 💸 매도 집중", " · 💸 매도 집중 1/3",
                 " · 🎯 매도 집중", " · 🎯 매도 집중 1/3",
-                " · 👓 매도 집중", " · 👓 매도 집중 1/3",
+                " · ✍🏻 매도 집중", " · ✍🏻 매도 집중 1/3",
                 " · ✅ 매도 유효 1/3", " · ✅ 매도 유효 2/3", " · ✅ 매도 유효 3/3",
                 " · ⚠️ 매도 유효 1/3", " · ⚠️ 매도 유효 2/3", " · ⚠️ 매도 유효 3/3",
                 " · 🚨 매도 유효 1/3", " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
@@ -2823,6 +2823,14 @@ def _cached_simulate_cadence(market: str, period_key: str):
     period_key = str(period_key).lower()
     return _cached_calculation(("simulate_cadence", market, period_key), lambda: simulate_cadence(market, period_key))
 
+
+
+def _cached_prediction_research_summary(category_key: str, limit: int = 350):
+    category_key = str(category_key or "COIN").upper()
+    return _cached_calculation(
+        ("prediction_research", category_key, int(limit)),
+        lambda: prediction_research_summary(limit, category_key),
+    )
 
 
 def _cadence_occurrence_groups(market_analysis: dict, market: str) -> list[dict]:
@@ -5354,7 +5362,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 
 <details id="admin-prediction" class="card collapsible-block">
 <summary class="section-title">상위 시간봉 저점 예측 연구</summary>
-<div id="adminPredictionBody" data-prediction-url="/performance/prediction-fragment" class="collapsible-content"><div class="analysis-note">1시간→4시간 등 상위 시간봉 예측 연구 데이터는 이 메뉴를 열 때만 계산합니다.</div></div>
+<div id="adminPredictionBody" data-prediction-url="/performance/prediction-fragment?category={{selected_category}}" class="collapsible-content"><div class="analysis-note">1시간→4시간 등 상위 시간봉 예측 연구 데이터는 이 메뉴를 열 때만 계산합니다.</div></div>
 </details>
 
 {% else %}
@@ -5443,6 +5451,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
  async function loadPrediction(){if(!body||body.dataset.loaded==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="analysis-note">상위 시간봉 예측 연구 데이터를 계산 중입니다…</div>';try{const r=await fetch(body.dataset.predictionUrl,{credentials:'same-origin'});body.innerHTML=await r.text();if(r.ok)body.dataset.loaded='1';}catch(e){body.innerHTML='<div class="analysis-note neg">예측 연구 데이터를 불러오지 못했습니다. 다시 열어주세요.</div>';}finally{body.dataset.loading='0';}}
  if(panel)panel.addEventListener('toggle',()=>{if(panel.open)loadPrediction();});
  document.querySelectorAll('a[href="#admin-prediction"]').forEach(a=>a.addEventListener('click',()=>{if(panel){panel.open=true;setTimeout(loadPrediction,0);}}));
+ // v83: 화면 진입 후 브라우저가 한가할 때 미리 불러와 메뉴 클릭 체감 대기를 줄인다.
+ if(window.requestIdleCallback){requestIdleCallback(()=>loadPrediction(),{timeout:2500});}else{setTimeout(loadPrediction,1400);}
 })();
 </script>
 </body>
@@ -5617,7 +5627,10 @@ summary{cursor:pointer;font-weight:bold}
 @member_required
 def performance_prediction_fragment():
     try:
-        data = prediction_research_summary(500)
+        category = request.args.get("category", "COIN").strip().upper()
+        if category not in {"COIN", "KOREA_1Q", "US_1Q"}:
+            category = "COIN"
+        data = _cached_prediction_research_summary(category, 350)
         return render_template_string(r'''
 <div class="prediction-research-wrap">
   <div class="analysis-note" style="margin-bottom:14px">
@@ -5675,7 +5688,10 @@ def performance_prediction_research():
             limit = int(request.args.get("limit", "100"))
         except ValueError:
             limit = 100
-        return jsonify(prediction_research_summary(limit)), 200
+        category = request.args.get("category", "").strip().upper()
+        if category not in {"COIN", "KOREA_1Q", "US_1Q"}:
+            category = ""
+        return jsonify(prediction_research_summary(limit, category or None)), 200
     except Exception as e:
         log.exception("Prediction research summary failed")
         return jsonify({"ok": False, "error": str(e)}), 500

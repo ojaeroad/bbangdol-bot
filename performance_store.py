@@ -406,33 +406,73 @@ def _prediction_signature(metrics: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
+def _prediction_market_where(category_key: str | None) -> str:
+    """Prediction research market filter.
+
+    The snapshot table predates an explicit market column, so classify with the
+    same stable signals used by the performance UI: exchange first, then symbol.
+    Returned SQL is static (no user input interpolation).
+    """
+    category = str(category_key or "").strip().upper()
+    exch = "UPPER(COALESCE(exchange,''))"
+    raw = "UPPER(COALESCE(raw_exchange,''))"
+    sym = "UPPER(COALESCE(symbol,''))"
+    coin = f"(({exch} ~ '(BINANCE|BYBIT|OKX|BITGET|UPBIT|BITHUMB|COINBASE|KRAKEN)') OR ({raw} ~ '(BINANCE|BYBIT|OKX|BITGET|UPBIT|BITHUMB|COINBASE|KRAKEN)') OR ({sym} LIKE '%USDT%' OR {sym} LIKE '%USDC%' OR {sym} LIKE '%.P'))"
+    korea = f"(({exch} ~ '(KRX|KOSPI|KOSDAQ|KONEX|KOREA)') OR ({raw} ~ '(KRX|KOSPI|KOSDAQ|KONEX|KOREA)') OR ({sym} ~ '^[0-9]{{6}}$'))"
+    us = f"(({exch} ~ '(NASDAQ|NYSE|AMEX|ARCA|BATS|CBOE|OTC|USA|US)') OR ({raw} ~ '(NASDAQ|NYSE|AMEX|ARCA|BATS|CBOE|OTC|USA|US)') OR (NOT {coin} AND NOT {korea} AND {sym} ~ '^[A-Z][A-Z0-9.\\-]{{0,14}}$'))"
+    if category == "COIN":
+        return coin
+    if category == "KOREA_1Q":
+        return korea
+    if category == "US_1Q":
+        return us
+    return "TRUE"
+
+
+def prediction_research_summary(limit: int = 100, category_key: str | None = None) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit), 1000))
+    category = str(category_key or "").strip().upper()
+    if category not in {"COIN", "KOREA_1Q", "US_1Q"}:
+        category = ""
     if not PERFORMANCE_DATABASE_URL:
-        return {"ok": False, "database": "not_configured", "count": 0, "pairs": [], "recent": [], "patterns": []}
+        return {"ok": False, "database": "not_configured", "count": 0, "pairs": [], "recent": [], "patterns": [], "category_key": category}
+
+    where_sql = _prediction_market_where(category)
+    target_minutes_sql = """CASE target_timeframe
+        WHEN '5m' THEN 5 WHEN '15m' THEN 15 WHEN '30m' THEN 30
+        WHEN '1h' THEN 60 WHEN '2h' THEN 120 WHEN '4h' THEN 240
+        WHEN '6h' THEN 360 WHEN '12h' THEN 720 WHEN '1d' THEN 1440
+        WHEN '3d' THEN 4320 WHEN '1w' THEN 10080 WHEN '1m' THEN 43200 WHEN '1M' THEN 43200
+        ELSE NULL END"""
+
     ensure_schema()
     with _connect() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM performance_prediction_snapshots").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM performance_prediction_snapshots WHERE {where_sql}").fetchone()[0]
         pairs_raw = conn.execute(
-            """
+            f"""
             SELECT source_timeframe, target_timeframe, COUNT(*), COUNT(first_target_at),
                    AVG(lead_minutes) FILTER (WHERE first_target_at IS NOT NULL),
                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lead_minutes)
-                     FILTER (WHERE first_target_at IS NOT NULL)
+                     FILTER (WHERE first_target_at IS NOT NULL),
+                   COUNT(*) FILTER (WHERE first_target_at IS NOT NULL AND lead_minutes <= ({target_minutes_sql})),
+                   COUNT(*) FILTER (WHERE first_target_at IS NOT NULL AND lead_minutes <= 2 * ({target_minutes_sql}))
             FROM performance_prediction_snapshots
+            WHERE {where_sql}
             GROUP BY source_timeframe, target_timeframe
             ORDER BY
               CASE source_timeframe
-                WHEN '30m' THEN 1 WHEN '1h' THEN 2 WHEN '4h' THEN 3
-                WHEN '1d' THEN 4 WHEN '3d' THEN 5 WHEN '1w' THEN 6 ELSE 99 END
+                WHEN '5m' THEN 1 WHEN '15m' THEN 2 WHEN '30m' THEN 3 WHEN '1h' THEN 4
+                WHEN '4h' THEN 5 WHEN '6h' THEN 6 WHEN '12h' THEN 7 WHEN '1d' THEN 8
+                WHEN '3d' THEN 9 WHEN '1w' THEN 10 ELSE 99 END
             """
         ).fetchall()
         recent_raw = conn.execute(
-            """
+            f"""
             SELECT id, exchange, symbol, source_timeframe, target_timeframe,
                    signal_price, snapshot_at, source_metrics, target_metrics,
                    first_target_at, lead_minutes
             FROM performance_prediction_snapshots
+            WHERE {where_sql}
             ORDER BY snapshot_at DESC, id DESC
             LIMIT %s
             """,
@@ -444,10 +484,8 @@ def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
         target_minutes = _tf_minutes_for_prediction(r[1])
         snapshots = int(r[2])
         matched = int(r[3])
-        pair_recent = [x for x in recent_raw if x[3] == r[0] and x[4] == r[1]]
-        strict = sum(1 for x in pair_recent if x[10] is not None and target_minutes and int(x[10]) <= target_minutes)
-        extended = sum(1 for x in pair_recent if x[10] is not None and target_minutes and int(x[10]) <= target_minutes * 2)
-        denom = len(pair_recent)
+        strict = int(r[6] or 0)
+        extended = int(r[7] or 0)
         pairs.append({
             "source_timeframe": r[0], "target_timeframe": r[1],
             "snapshots": snapshots, "matched": matched,
@@ -455,9 +493,9 @@ def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
             "average_lead_minutes": float(r[4]) if r[4] is not None else None,
             "median_lead_minutes": float(r[5]) if r[5] is not None else None,
             "strict_window_minutes": target_minutes or None,
-            "strict_match_rate_pct": (strict / denom * 100.0) if denom and target_minutes else None,
-            "extended_match_rate_pct": (extended / denom * 100.0) if denom and target_minutes else None,
-            "sampled_for_window": denom,
+            "strict_match_rate_pct": (strict / snapshots * 100.0) if snapshots and target_minutes else None,
+            "extended_match_rate_pct": (extended / snapshots * 100.0) if snapshots and target_minutes else None,
+            "sampled_for_window": snapshots,
         })
 
     recent = []
@@ -502,12 +540,14 @@ def prediction_research_summary(limit: int = 100) -> dict[str, Any]:
 
     return {
         "ok": True,
+        "category_key": category,
         "count": int(total),
         "pairs": pairs,
         "patterns": patterns[:30],
         "recent": recent,
         "window_note": "엄격 성공은 상위 목표 시간봉 길이 안에 실제 목표 저점이 처음 발생한 경우입니다. 확장 성공은 그 2배 시간 안에 발생한 경우입니다.",
     }
+
 
 
 def save_signal(payload: dict[str, Any]) -> bool:
