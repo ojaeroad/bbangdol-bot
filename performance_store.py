@@ -170,6 +170,37 @@ CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_symbol_pair_time
 CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_unmatched
     ON performance_prediction_snapshots(symbol, target_timeframe, first_target_at);
 
+
+CREATE TABLE IF NOT EXISTS performance_cadence_stage_events (
+    id BIGSERIAL PRIMARY KEY,
+    route_family VARCHAR(40) NOT NULL,
+    route VARCHAR(60),
+    exchange VARCHAR(30),
+    raw_exchange VARCHAR(30),
+    symbol VARCHAR(100) NOT NULL,
+    direction VARCHAR(10) NOT NULL,
+    timeframe VARCHAR(10) NOT NULL,
+    stage INTEGER NOT NULL,
+    stage_label VARCHAR(30) NOT NULL,
+    telegram_visible BOOLEAN NOT NULL DEFAULT FALSE,
+    signal_price NUMERIC(30,10),
+    episode_started_at TIMESTAMPTZ NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    raw_message TEXT,
+    event_hash VARCHAR(64) NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cadence_stage_symbol_time
+    ON performance_cadence_stage_events(symbol, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_cadence_stage_stage_tf
+    ON performance_cadence_stage_events(stage, timeframe, direction);
+
+CREATE TABLE IF NOT EXISTS performance_prediction_watch (
+    symbol VARCHAR(100) PRIMARY KEY,
+    active_until TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS performance_page_visits (
     id BIGSERIAL PRIMARY KEY,
     page_path VARCHAR(200) NOT NULL,
@@ -437,10 +468,12 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
             if kd is not None: out[prefix + f"_k_delta_{n}"] = kd
             if dd is not None: out[prefix + f"_d_delta_{n}"] = dd
 
-    # Moving averages: actual 20/60 values, state, just-crossed flag, spacing and slopes.
+    # Moving average research: V94 uses SMA only (20/60/200).
+    # Old EMA keys already stored in JSONB are preserved for backward compatibility,
+    # but new grouping/research intentionally ignores EMA to avoid duplicated features.
     price = _metric_float(_metric_first(src, "price", "close", "close_price"))
     if price is not None: out["price"] = price
-    for family in ("sma", "ema"):
+    for family in ("sma",):
         ma20 = _metric_float(_metric_first(src, family + "20", family + "_20"))
         ma60 = _metric_float(_metric_first(src, family + "60", family + "_60"))
         if ma20 is not None: out[family + "20"] = ma20
@@ -465,6 +498,38 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
                 out["price_vs_" + family + "60"] = _price_position(price, ma60)
                 out["price_gap_" + family + "60_pct"] = _pct_gap(price, ma60)
 
+    sma200 = _metric_float(_metric_first(src, "sma200", "sma_200"))
+    if sma200 is not None:
+        out["sma200"] = sma200
+        if price is not None:
+            out["price_vs_sma200"] = _price_position(price, sma200)
+            out["price_gap_sma200_pct"] = _pct_gap(price, sma200)
+    for n in (1, 3):
+        dv = _metric_float(_metric_first(src, f"sma200_delta_{n}", f"sma_200_delta_{n}"))
+        if dv is not None:
+            out[f"sma200_delta_{n}"] = dv
+    s20 = _metric_float(out.get("sma20")); s60 = _metric_float(out.get("sma60")); s200 = _metric_float(out.get("sma200"))
+    if s20 is not None and s60 is not None and s200 is not None:
+        if s20 > s60 > s200:
+            out["sma_alignment"] = "BULL"
+        elif s20 < s60 < s200:
+            out["sma_alignment"] = "BEAR"
+        else:
+            out["sma_alignment"] = "MIXED"
+
+    # Bollinger Band (20,2): compact price-location + volatility context.
+    for key in ("bb_basis", "bb_upper", "bb_lower", "bb_percent_b", "bb_width_pct", "recent20_position_pct"):
+        v = _metric_float(_metric_first(src, key))
+        if v is not None:
+            out[key] = v
+    pb = _metric_float(out.get("bb_percent_b"))
+    if pb is not None:
+        if pb < 0: out["bb_zone"] = "BELOW_LOWER"
+        elif pb <= 0.2: out["bb_zone"] = "LOWER_20"
+        elif pb < 0.8: out["bb_zone"] = "MIDDLE"
+        elif pb <= 1.0: out["bb_zone"] = "UPPER_20"
+        else: out["bb_zone"] = "ABOVE_UPPER"
+
     # Candle / volatility / volume context. These are optional, but store now if Pine sends them.
     for key in (
         "body_ratio", "upper_wick_ratio", "lower_wick_ratio", "volume_ratio",
@@ -473,7 +538,7 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
         v = _metric_float(_metric_first(src, key))
         if v is not None: out[key] = v
 
-    out["metrics_schema_version"] = 88
+    out["metrics_schema_version"] = 94
     return out
 
 
@@ -490,8 +555,8 @@ def _prediction_detail_signature(metrics: dict[str, Any]) -> str:
             bits.append(f"{label}={k:.1f}/{d:.1f}:{m.get(pfx+'_cross','NONE')}")
         else:
             bits.append(f"{label}={m.get(pfx+'_dir','NA')}")
-    bits.append(f"SMA={m.get('sma_state','NA')}/{m.get('sma_cross','NONE')}")
-    bits.append(f"EMA={m.get('ema_state','NA')}/{m.get('ema_cross','NONE')}")
+    bits.append(f"SMA={m.get('sma_alignment',m.get('sma_state','NA'))}/{m.get('sma_cross','NONE')}")
+    bits.append(f"BB={m.get('bb_zone','NA')}")
     return " | ".join(bits)
 
 
@@ -558,6 +623,23 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
         ).fetchone()
     if row:
         log.info("Prediction snapshot saved id=%s symbol=%s %s->%s", row[0], symbol, source_tf, target_tf)
+        # V94: keep confirmed 5m candles long enough to calculate MAE/MFE later.
+        # This does not increase Telegram alerts; Pine already sends 5m candle payloads.
+        try:
+            target_m = _tf_minutes_for_prediction(target_tf)
+            if target_m > 0:
+                watch_until = snapshot_at + timedelta(minutes=max(15, target_m * 2))
+                with _connect() as watch_conn:
+                    watch_conn.execute(
+                        """INSERT INTO performance_prediction_watch(symbol, active_until, updated_at)
+                           VALUES (%s,%s,NOW())
+                           ON CONFLICT(symbol) DO UPDATE SET
+                             active_until=GREATEST(performance_prediction_watch.active_until, EXCLUDED.active_until),
+                             updated_at=NOW()""",
+                        (symbol, watch_until),
+                    )
+        except Exception:
+            log.exception("Prediction candle watch activation failed symbol=%s", symbol)
         return True
     return False
 
@@ -611,11 +693,11 @@ def _tf_minutes_for_prediction(tf: str) -> int:
 def _prediction_signature(metrics: dict[str, Any]) -> str:
     m = metrics or {}
     parts = [
-        f"RSI:{m.get('rsi_dir','NA')}",
-        f"K5:{m.get('stoch_5_3_dir','NA')}",
-        f"K20:{m.get('stoch_20_12_dir','NA')}",
-        f"SMA:{m.get('sma_state','NA')}",
-        f"EMA:{m.get('ema_state','NA')}",
+        f"RSI:{m.get('rsi_zone','NA')}/{m.get('rsi_dir','NA')}",
+        f"K5:{m.get('stoch_5_3_zone','NA')}/{m.get('stoch_5_3_cross','NONE')}",
+        f"K20:{m.get('stoch_20_12_zone','NA')}/{m.get('stoch_20_12_cross','NONE')}",
+        f"SMA:{m.get('sma_alignment',m.get('sma_state','NA'))}",
+        f"BB:{m.get('bb_zone','NA')}",
     ]
     return " | ".join(parts)
 
@@ -881,6 +963,49 @@ def queue_signal_save(payload: dict[str, Any]) -> None:
     _submit_db_save(save_signal_safely, snapshot)
 
 
+def save_cadence_stage_event(payload: dict[str, Any]) -> bool:
+    """Persist visible stages 0~3 and admin-only research stages 4~5."""
+    symbol = str(payload.get("symbol", "")).strip()
+    timeframe = str(payload.get("timeframe", "")).strip()
+    direction = str(payload.get("direction", "")).strip().upper()
+    if not symbol or not timeframe or direction not in {"LOW", "HIGH"}:
+        return False
+    stage = int(payload.get("stage", 0) or 0)
+    if stage < 0 or stage > 5:
+        return False
+    occurred_at = datetime.fromtimestamp(float(payload.get("occurred_at_ts", 0) or 0), tz=timezone.utc)
+    episode_at = datetime.fromtimestamp(float(payload.get("episode_started_ts", 0) or 0), tz=timezone.utc)
+    if occurred_at.year < 2020 or episode_at.year < 2020:
+        return False
+    route_family = str(payload.get("route_family", "")).strip() or "UNKNOWN"
+    route = str(payload.get("route", "")).strip() or None
+    try:
+        price = Decimal(str(payload.get("signal_price"))) if payload.get("signal_price") is not None else None
+    except Exception:
+        price = None
+    event_key = f"{symbol}|{route_family}|{direction}|{timeframe}|{episode_at.isoformat()}|{stage}"
+    event_hash = hashlib.sha256(event_key.encode("utf-8")).hexdigest()
+    label = "FOCUS" if stage == 0 else f"VALID_{stage}"
+    ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            """INSERT INTO performance_cadence_stage_events(
+                   route_family,route,exchange,raw_exchange,symbol,direction,timeframe,
+                   stage,stage_label,telegram_visible,signal_price,episode_started_at,occurred_at,raw_message,event_hash
+               ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT(event_hash) DO NOTHING RETURNING id""",
+            (route_family, route, payload.get("exchange"), payload.get("raw_exchange"), symbol,
+             direction, timeframe, stage, label, bool(payload.get("telegram_visible")), price,
+             episode_at, occurred_at, str(payload.get("raw_message", "")) or None, event_hash),
+        ).fetchone()
+    return bool(row)
+
+
+def queue_cadence_stage_event_save(payload: dict[str, Any]) -> None:
+    snapshot = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    _submit_db_save(save_cadence_stage_event, snapshot)
+
+
 def health_summary() -> dict[str, Any]:
     """Return a non-sensitive connectivity and row-count summary."""
     if not PERFORMANCE_DATABASE_URL:
@@ -972,8 +1097,18 @@ def save_candle(payload: dict[str, Any]) -> bool:
             "SELECT active, started_at, need_1m, need_5m FROM performance_candle_watch WHERE symbol=%s",
             (symbol,),
         ).fetchone()
-        required = bool(watch and watch[0] and ((interval == 1 and watch[2]) or (interval == 5 and watch[3])))
-        if not required or bar_time < watch[1] - timedelta(minutes=interval):
+        position_required = bool(watch and watch[0] and ((interval == 1 and watch[2]) or (interval == 5 and watch[3])))
+        prediction_required = False
+        if interval == 5:
+            prow = conn.execute(
+                "SELECT active_until FROM performance_prediction_watch WHERE symbol=%s AND active_until >= %s",
+                (symbol, bar_time),
+            ).fetchone()
+            prediction_required = bool(prow)
+        required = position_required or prediction_required
+        if not required:
+            return False
+        if position_required and watch and bar_time < watch[1] - timedelta(minutes=interval) and not prediction_required:
             return False
         table = "performance_candles_1m" if interval == 1 else "performance_candles_5m"
         sql = f"""

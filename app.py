@@ -1,3 +1,4 @@
+# V94_RESEARCH_COLLECTION: SMA 단일화 + 관리자 유효1~5 + BB/MAE-MFE 연구 수집
 # V93_FIVE_MIN_CADENCE: 전 알람 5분 유효 쿨타임 + 시간봉별 집중 리셋 + 5분 주기 분석
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V92_DETAIL_UI: 단타 상세/예측 종목정렬/클릭 hover 강화
@@ -16,7 +17,7 @@ import requests
 
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
-    queue_signal_save, queue_candle_save, queue_prediction_snapshot_save,
+    queue_signal_save, queue_candle_save, queue_prediction_snapshot_save, queue_cadence_stage_event_save,
     health_summary, latest_signals, prediction_research_summary,
     record_page_visit, page_visit_summary,
 )
@@ -161,7 +162,7 @@ def _mark_sent(bucket: str):
 # V93 운영 고정 규칙:
 # - 집중 이후 유효 알람은 모든 매수/매도 시간봉에서 5분 쿨타임.
 # - 5m/15m는 집중 시작 후 15분, 30m는 30분, 1h 이상은 60분 뒤 새 집중으로 리셋.
-# - 집중은 카운터 0, 유효는 1/3 → 2/3 → 3/3.
+# - Telegram은 집중 + 유효1~3만 표시. 관리자 연구 DB는 동일 5분 간격으로 유효4~5까지 숨김 수집.
 TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "CUSTOM").strip().upper()
 TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))  # 하위 호환용(실제 판정에는 사용하지 않음)
@@ -478,20 +479,15 @@ def _decorate_asset_header(msg: str, symbol: str, route: str = "") -> str:
     return f"{left}{tag}{right}\n{text}"
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
-    """Telegram 집중/유효 전송 판정 V93.
+    """Telegram V94: visible 0~3, admin research hidden 4~5.
 
-    실제 운영 규칙:
-    - 첫 신호는 즉시 집중(카운터 0).
-    - 이후 조건이 유지되면 마지막 전송으로부터 5분 이상 지난 첫 신호를
-      유효 1/3 → 2/3 → 3/3으로 전송한다.
-    - 5m/15m는 집중 시작 후 15분, 30m는 30분, 1h 이상은 60분이 지나면
-      다음 들어오는 신호를 다시 집중으로 시작한다.
-    - 자연 시간봉 경계(정각/15분/30분 경계)는 사용하지 않는다.
+    Visible operation is unchanged from V93:
+      focus -> valid1 -> valid2 -> valid3, five-minute cooldown.
+    Research-only stages valid4/valid5 are persisted to DB but never sent to Telegram.
+    Episode reset: 5m/15m=15m, 30m=30m, 1h+=60m.
     """
     if not TELEGRAM_CADENCE_ENABLED:
         return True, msg, "disabled"
-
-    # 주요지표/AUX 방은 매수·매도 cadence 로직을 절대 적용하지 않는다.
     if not _route_uses_asset_hashtag(route):
         return True, msg, "non_trade_route"
 
@@ -503,14 +499,23 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
     valid_cooldown_sec = TELEGRAM_VALID_COOLDOWN_MINUTES * 60
     reset_minutes = _focus_reset_minutes(timeframe)
     reset_sec = reset_minutes * 60
-
-    if "_1Q" in route_key:
-        route_family = "1Q"
-    elif route_key.startswith("BD_"):
-        route_family = "STARFLOWER"
-    else:
-        route_family = route_key
+    route_family = "1Q" if "_1Q" in route_key else ("STARFLOWER" if route_key.startswith("BD_") else route_key)
     key = f"{sym}|{route_family}|{direction}|{timeframe}"
+
+    def record_stage(stage: int, episode_started: float, visible: bool):
+        # DB failures are isolated by the async performance-store worker.
+        price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
+        try:
+            signal_price = float(price_match.group(1).replace(",", "")) if price_match else None
+        except Exception:
+            signal_price = None
+        queue_cadence_stage_event_save({
+            "route_family": route_family, "route": route_key, "symbol": sym,
+            "direction": direction, "timeframe": timeframe, "stage": stage,
+            "telegram_visible": visible, "signal_price": signal_price,
+            "episode_started_ts": episode_started, "occurred_at_ts": now_ts,
+            "raw_message": msg,
+        })
 
     with _CADENCE_LOCK:
         state, commit_state, close_state = _cadence_state_transaction()
@@ -519,8 +524,6 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
             for old_key in list(state):
                 if old_key != key and old_key.startswith(f"{sym}|") and old_key.endswith(legacy_suffix):
                     state.pop(old_key, None)
-
-            # 반대 방향이 나타난 뒤 이전 방향 상태가 다시 살아나 집중을 건너뛰지 않도록 정리한다.
             opposite = "HIGH" if direction == "LOW" else "LOW"
             for old_key in list(state):
                 if old_key.startswith(f"{sym}|") and f"|{opposite}|{timeframe}" in old_key:
@@ -529,66 +532,74 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
             prev = state.get(key)
             if prev is not None:
                 try:
-                    episode_started = float(prev.get("episode_started", prev.get("last_sent", 0)) or 0)
+                    episode_started = float(prev.get("episode_started", prev.get("last_stage_at", prev.get("last_sent", 0))) or 0)
                 except (TypeError, ValueError):
                     episode_started = 0.0
-                # 핵심: 마지막 신호 시각이 아니라 '집중 시작 시각' 기준으로 리셋한다.
                 if episode_started <= 0 or now_ts - episode_started >= reset_sec:
                     prev = None
 
+            stage_to_record = None
+            telegram_visible = False
             if prev is None:
                 episode_count = 0
                 phase = "FOCUS" if direction == "LOW" else "EXIT"
                 should_send = True
+                telegram_visible = True
                 episode_started = now_ts
+                last_stage_at = now_ts
                 last_sent = now_ts
+                stage_to_record = 0
             else:
                 episode_count = int(prev.get("episode_count", 0) or 0)
                 episode_started = float(prev.get("episode_started", now_ts) or now_ts)
-                try:
-                    last_sent = float(prev.get("last_sent", episode_started) or episode_started)
-                except (TypeError, ValueError):
-                    last_sent = episode_started
-
-                if episode_count >= 3:
+                last_stage_at = float(prev.get("last_stage_at", prev.get("last_sent", episode_started)) or episode_started)
+                last_sent = float(prev.get("last_sent", episode_started) or episode_started)
+                if episode_count >= 5:
                     phase = "SUPPRESS"
                     should_send = False
-                elif now_ts - last_sent >= valid_cooldown_sec:
+                elif now_ts - last_stage_at >= valid_cooldown_sec:
                     episode_count += 1
-                    if direction == "LOW":
-                        phase = "HOLD"
+                    last_stage_at = now_ts
+                    stage_to_record = episode_count
+                    if episode_count <= 3:
+                        telegram_visible = True
+                        should_send = True
+                        last_sent = now_ts
+                        if direction == "LOW":
+                            phase = "HOLD"
+                        else:
+                            phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
                     else:
-                        phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
-                    should_send = True
-                    last_sent = now_ts
+                        # Admin-only VALID_4 / VALID_5 research stage.
+                        phase = "ADMIN_RESEARCH"
+                        should_send = False
                 else:
                     phase = "SUPPRESS"
                     should_send = False
 
             state[key] = {
-                "last_seen": now_ts,
-                "last_sent": last_sent,
-                "episode_started": episode_started,
-                "timeframe": timeframe,
+                "last_seen": now_ts, "last_sent": last_sent, "last_stage_at": last_stage_at,
+                "episode_started": episode_started, "timeframe": timeframe,
                 "valid_cooldown_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
-                "focus_reset_minutes": reset_minutes,
-                "phase": phase,
+                "focus_reset_minutes": reset_minutes, "phase": phase,
                 "episode_count": episode_count,
             }
             commit_state(state)
+            if stage_to_record is not None:
+                record_stage(stage_to_record, episode_started, telegram_visible)
 
             if not should_send:
-                if episode_count >= 3:
-                    reason = f"{direction.lower()}_max_3_reached_until_reset_{reset_minutes}m"
-                else:
-                    reason = f"waiting_5m_cooldown_reset_{reset_minutes}m"
-                return False, msg, reason
+                if phase == "ADMIN_RESEARCH":
+                    return False, msg, f"admin_hidden_valid_{episode_count}_of_5"
+                if episode_count >= 5:
+                    return False, msg, f"research_max_5_reached_until_reset_{reset_minutes}m"
+                return False, msg, f"waiting_5m_cooldown_reset_{reset_minutes}m"
 
             if direction == "LOW":
                 reason = "low_focus" if phase == "FOCUS" else f"low_valid_{episode_count}_of_3"
             else:
                 reason = "high_focus" if phase == "EXIT" else f"high_valid_{episode_count}_of_3"
-            return True, _decorate_cadence_message(msg, phase, episode_count), reason
+            return True, _decorate_cadence_message(msg, phase, max(1, episode_count)), reason
         finally:
             close_state()
 
@@ -5688,7 +5699,7 @@ def performance_prediction_fragment():
   <div class="analysis-note" style="margin-bottom:14px">
     <b>상위 시간봉 저점 예측 연구</b><br>
     현재 시간봉 저점이 발생한 순간, 바로 위 상위 시간봉의 상태를 저장하고 실제 상위 저점 발생 여부와 대기시간을 연결합니다.<br>
-    <span class="small">v87부터 RSI 실제값·50선 위치·1/3/5봉 변화량, Stoch 5·3·3 / 20·12·12의 K/D값·골든/데드크로스·변화량, SMA/EMA 20·60 이격·교차·기울기·가격 위치, 캔들/거래량/ATR 문맥까지 수신되는 값은 모두 JSONB로 누적합니다. 기존 데이터는 그대로 유지됩니다.</span>
+    <span class="small">V94부터 연구축을 RSI · Stoch 5·3·3/20·12·12 · SMA20/60/200 · Bollinger Band(20,2) · 가격행동/거래량/ATR로 단순화합니다. EMA는 신규 연구에서 제외하며 기존 저장 데이터는 삭제하지 않습니다. 예측 구간의 5분봉도 별도 보관해 향후 MAE/MFE를 계산할 수 있게 합니다.</span>
   </div>
   <div class="research-guide">
     <div><b>스냅샷</b><span>하위 시간봉 저점 신호가 발생한 순간을 1건으로 저장한 연구 표본입니다.</span></div>
@@ -5698,7 +5709,7 @@ def performance_prediction_fragment():
     <div><b>2배시간 성공률</b><span>목표 시간봉 길이의 2배 안에 발생한 비율입니다. 엄격 기준보다 느슨한 보조지표입니다.</span></div>
     <div><b>평균 대기</b><span>연결된 사례들이 상위 저점까지 걸린 평균 시간입니다. 긴 꼬리값의 영향을 받습니다.</span></div>
     <div><b>중앙 대기</b><span>대기시간을 정렬했을 때 가운데 값입니다. 이상치 영향이 적어 체감 대기시간 판단에 유용합니다.</span></div>
-    <div><b>조건 조합</b><span>상위봉의 RSI·K5·K20 방향과 SMA/EMA 상태별로 성공률을 분리한 조건 연구입니다.</span></div>
+    <div><b>조건 조합</b><span>상위봉의 RSI 구간/방향, Stoch K/D 구간·크로스, SMA20/60/200 배열, Bollinger 위치를 묶어 성공률을 비교합니다.</span></div>
   </div>
   {% if not data.ok %}<div class="analysis-note neg">예측 연구 DB를 불러오지 못했습니다.</div>{% else %}
   <h3>시간봉 전환 성과</h3>
@@ -5725,8 +5736,8 @@ def performance_prediction_fragment():
   <div class="small" style="margin-bottom:10px">원자료를 시간순으로 길게 나열하지 않고 종목별로 묶었습니다. 각 종목을 펼치면 해당 종목의 전환·지표상태·결과를 확인할 수 있습니다.</div>
   {% for g in recent_by_symbol %}<details class="prediction-symbol-card" {% if loop.index <= 3 %}open{% endif %}><summary class="prediction-symbol-title">{{g.label}} · {{g.rows|length}}건</summary><div style="overflow-x:auto"><table class="cadence-table"><thead><tr><th>시각</th><th>전환</th><th>신호가</th><th>현재봉</th><th>상위봉 당시 상태</th><th>아랫꼬리</th><th>결과</th></tr></thead><tbody>{% for r in g.rows %}<tr class="clickable-row">
 <td class="small">{{r.snapshot_at[:16].replace('T',' ') if r.snapshot_at else '-'}}</td><td><b>{{r.source_timeframe}}→{{r.target_timeframe}}</b></td><td>{{r.signal_price if r.signal_price is not none else '-'}}</td>
-<td class="small">RSI {% if r.source_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.source_metrics.get('rsi_value')|float)}}{% else %}{{r.source_metrics.get('rsi_dir','NA')}}{% endif %}{% if r.source_metrics.get('rsi_above_50') is not none %} · 50선 {{'위' if r.source_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>K5 {% if r.source_metrics.get('stoch_5_3_k') is not none %}{{'%.1f'|format(r.source_metrics.get('stoch_5_3_k')|float)}}/{{'%.1f'|format(r.source_metrics.get('stoch_5_3_d')|float)}} {{r.source_metrics.get('stoch_5_3_cross','NONE')}}{% else %}{{r.source_metrics.get('stoch_5_3_dir','NA')}}{% endif %} · K20 {% if r.source_metrics.get('stoch_20_12_k') is not none %}{{'%.1f'|format(r.source_metrics.get('stoch_20_12_k')|float)}}/{{'%.1f'|format(r.source_metrics.get('stoch_20_12_d')|float)}} {{r.source_metrics.get('stoch_20_12_cross','NONE')}}{% else %}{{r.source_metrics.get('stoch_20_12_dir','NA')}}{% endif %}<br>SMA {{r.source_metrics.get('sma_state','NA')}}{% if r.source_metrics.get('sma_cross') %}/{{r.source_metrics.get('sma_cross')}}{% endif %} · EMA {{r.source_metrics.get('ema_state','NA')}}{% if r.source_metrics.get('ema_cross') %}/{{r.source_metrics.get('ema_cross')}}{% endif %}</td>
-<td class="small">RSI {% if r.target_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.target_metrics.get('rsi_value')|float)}}{% else %}{{r.target_metrics.get('rsi_dir','NA')}}{% endif %}{% if r.target_metrics.get('rsi_above_50') is not none %} · 50선 {{'위' if r.target_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>K5 {% if r.target_metrics.get('stoch_5_3_k') is not none %}{{'%.1f'|format(r.target_metrics.get('stoch_5_3_k')|float)}}/{{'%.1f'|format(r.target_metrics.get('stoch_5_3_d')|float)}} {{r.target_metrics.get('stoch_5_3_cross','NONE')}}{% else %}{{r.target_metrics.get('stoch_5_3_dir','NA')}}{% endif %} · K20 {% if r.target_metrics.get('stoch_20_12_k') is not none %}{{'%.1f'|format(r.target_metrics.get('stoch_20_12_k')|float)}}/{{'%.1f'|format(r.target_metrics.get('stoch_20_12_d')|float)}} {{r.target_metrics.get('stoch_20_12_cross','NONE')}}{% else %}{{r.target_metrics.get('stoch_20_12_dir','NA')}}{% endif %}<br>SMA {{r.target_metrics.get('sma_state','NA')}}{% if r.target_metrics.get('sma_cross') %}/{{r.target_metrics.get('sma_cross')}}{% endif %} · EMA {{r.target_metrics.get('ema_state','NA')}}{% if r.target_metrics.get('ema_cross') %}/{{r.target_metrics.get('ema_cross')}}{% endif %}</td>
+<td class="small">RSI {% if r.source_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.source_metrics.get('rsi_value')|float)}}{% else %}{{r.source_metrics.get('rsi_dir','NA')}}{% endif %}{% if r.source_metrics.get('rsi_above_50') is not none %} · 50선 {{'위' if r.source_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>K5 {% if r.source_metrics.get('stoch_5_3_k') is not none %}{{'%.1f'|format(r.source_metrics.get('stoch_5_3_k')|float)}}/{{'%.1f'|format(r.source_metrics.get('stoch_5_3_d')|float)}} {{r.source_metrics.get('stoch_5_3_cross','NONE')}}{% else %}{{r.source_metrics.get('stoch_5_3_dir','NA')}}{% endif %} · K20 {% if r.source_metrics.get('stoch_20_12_k') is not none %}{{'%.1f'|format(r.source_metrics.get('stoch_20_12_k')|float)}}/{{'%.1f'|format(r.source_metrics.get('stoch_20_12_d')|float)}} {{r.source_metrics.get('stoch_20_12_cross','NONE')}}{% else %}{{r.source_metrics.get('stoch_20_12_dir','NA')}}{% endif %}<br>SMA {{r.source_metrics.get('sma_state','NA')}}{% if r.source_metrics.get('sma_cross') %}/{{r.source_metrics.get('sma_cross')}}{% endif %} · SMA배열 {{r.source_metrics.get('sma_alignment','NA')}} · BB {{r.source_metrics.get('bb_zone','NA')}}</td>
+<td class="small">RSI {% if r.target_metrics.get('rsi_value') is not none %}{{'%.1f'|format(r.target_metrics.get('rsi_value')|float)}}{% else %}{{r.target_metrics.get('rsi_dir','NA')}}{% endif %}{% if r.target_metrics.get('rsi_above_50') is not none %} · 50선 {{'위' if r.target_metrics.get('rsi_above_50') else '아래'}}{% endif %}<br>K5 {% if r.target_metrics.get('stoch_5_3_k') is not none %}{{'%.1f'|format(r.target_metrics.get('stoch_5_3_k')|float)}}/{{'%.1f'|format(r.target_metrics.get('stoch_5_3_d')|float)}} {{r.target_metrics.get('stoch_5_3_cross','NONE')}}{% else %}{{r.target_metrics.get('stoch_5_3_dir','NA')}}{% endif %} · K20 {% if r.target_metrics.get('stoch_20_12_k') is not none %}{{'%.1f'|format(r.target_metrics.get('stoch_20_12_k')|float)}}/{{'%.1f'|format(r.target_metrics.get('stoch_20_12_d')|float)}} {{r.target_metrics.get('stoch_20_12_cross','NONE')}}{% else %}{{r.target_metrics.get('stoch_20_12_dir','NA')}}{% endif %}<br>SMA {{r.target_metrics.get('sma_state','NA')}}{% if r.target_metrics.get('sma_cross') %}/{{r.target_metrics.get('sma_cross')}}{% endif %} · SMA배열 {{r.target_metrics.get('sma_alignment','NA')}} · BB {{r.target_metrics.get('bb_zone','NA')}}</td>
 <td>{{'%.3f'|format(r.target_metrics.get('lower_wick_ratio',0)|float)}}</td><td>{% if r.first_target_at %}<b class="pos">상위 저점 발생</b><div>{{format_minutes_compact(r.lead_minutes)}} 후</div>{% if r.strict_success %}<div class="small">엄격 성공</div>{% endif %}{% else %}<span class="warn">대기</span>{% endif %}</td></tr>{% endfor %}</tbody></table></div></details>{% endfor %}
   <div class="analysis-note" style="margin-top:14px">{{data.window_note}}</div>
   {% endif %}

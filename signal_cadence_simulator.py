@@ -1,3 +1,4 @@
+# V94_ADMIN_STAGE_RESEARCH: 운영 진입 3회 유지 + 관리자 유효1~5 단계 연구
 # V93_FIVE_MIN_SIMULATOR: 5분 유효 쿨타임 + 시간봉별 집중 리셋 분석 포함
 """저점·고점 반복 알람 축소 B안 과거 데이터 시뮬레이터 v2.
 
@@ -65,6 +66,7 @@ EXIT_GROUPS = {
 EPISODE_GAP_SECONDS = 125
 CURRENT_ENTRY_COOLDOWN_SECONDS = 300
 MAX_ENTRIES = 3
+MAX_ADMIN_VALID_STAGES = 5  # Telegram/실제 진입은 3 유지, 관리자 연구만 4~5까지 추적
 FIVE_VALID_COOLDOWN_SECONDS = 300
 FIVE_RESET_MINUTES = {
     "3m": 15, "5m": 15, "15m": 15, "30m": 30,
@@ -522,6 +524,36 @@ def _coin_scalp_details(simulations: dict[str, dict[str, Any]]) -> list[dict[str
             })
     return output
 
+def _admin_stage_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reconstruct focus + VALID1..VALID5 from raw signals without changing trade entries.
+
+    This mirrors V94 live collection: 5-minute stage spacing and the same focus reset.
+    Stages 4/5 are research-only and never count as entries or Telegram messages.
+    """
+    state: dict[tuple[str, str, str], dict[str, Any]] = {}
+    counts = {i: 0 for i in range(6)}
+    by_tf: dict[str, dict[int, int]] = {}
+    for sig in signals:
+        key=(sig["symbol"],sig["type"],sig["tf"])
+        prev=state.get(key)
+        reset_sec=_five_reset_minutes(sig["tf"])*60
+        if prev is None or (sig["time"]-prev["focus_time"]).total_seconds() >= reset_sec:
+            stage=0
+            state[key]={"focus_time":sig["time"],"last_stage":sig["time"],"stage":0}
+        else:
+            stage=int(prev.get("stage",0))
+            if stage>=MAX_ADMIN_VALID_STAGES:
+                continue
+            if (sig["time"]-prev["last_stage"]).total_seconds() < FIVE_VALID_COOLDOWN_SECONDS:
+                continue
+            stage += 1
+            prev["stage"]=stage; prev["last_stage"]=sig["time"]
+            state[key]=prev
+        counts[stage]+=1
+        by_tf.setdefault(sig["tf"],{i:0 for i in range(6)})[stage]+=1
+    return {"counts":counts,"by_timeframe":by_tf,"max_stage":MAX_ADMIN_VALID_STAGES}
+
+
 def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     signals = _load(market, period_key)
     variants: list[dict[str, Any]] = []
@@ -619,7 +651,9 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     scalp_combinations = _coin_scalp_combinations(simulations) if market == "COIN" else []
     scalp_details = _coin_scalp_details(simulations) if market == "COIN" else []
 
+    admin_stage_research = _admin_stage_research(signals)
     return {
+        "admin_stage_research": admin_stage_research,
         "market": market,
         "period_key": period_key,
         "raw_signal_count": len(signals),
