@@ -1,3 +1,4 @@
+# V95_RESEARCH_CADENCE: 3분 쿨타임 + 정시5분 연구 + MAE/MFE 성과분석
 # V94_ADMIN_STAGE_RESEARCH: 운영 진입 3회 유지 + 관리자 유효1~5 단계 연구
 # V93_FIVE_MIN_SIMULATOR: 5분 유효 쿨타임 + 시간봉별 집중 리셋 분석 포함
 """저점·고점 반복 알람 축소 B안 과거 데이터 시뮬레이터 v2.
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -68,6 +70,8 @@ CURRENT_ENTRY_COOLDOWN_SECONDS = 300
 MAX_ENTRIES = 3
 MAX_ADMIN_VALID_STAGES = 5  # Telegram/실제 진입은 3 유지, 관리자 연구만 4~5까지 추적
 FIVE_VALID_COOLDOWN_SECONDS = 300
+THREE_VALID_COOLDOWN_SECONDS = 180
+CLOCK5_MINUTES = 5
 FIVE_RESET_MINUTES = {
     "3m": 15, "5m": 15, "15m": 15, "30m": 30,
     "1h": 60, "2h": 60, "4h": 60, "6h": 60, "12h": 60,
@@ -176,16 +180,33 @@ def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, A
         key = (signal["symbol"], signal["type"], signal["tf"])
         previous = state.get(key)
 
-        if mode == "FIVE":
+        if mode in {"FIVE", "THREE", "CLOCK5"}:
             reset_sec = _five_reset_minutes(signal["tf"]) * 60
             new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= reset_sec
             if new_episode:
                 sampled.append(signal)
-                state[key] = {"focus_time": signal["time"], "last_sent": signal["time"], "valid_count": 0}
+                state[key] = {
+                    "focus_time": signal["time"],
+                    "last_sent": signal["time"],
+                    "valid_count": 0,
+                    "sent_slot": _slot(signal["time"], CLOCK5_MINUTES),
+                }
                 continue
             valid_count = int(previous.get("valid_count", 0))
-            since_sent = (signal["time"] - previous["last_sent"]).total_seconds()
-            if valid_count < MAX_ENTRIES and since_sent >= FIVE_VALID_COOLDOWN_SECONDS:
+            if valid_count >= MAX_ENTRIES:
+                state[key] = previous
+                continue
+            should_send = False
+            if mode == "CLOCK5":
+                slot = _slot(signal["time"], CLOCK5_MINUTES)
+                focus_slot = _slot(previous["focus_time"], CLOCK5_MINUTES)
+                should_send = slot > focus_slot and slot != previous.get("sent_slot")
+                if should_send:
+                    previous["sent_slot"] = slot
+            else:
+                cooldown = FIVE_VALID_COOLDOWN_SECONDS if mode == "FIVE" else THREE_VALID_COOLDOWN_SECONDS
+                should_send = (signal["time"] - previous["last_sent"]).total_seconds() >= cooldown
+            if should_send:
                 sampled.append(signal)
                 previous["last_sent"] = signal["time"]
                 previous["valid_count"] = valid_count + 1
@@ -220,9 +241,19 @@ def _entry_allowed(
     if position and len(position["entries"]) >= MAX_ENTRIES:
         return False
 
-    if mode in {"ALL", "FIVE"}:
+    if mode in {"ALL", "FIVE", "THREE"}:
         last_entry_time = position["entries"][-1]["time"] if position else episode["focus_time"]
-        return (signal["time"] - last_entry_time).total_seconds() >= CURRENT_ENTRY_COOLDOWN_SECONDS
+        cooldown = THREE_VALID_COOLDOWN_SECONDS if mode == "THREE" else CURRENT_ENTRY_COOLDOWN_SECONDS
+        return (signal["time"] - last_entry_time).total_seconds() >= cooldown
+
+    if mode == "CLOCK5":
+        current_slot = _slot(signal["time"], CLOCK5_MINUTES)
+        if current_slot <= episode["focus_slot"]:
+            return False
+        if episode.get("last_entry_slot") == current_slot:
+            return False
+        episode["last_entry_slot"] = current_slot
+        return True
 
     cadence = signal["mins"] if mode == "FULL" else _operating_minutes(
         signal["market"], signal["tf"]
@@ -247,7 +278,7 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
         if signal["type"] == "LOW":
             key = (signal["symbol"], signal["group"], signal["tf"])
             previous = episodes.get(key)
-            if mode == "FIVE":
+            if mode in {"FIVE", "THREE", "CLOCK5"}:
                 new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= _five_reset_minutes(signal["tf"]) * 60
             else:
                 new_episode = (
@@ -255,8 +286,10 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
                     or (signal["time"] - previous["last_time"]).total_seconds() > EPISODE_GAP_SECONDS
                 )
             if new_episode:
-                if mode == "FIVE":
+                if mode in {"FIVE", "CLOCK5"}:
                     cadence = 5
+                elif mode == "THREE":
+                    cadence = 3
                 else:
                     cadence = signal["mins"] if mode != "HALF" else _operating_minutes(
                         signal["market"], signal["tf"]
@@ -381,6 +414,8 @@ def _cycle_stats(cycles: list[dict[str, Any]]) -> dict[str, Any]:
         max(0.0, (c["exit_time"] - c["entry_time"]).total_seconds() / 60.0)
         for c in cycles if c.get("entry_time") and c.get("exit_time")
     ]
+    mae_values = [float(c["mae_pct"]) for c in cycles if c.get("mae_pct") is not None]
+    mfe_values = [float(c["mfe_pct"]) for c in cycles if c.get("mfe_pct") is not None]
     return {
         "completed_cycles": len(cycles),
         "win_rate_pct": (sum(v > 0 for v in values) / len(values) * 100.0) if values else None,
@@ -389,6 +424,9 @@ def _cycle_stats(cycles: list[dict[str, Any]]) -> dict[str, Any]:
         "worst_return_pct": min(values) if values else None,
         "average_entries": (sum(entries) / len(entries)) if entries else None,
         "average_holding_minutes": (sum(holds) / len(holds)) if holds else None,
+        "average_mae_pct": (sum(mae_values) / len(mae_values)) if mae_values else None,
+        "average_mfe_pct": (sum(mfe_values) / len(mfe_values)) if mfe_values else None,
+        "mae_mfe_samples": min(len(mae_values), len(mfe_values)),
     }
 
 
@@ -407,6 +445,9 @@ def _serialise_cycle(cycle: dict[str, Any], code: str) -> dict[str, Any]:
         "exit_price": float(cycle.get("exit_price") or 0),
         "exit_time": cycle.get("exit_time"),
         "return_pct": float(cycle.get("return_pct") or 0),
+        "mae_pct": float(cycle["mae_pct"]) if cycle.get("mae_pct") is not None else None,
+        "mfe_pct": float(cycle["mfe_pct"]) if cycle.get("mfe_pct") is not None else None,
+        "mae_mfe_candle_count": int(cycle.get("mae_mfe_candle_count") or 0),
     }
 
 
@@ -427,7 +468,7 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
     symbols = sorted({str(s.get("symbol") or "") for s in signals if s.get("symbol")})
     by_code: dict[str, dict[tuple[str, str, str, str], list[dict[str, Any]]]] = {}
     all_keys: set[tuple[str, str, str, str]] = set()
-    for code in ("ALL", "FIVE", "FULL", "HALF"):
+    for code in ("ALL", "THREE", "FIVE", "CLOCK5", "FULL", "HALF"):
         bucket: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
         for cycle in simulations.get(code, {}).get("cycles", []):
             key = (
@@ -454,7 +495,7 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
             for key in group_keys:
                 _, _, entry_tf, exit_tf = key
                 variants = []
-                for code, label in (("ALL", "1분 원본"), ("FIVE", "5분 주기"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
+                for code, label in (("ALL", "1분 원본"), ("THREE", "3분 쿨타임 · 연구"), ("FIVE", "5분 쿨타임 · 현재운영"), ("CLOCK5", "정시 5분봉 · 연구"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
                     detail = _latest_cycle_detail(by_code[code].get(key, []), code)
                     variants.append({"code": code, "label": label, "detail": detail})
                 rows.append({"entry_tf": entry_tf, "exit_tf": exit_tf, "variants": variants})
@@ -524,6 +565,69 @@ def _coin_scalp_details(simulations: dict[str, dict[str, Any]]) -> list[dict[str
             })
     return output
 
+
+def _attach_mae_mfe(simulations: dict[str, dict[str, Any]]) -> None:
+    """Attach 5m-candle based MAE/MFE to every completed simulated cycle.
+
+    MAE is clamped to <=0% and MFE to >=0%. Missing candle coverage stays None,
+    so historical periods without stored candles are never treated as zero excursion.
+    One range query is used for all modes to avoid per-cycle DB load.
+    """
+    all_cycles = [c for sim in simulations.values() for c in sim.get("cycles", [])]
+    usable = [c for c in all_cycles if c.get("symbol") and c.get("entry_time") and c.get("exit_time") and float(c.get("entry_price") or 0) > 0]
+    if not usable:
+        return
+    ranges: dict[str, tuple[datetime, datetime]] = {}
+    for c in usable:
+        sym = str(c["symbol"])
+        start, end = c["entry_time"], c["exit_time"]
+        if sym not in ranges:
+            ranges[sym] = (start, end)
+        else:
+            a, b = ranges[sym]
+            ranges[sym] = (min(a, start), max(b, end))
+    if not ranges:
+        return
+    values_sql = ",".join(["(%s,%s,%s)"] * len(ranges))
+    params: list[Any] = []
+    for sym, (start, end) in ranges.items():
+        params.extend([sym, start, end])
+    sql = f"""
+        WITH ranges(symbol,start_at,end_at) AS (VALUES {values_sql})
+        SELECT c.symbol,c.bar_time,c.high,c.low
+        FROM performance_candles_5m c
+        JOIN ranges r ON r.symbol=c.symbol
+                     AND c.bar_time BETWEEN r.start_at AND r.end_at
+        ORDER BY c.symbol,c.bar_time
+    """
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception:
+        return
+    candles: dict[str, list[tuple[datetime, float, float]]] = defaultdict(list)
+    for sym, bar_time, high, low in rows:
+        candles[str(sym)].append((bar_time, float(high), float(low)))
+    indexed: dict[str, tuple[list[datetime], list[tuple[datetime, float, float]]]] = {
+        sym: ([r[0] for r in items], items) for sym, items in candles.items()
+    }
+    for c in usable:
+        sym = str(c["symbol"])
+        if sym not in indexed:
+            continue
+        times, items = indexed[sym]
+        left = bisect_left(times, c["entry_time"])
+        right = bisect_right(times, c["exit_time"])
+        window = items[left:right]
+        if not window:
+            continue
+        entry = float(c["entry_price"])
+        low = min(x[2] for x in window)
+        high = max(x[1] for x in window)
+        c["mae_pct"] = min(0.0, (low - entry) / entry * 100.0)
+        c["mfe_pct"] = max(0.0, (high - entry) / entry * 100.0)
+        c["mae_mfe_candle_count"] = len(window)
+
 def _admin_stage_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
     """Reconstruct focus + VALID1..VALID5 from raw signals without changing trade entries.
 
@@ -562,34 +666,48 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
 
     labels = (
         ("ALL", "1분 원본"),
-        ("FIVE", "5분 주기 · V93 운영"),
+        ("THREE", "3분 쿨타임 · 연구"),
+        ("FIVE", "5분 쿨타임 · 현재운영"),
+        ("CLOCK5", "정시 5분봉 · 연구"),
         ("FULL", "자기 시간봉 주기"),
         ("HALF", "절반 주기"),
     )
+    for code, _label in labels:
+        alert_samples[code] = _sample_alerts(signals, code)
+        simulations[code] = _simulate_cycles(signals, code)
+
+    # One bulk candle query enriches every mode with MAE/MFE; missing history remains blank.
+    _attach_mae_mfe(simulations)
+
     for code, label in labels:
-        sampled = _sample_alerts(signals, code)
-        alert_samples[code] = sampled
-        simulation = _simulate_cycles(signals, code)
-        simulations[code] = simulation
+        simulation = simulations[code]
+        stats = _stats(len(signals), len(alert_samples[code]), simulation)
+        stats.update({k: v for k, v in _cycle_stats(simulation["cycles"]).items() if k in {"average_mae_pct", "average_mfe_pct", "mae_mfe_samples"}})
         variants.append({
             "code": code,
             "label": label,
-            **_stats(len(signals), len(sampled), simulation),
+            **stats,
         })
 
     timeframe_rows: list[dict[str, Any]] = []
     for tf in sorted({s["tf"] for s in signals}, key=lambda value: TF_MINUTES.get(value, 999999)):
         raw = [s for s in signals if s["tf"] == tf]
+        three = _sample_alerts(raw, "THREE")
         five = _sample_alerts(raw, "FIVE")
+        clock5 = _sample_alerts(raw, "CLOCK5")
         full = _sample_alerts(raw, "FULL")
         half = _sample_alerts(raw, "HALF")
         timeframe_rows.append({
             "timeframe": tf,
             "raw_count": len(raw),
+            "three_count": len(three),
             "five_count": len(five),
+            "clock5_count": len(clock5),
             "full_count": len(full),
             "half_count": len(half),
+            "three_reduction_pct": ((len(raw) - len(three)) / len(raw) * 100) if raw else 0.0,
             "five_reduction_pct": ((len(raw) - len(five)) / len(raw) * 100) if raw else 0.0,
+            "clock5_reduction_pct": ((len(raw) - len(clock5)) / len(raw) * 100) if raw else 0.0,
             "full_reduction_pct": ((len(raw) - len(full)) / len(raw) * 100) if raw else 0.0,
             "half_reduction_pct": ((len(raw) - len(half)) / len(raw) * 100) if raw else 0.0,
         })
@@ -598,7 +716,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     for group in GROUPS.get(market, {}):
         item = {"group": group, "group_label": GROUP_LABEL[group], "variants": []}
         raw_group_count = len([s for s in signals if s["group"] == group])
-        for code, short_label in (("ALL", "1분 원본"), ("FIVE", "5분 주기"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
+        for code, short_label in (("ALL", "1분 원본"), ("THREE", "3분 쿨타임"), ("FIVE", "5분 현재운영"), ("CLOCK5", "정시 5분봉"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
             group_sample_count = len([s for s in alert_samples[code] if s["group"] == group])
             group_cycles = [c for c in simulations[code]["cycles"] if c["group"] == group]
             group_focus = [
@@ -636,13 +754,13 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     timeframe_performance: list[dict[str, Any]] = []
     for tf in sorted({s["tf"] for s in signals}, key=lambda value: TF_MINUTES.get(value, 999999)):
         row = {"timeframe": tf, "group": _group(market, tf), "group_label": GROUP_LABEL.get(_group(market, tf), ""), "variants": []}
-        for code, label in (("ALL", "1분 원본"), ("FIVE", "5분 주기"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
+        for code, label in (("ALL", "1분 원본"), ("THREE", "3분 쿨타임"), ("FIVE", "5분 현재운영"), ("CLOCK5", "정시 5분봉"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
             tf_cycles = [c for c in simulations[code]["cycles"] if c["entry_tf"] == tf]
             row["variants"].append({"code": code, "label": label, **_cycle_stats(tf_cycles)})
         timeframe_performance.append(row)
 
     recent_cycles: list[dict[str, Any]] = []
-    for code in ("ALL", "FIVE", "FULL", "HALF"):
+    for code in ("ALL", "THREE", "FIVE", "CLOCK5", "FULL", "HALF"):
         for cycle in simulations[code]["cycles"]:
             recent_cycles.append(_serialise_cycle(cycle, code))
     recent_cycles.sort(key=lambda c: c.get("exit_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
@@ -668,8 +786,9 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "
-            "5분 주기는 V93 실제 운영 규칙(유효 5분 쿨타임, 5m/15m=15분·30m=30분·1h+=60분 집중 리셋), "
-            "자기 시간봉과 절반 주기는 비교 연구용이며, 매도는 기존 성과 시뮬레이션 원칙대로 첫 유효 HIGH에서 전량 종료한 저장 신호 기반 가정 결과입니다."
+            "5분 쿨타임은 현재 실제 운영 규칙(5m/15m=15분·30m=30분·1h+=60분 집중 리셋)이며, "
+            "3분 쿨타임과 정시 5분봉은 Telegram 전송 없는 관리자 연구용입니다. 자기 시간봉·절반 주기도 비교 연구용입니다. "
+            "MAE/MFE는 저장된 5분봉이 존재하는 완료사이클만 계산하므로 과거 미수집 구간은 빈칸으로 남습니다."
         ),
     }
 

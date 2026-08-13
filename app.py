@@ -1,3 +1,4 @@
+# V95_CADENCE_RESEARCH: 3분 쿨타임 + 정시5분 + MAE/MFE 성과표
 # V94_RESEARCH_COLLECTION: SMA 단일화 + 관리자 유효1~5 + BB/MAE-MFE 연구 수집
 # V93_FIVE_MIN_CADENCE: 전 알람 5분 유효 쿨타임 + 시간봉별 집중 리셋 + 5분 주기 분석
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
@@ -2873,32 +2874,37 @@ def performance_cadence_fragment():
   <div class="analysis-note" style="margin-bottom:14px">
     <b>알람 주기 비교 기준</b><br>
     ① 1분 원본 = TradingView에서 들어온 원본 반복 신호 ·
-    ② 5분 주기 = <b>현재 V93 실제 운영</b> (유효 알람 5분 쿨타임, 집중 리셋 5m/15m=15분 · 30m=30분 · 1h 이상=60분) ·
-    ③ 자기 시간봉 주기 = 해당 시간봉의 자연 경계 ·
-    ④ 절반 주기 = 이전 운영 방식과의 비교 연구용입니다.
+    ② 3분 쿨타임 = <b>관리자 연구 전용</b> (Telegram 전송 없음) ·
+    ③ 5분 쿨타임 = <b>현재 실제 운영</b> (집중 리셋 5m/15m=15분 · 30m=30분 · 1h 이상=60분) ·
+    ④ 정시 5분봉 = <b>:00/:05/:10… 자연 5분 경계 연구</b> (Telegram 전송 없음) ·
+    ⑤ 자기 시간봉 = 해당 시간봉의 자연 경계 · ⑥ 절반 주기 = 이전 방식 비교 연구입니다.
+    <br><span class="small"><b>MAE(최대 불리 움직임)</b> = 진입 후 종료 전까지 평균진입가보다 가장 불리하게 움직인 최대 하락폭. <b>MFE(최대 유리 움직임)</b> = 같은 구간에서 가장 유리하게 움직인 최대 상승폭. 저장된 5분봉이 있는 완료사이클만 계산하므로 표본 수를 함께 확인하세요.</span>
   </div>
   <h3>전체 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
-    <thead><tr><th>비교 방식</th><th>알람 수</th><th>감소율</th><th>완료 사이클</th><th>평균 진입 횟수</th><th>승률</th><th>평균 수익률</th></tr></thead>
+    <thead><tr><th>비교 방식</th><th>알람 수</th><th>감소율</th><th>완료 사이클</th><th>평균 진입 횟수</th><th>승률</th><th>평균 수익률</th><th>평균 MAE<br><span class="small">최대 불리 움직임</span></th><th>평균 MFE<br><span class="small">최대 유리 움직임</span></th><th>MAE/MFE 표본</th></tr></thead>
     <tbody>{% for v in cadence_simulation.variants %}<tr>
-      <td><b>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FIVE' %}5분 주기 · 현재운영{% elif v.code == 'FULL' %}자기 시간봉 주기{% else %}절반 주기{% endif %}</b></td>
+      <td><b>{{mode_labels.get(v.code, v.label)}}</b></td>
       <td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.completed_cycles}}회</td>
       <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
       <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
       <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+      <td class="neg">{% if v.average_mae_pct is not none %}{{'%+.2f'|format(v.average_mae_pct)}}%{% else %}-{% endif %}</td>
+      <td class="pos">{% if v.average_mfe_pct is not none %}{{'%+.2f'|format(v.average_mfe_pct)}}%{% else %}-{% endif %}</td>
+      <td>{{v.mae_mfe_samples or 0}}회</td>
     </tr>{% endfor %}</tbody>
   </table></div>
 
-  <h3 style="margin-top:22px">시간봉별 4가지 주기 비교</h3>
+  <h3 style="margin-top:22px">시간봉별 6가지 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
-    <thead><tr><th>시간봉</th><th>1분 원본</th><th>5분 주기 · 현재운영</th><th>자기 시간봉</th><th>절반 주기</th><th>5분 감소율</th><th>자기시간봉 감소율</th><th>절반주기 감소율</th></tr></thead>
-    <tbody>{% for r in cadence_simulation.timeframes %}<tr><td><b>{{r.timeframe}}</b></td><td>{{r.raw_count}}건</td><td><b>{{r.five_count}}건</b></td><td>{{r.full_count}}건</td><td>{{r.half_count}}건</td><td><b>{{'%.1f'|format(r.five_reduction_pct)}}%</b></td><td>{{'%.1f'|format(r.full_reduction_pct)}}%</td><td>{{'%.1f'|format(r.half_reduction_pct)}}%</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>시간봉</th><th>1분 원본</th><th>3분 쿨타임</th><th>5분 현재운영</th><th>정시 5분봉</th><th>자기 시간봉</th><th>절반 주기</th><th>3분 감소율</th><th>5분 감소율</th><th>정시5분 감소율</th><th>자기봉 감소율</th><th>절반 감소율</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.timeframes %}<tr><td><b>{{r.timeframe}}</b></td><td>{{r.raw_count}}건</td><td>{{r.three_count}}건</td><td><b>{{r.five_count}}건</b></td><td>{{r.clock5_count}}건</td><td>{{r.full_count}}건</td><td>{{r.half_count}}건</td><td>{{'%.1f'|format(r.three_reduction_pct)}}%</td><td><b>{{'%.1f'|format(r.five_reduction_pct)}}%</b></td><td>{{'%.1f'|format(r.clock5_reduction_pct)}}%</td><td>{{'%.1f'|format(r.full_reduction_pct)}}%</td><td>{{'%.1f'|format(r.half_reduction_pct)}}%</td></tr>{% endfor %}</tbody>
   </table></div>
 
   <h3 style="margin-top:22px">시간봉별 실제 매수 결과 비교</h3>
   <div class="small" style="margin-bottom:10px">같은 원본 신호에서 각 주기를 실제 매수 규칙으로 적용했을 때의 완료 사이클 결과입니다. 승률과 수익률을 함께 봐야 주기 우열을 판단할 수 있습니다.</div>
   <div style="overflow-x:auto"><table class="cadence-table">
-    <thead><tr><th>포지션</th><th>시간봉</th><th>방식</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>최고</th><th>최저</th><th>평균 진입</th><th>평균 보유</th></tr></thead>
+    <thead><tr><th>포지션</th><th>시간봉</th><th>방식</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>최고</th><th>최저</th><th>평균 진입</th><th>평균 보유</th><th>평균 MAE<br><span class="small">최대 불리</span></th><th>평균 MFE<br><span class="small">최대 유리</span></th><th>표본</th></tr></thead>
     <tbody>{% for r in cadence_simulation.timeframe_performance %}{% for v in r.variants %}<tr>
       <td>{{r.group_label}}</td><td><b>{{r.timeframe}}</b></td><td>{{v.label}}</td><td>{{v.completed_cycles}}회</td>
       <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
@@ -2907,23 +2913,27 @@ def performance_cadence_fragment():
       <td>{% if v.worst_return_pct is not none %}{{'%+.2f'|format(v.worst_return_pct)}}%{% else %}-{% endif %}</td>
       <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
       <td>{% if v.average_holding_minutes is not none %}{{format_minutes_compact(v.average_holding_minutes)}}{% else %}-{% endif %}</td>
+      <td class="neg">{% if v.average_mae_pct is not none %}{{'%+.2f'|format(v.average_mae_pct)}}%{% else %}-{% endif %}</td>
+      <td class="pos">{% if v.average_mfe_pct is not none %}{{'%+.2f'|format(v.average_mfe_pct)}}%{% else %}-{% endif %}</td>
+      <td>{{v.mae_mfe_samples or 0}}회</td>
     </tr>{% endfor %}{% endfor %}</tbody>
   </table></div>
 
   <h3 style="margin-top:22px">최근 실제 진입 타점 비교 · 종목별</h3>
-  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 같은 조합에서 1분 원본·5분 현재운영·자기 시간봉·절반 주기를 나란히 비교하며 아직 결과가 없는 방식은 빈칸(-)으로 둡니다.</div>
+  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 1분 원본·3분 연구·5분 현재운영·정시5분 연구·자기 시간봉·절반 주기를 나란히 비교하며 아직 결과가 없는 방식은 빈칸(-)으로 둡니다.</div>
   {% for item in cadence_simulation.symbol_recent_comparison %}
   <details class="cadence-symbol-card" style="margin-bottom:12px">
     <summary class="cadence-symbol-title" style="cursor:pointer;font-weight:900;font-size:18px">{{symbol_display(item.symbol, 'KRX' if category == 'KOREA_1Q' else '')}}</summary>
     {% for g in item.groups %}
     <div class="cadence-group-label" style="margin:14px 0 6px">{{g.group_label}}</div>
     <div style="overflow-x:auto"><table class="cadence-table">
-      <thead><tr><th>매수→매도</th><th>1분 원본</th><th>5분 주기 · 현재운영</th><th>자기 시간봉</th><th>절반 주기</th></tr></thead>
+      <thead><tr><th>매수→매도</th><th>1분 원본</th><th>3분 쿨타임</th><th>5분 현재운영</th><th>정시 5분봉</th><th>자기 시간봉</th><th>절반 주기</th></tr></thead>
       <tbody>{% for row in g.rows %}<tr><td><b>{{row.entry_tf}} → {{row.exit_tf}}</b></td>
       {% for v in row.variants %}<td class="cadence-compare-cell">{% if v.detail %}
         <div class="entry">{% for e in v.detail.entry_points %}{{loop.index}}차 {{'%.6g'|format(e.price)}} · {{e.time.strftime('%m.%d %H:%M') if e.time else '-'}}{% if not loop.last %}<br>{% endif %}{% endfor %}</div>
         <div class="small">평균 {{'%.6g'|format(v.detail.entry_price)}} → 매도 {{'%.6g'|format(v.detail.exit_price)}}</div>
         <div class="ret {{'pos' if v.detail.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(v.detail.return_pct)}}%</div>
+        {% if v.detail.mae_pct is not none or v.detail.mfe_pct is not none %}<div class="small">MAE {% if v.detail.mae_pct is not none %}{{'%+.2f'|format(v.detail.mae_pct)}}%{% else %}-{% endif %} · MFE {% if v.detail.mfe_pct is not none %}{{'%+.2f'|format(v.detail.mfe_pct)}}%{% else %}-{% endif %}</div>{% endif %}
       {% else %}-{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
     </table></div>
     {% endfor %}
@@ -2933,7 +2943,7 @@ def performance_cadence_fragment():
   <h3 style="margin-top:22px">포지션별 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
     <thead><tr><th>포지션</th><th>방식</th><th>알람 수</th><th>감소율</th><th>집중 구간</th><th>진입 포착률</th><th>완료 사이클</th></tr></thead>
-    <tbody>{% for g in cadence_simulation.groups %}{% for v in g.variants %}<tr><td><b>{{g.group_label}}</b></td><td>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FIVE' %}5분 주기 · 현재운영{% elif v.code == 'FULL' %}자기 시간봉{% else %}절반 주기{% endif %}</td><td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.focus_count}}회</td><td>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</td><td>{{v.completed_cycles}}회</td></tr>{% endfor %}{% endfor %}</tbody>
+    <tbody>{% for g in cadence_simulation.groups %}{% for v in g.variants %}<tr><td><b>{{g.group_label}}</b></td><td>{{mode_labels.get(v.code, v.label)}}</td><td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.focus_count}}회</td><td>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</td><td>{{v.completed_cycles}}회</td></tr>{% endfor %}{% endfor %}</tbody>
   </table></div>
 
   <h3 style="margin-top:22px">종목별 실제 발생 주기</h3>
@@ -2944,7 +2954,10 @@ def performance_cadence_fragment():
     <tbody>{% for row in item.rows %}<tr><td><b>{{row.timeframe}}</b></td><td>{{row.group_label}}</td><td>{{row.occurrence_count}}회</td><td>{{row.overall_average_text}}</td><td>{{row.recent_average_text}}</td><td>{{row.elapsed_text}}</td><td>{{row.readiness_label}}</td></tr>{% endfor %}</tbody></table></div>
   </div>{% else %}<div class="empty-note">발생 주기 데이터가 아직 없습니다.</div>{% endfor %}
 </div>
-        ''', cadence_simulation=cadence_simulation, occurrence_groups=occurrence_groups, category=category), 200
+        ''', cadence_simulation=cadence_simulation, occurrence_groups=occurrence_groups, category=category, mode_labels={
+            'ALL':'1분 원본','THREE':'3분 쿨타임 · 연구','FIVE':'5분 쿨타임 · 현재운영',
+            'CLOCK5':'정시 5분봉 · 연구','FULL':'자기 시간봉','HALF':'절반 주기'
+        }), 200
     except Exception as exc:
         log.exception("Cadence fragment failed")
         return f'<div class="analysis-note neg">알람 분석 로딩 실패: {type(exc).__name__}</div>', 500
@@ -5339,7 +5352,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </details>
 {% endif %}
 <details id="admin-cadence" class="card collapsible-block">
-<summary class="section-title">알람 분석 · 1분 / 5분 / 자기시간봉 / 절반주기</summary>
+<summary class="section-title">알람 분석 · 1분 / 3분 / 5분 / 정시5분 / 자기시간봉 / 절반주기</summary>
 <div id="adminCadenceBody" data-cadence-url="/performance/cadence-fragment?category={{selected_category}}&period={{period_key}}" class="collapsible-content"><div class="analysis-note">처음 접속 속도를 위해 이 메뉴를 열 때만 계산합니다.</div></div>
 </details>
 
