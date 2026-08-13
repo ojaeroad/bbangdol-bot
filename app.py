@@ -1,4 +1,4 @@
-# V84_PREDICTION_MARKET_AND_SAME_STAGE: 상위시간봉 시장분리/캐시 + 매수·매도 집중 무카운트 + 동일 유효 단계 이모지
+# V93_FIVE_MIN_CADENCE: 전 알람 5분 유효 쿨타임 + 시간봉별 집중 리셋 + 5분 주기 분석
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V92_DETAIL_UI: 단타 상세/예측 종목정렬/클릭 hover 강화
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
@@ -80,7 +80,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v91-admin-ui-speed-scalp-fix")
+APP_VERSION  = os.getenv("APP_VERSION", "v93-five-minute-cadence")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -110,7 +110,8 @@ def version():
         "ui_release": "V50_MASTER",
         "telegram_cadence_enabled": TELEGRAM_CADENCE_ENABLED,
         "telegram_cadence_mode": TELEGRAM_CADENCE_MODE,
-        "telegram_cadence_minutes": _CADENCE_HALF_MIN if TELEGRAM_CADENCE_MODE != "FULL" else _CADENCE_FULL_MIN,
+        "telegram_cadence_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
+        "telegram_focus_reset_minutes": _CADENCE_FOCUS_RESET_MIN,
     })
 
 @app.get("/whoami")
@@ -157,8 +158,10 @@ def _mark_sent(bucket: str):
 
 # === Telegram cadence filter (실제 회원 알람 축소) ===
 # Pine/DB 원본 신호는 그대로 저장하고, Telegram 전송만 줄인다.
-# 기본값 CUSTOM: 최초 즉시 + 운영 확정 주기 경계에서 조건 유지 알림.
-# 5m=5분, 15m=5분, 30m=15분, 1h=30분, 이후는 절반 주기.
+# V93 운영 고정 규칙:
+# - 집중 이후 유효 알람은 모든 매수/매도 시간봉에서 5분 쿨타임.
+# - 5m/15m는 집중 시작 후 15분, 30m는 30분, 1h 이상은 60분 뒤 새 집중으로 리셋.
+# - 집중은 카운터 0, 유효는 1/3 → 2/3 → 3/3.
 TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "CUSTOM").strip().upper()
 TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))  # 하위 호환용(실제 판정에는 사용하지 않음)
@@ -179,6 +182,17 @@ _CADENCE_1Q_CUSTOM_MIN = {
     "30m": 15, "1h": 30, "4h": 60, "1d": 60,
     "3d": 60, "1w": 60, "1M": 1440,
 }
+
+# V93 실제 Telegram 운영 규칙. 자연 경계가 아니라 마지막 전송 시점 기준 5분 경과를 사용한다.
+TELEGRAM_VALID_COOLDOWN_MINUTES = 5
+_CADENCE_FOCUS_RESET_MIN = {
+    "3m": 15, "5m": 15, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 60, "4h": 60, "6h": 60, "12h": 60,
+    "1d": 60, "3d": 60, "1w": 60, "1M": 60,
+}
+
+def _focus_reset_minutes(timeframe: str) -> int:
+    return _CADENCE_FOCUS_RESET_MIN.get(_canonical_timeframe(timeframe or ""), 60)
 _CADENCE_STATE: Dict[str, Dict[str, Any]] = {}
 _CADENCE_LOCK = threading.Lock()
 
@@ -464,35 +478,32 @@ def _decorate_asset_header(msg: str, symbol: str, route: str = "") -> str:
     return f"{left}{tag}{right}\n{text}"
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
-    """Telegram 집중/유효 전송 판정 v70.
+    """Telegram 집중/유효 전송 판정 V93.
 
-    LOW: 첫 신호는 즉시 '매수 집중'(카운터 제외). 이후 같은 조건이 계속 들어와도
-    정해진 cadence 경계 전에는 전부 차단하고, 다음 경계 이후 처음 들어온
-    신호를 '매수 유효 1/3 → 2/3 → 3/3' 순서로 전송한다.
-
-    HIGH: 첫 신호는 즉시 '매도 집중'(카운터 제외). 이후 cadence 경계마다
-    '매도 유효 1/3 → 2/3 → 3/3' 순서로 전송한다.
-    가격 변화 및 Pine의 매분 재호출은 새 집중으로 보지 않는다.
+    실제 운영 규칙:
+    - 첫 신호는 즉시 집중(카운터 0).
+    - 이후 조건이 유지되면 마지막 전송으로부터 5분 이상 지난 첫 신호를
+      유효 1/3 → 2/3 → 3/3으로 전송한다.
+    - 5m/15m는 집중 시작 후 15분, 30m는 30분, 1h 이상은 60분이 지나면
+      다음 들어오는 신호를 다시 집중으로 시작한다.
+    - 자연 시간봉 경계(정각/15분/30분 경계)는 사용하지 않는다.
     """
     if not TELEGRAM_CADENCE_ENABLED:
         return True, msg, "disabled"
 
-    # v81: 집중/유효 cadence는 실제 매수/매도 알람방에만 적용한다.
-    # AUX/INDEX/INDICATOR 등 주요지표방은 원문 그대로 통과시켜,
-    # 지표 문장 안의 저점/고점 문자열이 매수·매도 알람으로 오인되지 않게 한다.
+    # 주요지표/AUX 방은 매수·매도 cadence 로직을 절대 적용하지 않는다.
     if not _route_uses_asset_hashtag(route):
         return True, msg, "non_trade_route"
 
     sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
-    cadence = _cadence_minutes(timeframe, route_key)
-    if cadence <= 0 or direction == "UNKNOWN":
+    if direction == "UNKNOWN" or timeframe == "unknown":
         return True, msg, "unsupported"
 
     now_ts = time.time()
-    cadence_sec = cadence * 60
-    current_slot = int(now_ts // cadence_sec)
+    valid_cooldown_sec = TELEGRAM_VALID_COOLDOWN_MINUTES * 60
+    reset_minutes = _focus_reset_minutes(timeframe)
+    reset_sec = reset_minutes * 60
 
-    # route 문구가 조금 달라져도 같은 전략/종목/방향/시간봉은 하나의 상태로 본다.
     if "_1Q" in route_key:
         route_family = "1Q"
     elif route_key.startswith("BD_"):
@@ -501,108 +512,82 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
         route_family = route_key
     key = f"{sym}|{route_family}|{direction}|{timeframe}"
 
-    # 조건이 오랫동안 완전히 사라졌다가 다시 나타난 경우에만 새 에피소드.
-    # 매분 신호의 일시 누락으로 집중이 다시 뜨지 않도록 cadence 2배를 사용한다.
-    reset_gap_sec = max(cadence_sec * 2, 600)
-
     with _CADENCE_LOCK:
         state, commit_state, close_state = _cadence_state_transaction()
         try:
-            # v69 이하의 route 포함 구형 키가 남아 있어도 새 로직과 충돌하지 않게 제거.
             legacy_suffix = f"|{direction}|{timeframe}"
             for old_key in list(state):
                 if old_key != key and old_key.startswith(f"{sym}|") and old_key.endswith(legacy_suffix):
                     state.pop(old_key, None)
 
-            # LOW가 시작되면 같은 종목/시간봉의 이전 HIGH 3회 상태는 종료한다.
-            if direction == "LOW":
-                for old_key in list(state):
-                    if old_key.startswith(f"{sym}|") and f"|HIGH|{timeframe}" in old_key:
-                        state.pop(old_key, None)
+            # 반대 방향이 나타난 뒤 이전 방향 상태가 다시 살아나 집중을 건너뛰지 않도록 정리한다.
+            opposite = "HIGH" if direction == "LOW" else "LOW"
+            for old_key in list(state):
+                if old_key.startswith(f"{sym}|") and f"|{opposite}|{timeframe}" in old_key:
+                    state.pop(old_key, None)
 
             prev = state.get(key)
-            if prev:
+            if prev is not None:
                 try:
-                    last_seen = float(prev.get("last_seen", 0) or 0)
+                    episode_started = float(prev.get("episode_started", prev.get("last_sent", 0)) or 0)
                 except (TypeError, ValueError):
-                    last_seen = 0.0
-                if last_seen <= 0 or now_ts - last_seen > reset_gap_sec:
+                    episode_started = 0.0
+                # 핵심: 마지막 신호 시각이 아니라 '집중 시작 시각' 기준으로 리셋한다.
+                if episode_started <= 0 or now_ts - episode_started >= reset_sec:
                     prev = None
 
-            if direction == "LOW":
-                # v81: 최초 집중은 카운터에 포함하지 않는다.
-                # 집중(0) → 유효 1/3 → 유효 2/3 → 유효 3/3 순서로 최대 4회 전송한다.
-                if prev is None:
-                    episode_count = 0
-                    phase = "FOCUS"
-                    should_send = True
-                    next_due_slot = current_slot + 1
-                else:
-                    episode_count = int(prev.get("episode_count", 0) or 0)
-                    next_due_slot = int(prev.get("next_due_slot", current_slot + 1))
-                    if episode_count >= 3:
-                        phase = "SUPPRESS"
-                        should_send = False
-                    elif current_slot >= next_due_slot:
-                        episode_count += 1
-                        phase = "HOLD"
-                        should_send = True
-                        next_due_slot = current_slot + 1
-                    else:
-                        phase = "SUPPRESS"
-                        should_send = False
-
-                state[key] = {
-                    "last_seen": now_ts,
-                    "last_sent": now_ts if should_send else (prev or {}).get("last_sent"),
-                    "next_due_slot": next_due_slot,
-                    "timeframe": timeframe,
-                    "cadence_minutes": cadence,
-                    "phase": phase,
-                    "episode_count": episode_count,
-                }
-                commit_state(state)
-                if not should_send:
-                    reason = "low_max_3_reached" if episode_count >= 3 else f"waiting_boundary_{cadence}m"
-                    return False, msg, reason
-                reason = "low_focus" if phase == "FOCUS" else f"low_valid_{episode_count}_of_3"
-                return True, _decorate_cadence_message(msg, phase, episode_count), reason
-
-            # HIGH v82: 집중은 카운터 0. 이후 유효 1/3 → 2/3 → 3/3.
             if prev is None:
                 episode_count = 0
-                phase = "EXIT"
+                phase = "FOCUS" if direction == "LOW" else "EXIT"
                 should_send = True
-                next_due_slot = current_slot + 1
+                episode_started = now_ts
+                last_sent = now_ts
             else:
                 episode_count = int(prev.get("episode_count", 0) or 0)
-                next_due_slot = int(prev.get("next_due_slot", current_slot + 1))
+                episode_started = float(prev.get("episode_started", now_ts) or now_ts)
+                try:
+                    last_sent = float(prev.get("last_sent", episode_started) or episode_started)
+                except (TypeError, ValueError):
+                    last_sent = episode_started
+
                 if episode_count >= 3:
                     phase = "SUPPRESS"
                     should_send = False
-                elif current_slot >= next_due_slot:
+                elif now_ts - last_sent >= valid_cooldown_sec:
                     episode_count += 1
-                    phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
+                    if direction == "LOW":
+                        phase = "HOLD"
+                    else:
+                        phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
                     should_send = True
-                    next_due_slot = current_slot + 1
+                    last_sent = now_ts
                 else:
                     phase = "SUPPRESS"
                     should_send = False
 
             state[key] = {
                 "last_seen": now_ts,
-                "last_sent": now_ts if should_send else (prev or {}).get("last_sent"),
-                "next_due_slot": next_due_slot,
+                "last_sent": last_sent,
+                "episode_started": episode_started,
                 "timeframe": timeframe,
-                "cadence_minutes": cadence,
+                "valid_cooldown_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
+                "focus_reset_minutes": reset_minutes,
                 "phase": phase,
                 "episode_count": episode_count,
             }
             commit_state(state)
+
             if not should_send:
-                reason = "high_max_3_reached" if episode_count >= 3 else f"waiting_boundary_{cadence}m"
+                if episode_count >= 3:
+                    reason = f"{direction.lower()}_max_3_reached_until_reset_{reset_minutes}m"
+                else:
+                    reason = f"waiting_5m_cooldown_reset_{reset_minutes}m"
                 return False, msg, reason
-            reason = "high_focus" if phase == "EXIT" else f"high_valid_{episode_count}_of_3"
+
+            if direction == "LOW":
+                reason = "low_focus" if phase == "FOCUS" else f"low_valid_{episode_count}_of_3"
+            else:
+                reason = "high_focus" if phase == "EXIT" else f"high_valid_{episode_count}_of_3"
             return True, _decorate_cadence_message(msg, phase, episode_count), reason
         finally:
             close_state()
@@ -2877,14 +2862,15 @@ def performance_cadence_fragment():
   <div class="analysis-note" style="margin-bottom:14px">
     <b>알람 주기 비교 기준</b><br>
     ① 1분 원본 = TradingView에서 들어온 원본 반복 신호 ·
-    ② 자기 시간봉 주기 = 해당 시간봉의 자연 경계 ·
-    ③ 절반/운영 주기 = 현재 운영용 유효 알람 경계입니다.
+    ② 5분 주기 = <b>현재 V93 실제 운영</b> (유효 알람 5분 쿨타임, 집중 리셋 5m/15m=15분 · 30m=30분 · 1h 이상=60분) ·
+    ③ 자기 시간봉 주기 = 해당 시간봉의 자연 경계 ·
+    ④ 절반 주기 = 이전 운영 방식과의 비교 연구용입니다.
   </div>
   <h3>전체 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
     <thead><tr><th>비교 방식</th><th>알람 수</th><th>감소율</th><th>완료 사이클</th><th>평균 진입 횟수</th><th>승률</th><th>평균 수익률</th></tr></thead>
     <tbody>{% for v in cadence_simulation.variants %}<tr>
-      <td><b>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FULL' %}자기 시간봉 주기{% else %}절반/운영 주기{% endif %}</b></td>
+      <td><b>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FIVE' %}5분 주기 · 현재운영{% elif v.code == 'FULL' %}자기 시간봉 주기{% else %}절반 주기{% endif %}</b></td>
       <td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.completed_cycles}}회</td>
       <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
       <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
@@ -2892,10 +2878,10 @@ def performance_cadence_fragment():
     </tr>{% endfor %}</tbody>
   </table></div>
 
-  <h3 style="margin-top:22px">시간봉별 3가지 주기 비교</h3>
+  <h3 style="margin-top:22px">시간봉별 4가지 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
-    <thead><tr><th>시간봉</th><th>1분 원본</th><th>자기 시간봉 주기</th><th>절반/운영 주기</th><th>자기시간봉 감소율</th><th>절반주기 감소율</th></tr></thead>
-    <tbody>{% for r in cadence_simulation.timeframes %}<tr><td><b>{{r.timeframe}}</b></td><td>{{r.raw_count}}건</td><td>{{r.full_count}}건</td><td>{{r.half_count}}건</td><td>{{'%.1f'|format(r.full_reduction_pct)}}%</td><td>{{'%.1f'|format(r.half_reduction_pct)}}%</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>시간봉</th><th>1분 원본</th><th>5분 주기 · 현재운영</th><th>자기 시간봉</th><th>절반 주기</th><th>5분 감소율</th><th>자기시간봉 감소율</th><th>절반주기 감소율</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.timeframes %}<tr><td><b>{{r.timeframe}}</b></td><td>{{r.raw_count}}건</td><td><b>{{r.five_count}}건</b></td><td>{{r.full_count}}건</td><td>{{r.half_count}}건</td><td><b>{{'%.1f'|format(r.five_reduction_pct)}}%</b></td><td>{{'%.1f'|format(r.full_reduction_pct)}}%</td><td>{{'%.1f'|format(r.half_reduction_pct)}}%</td></tr>{% endfor %}</tbody>
   </table></div>
 
   <h3 style="margin-top:22px">시간봉별 실제 매수 결과 비교</h3>
@@ -2914,14 +2900,14 @@ def performance_cadence_fragment():
   </table></div>
 
   <h3 style="margin-top:22px">최근 실제 진입 타점 비교 · 종목별</h3>
-  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 같은 조합에서 1분 원본·자기 시간봉·절반/운영을 나란히 비교하며 아직 결과가 없는 방식은 빈칸(-)으로 둡니다.</div>
+  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 같은 조합에서 1분 원본·5분 현재운영·자기 시간봉·절반 주기를 나란히 비교하며 아직 결과가 없는 방식은 빈칸(-)으로 둡니다.</div>
   {% for item in cadence_simulation.symbol_recent_comparison %}
   <details class="cadence-symbol-card" style="margin-bottom:12px">
     <summary class="cadence-symbol-title" style="cursor:pointer;font-weight:900;font-size:18px">{{symbol_display(item.symbol, 'KRX' if category == 'KOREA_1Q' else '')}}</summary>
     {% for g in item.groups %}
     <div class="cadence-group-label" style="margin:14px 0 6px">{{g.group_label}}</div>
     <div style="overflow-x:auto"><table class="cadence-table">
-      <thead><tr><th>매수→매도</th><th>1분 원본</th><th>자기 시간봉</th><th>절반/운영</th></tr></thead>
+      <thead><tr><th>매수→매도</th><th>1분 원본</th><th>5분 주기 · 현재운영</th><th>자기 시간봉</th><th>절반 주기</th></tr></thead>
       <tbody>{% for row in g.rows %}<tr><td><b>{{row.entry_tf}} → {{row.exit_tf}}</b></td>
       {% for v in row.variants %}<td class="cadence-compare-cell">{% if v.detail %}
         <div class="entry">{% for e in v.detail.entry_points %}{{loop.index}}차 {{'%.6g'|format(e.price)}} · {{e.time.strftime('%m.%d %H:%M') if e.time else '-'}}{% if not loop.last %}<br>{% endif %}{% endfor %}</div>
@@ -2936,7 +2922,7 @@ def performance_cadence_fragment():
   <h3 style="margin-top:22px">포지션별 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
     <thead><tr><th>포지션</th><th>방식</th><th>알람 수</th><th>감소율</th><th>집중 구간</th><th>진입 포착률</th><th>완료 사이클</th></tr></thead>
-    <tbody>{% for g in cadence_simulation.groups %}{% for v in g.variants %}<tr><td><b>{{g.group_label}}</b></td><td>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FULL' %}자기 시간봉{% else %}절반/운영{% endif %}</td><td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.focus_count}}회</td><td>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</td><td>{{v.completed_cycles}}회</td></tr>{% endfor %}{% endfor %}</tbody>
+    <tbody>{% for g in cadence_simulation.groups %}{% for v in g.variants %}<tr><td><b>{{g.group_label}}</b></td><td>{% if v.code == 'ALL' %}1분 원본{% elif v.code == 'FIVE' %}5분 주기 · 현재운영{% elif v.code == 'FULL' %}자기 시간봉{% else %}절반 주기{% endif %}</td><td>{{v.alert_count}}건</td><td>{{'%.1f'|format(v.alert_reduction_pct)}}%</td><td>{{v.focus_count}}회</td><td>{% if v.entry_capture_rate_pct is not none %}{{'%.1f'|format(v.entry_capture_rate_pct)}}%{% else %}-{% endif %}</td><td>{{v.completed_cycles}}회</td></tr>{% endfor %}{% endfor %}</tbody>
   </table></div>
 
   <h3 style="margin-top:22px">종목별 실제 발생 주기</h3>
@@ -5342,7 +5328,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </details>
 {% endif %}
 <details id="admin-cadence" class="card collapsible-block">
-<summary class="section-title">알람 분석 · 1분 / 자기시간봉 / 절반주기</summary>
+<summary class="section-title">알람 분석 · 1분 / 5분 / 자기시간봉 / 절반주기</summary>
 <div id="adminCadenceBody" data-cadence-url="/performance/cadence-fragment?category={{selected_category}}&period={{period_key}}" class="collapsible-content"><div class="analysis-note">처음 접속 속도를 위해 이 메뉴를 열 때만 계산합니다.</div></div>
 </details>
 
@@ -5633,7 +5619,7 @@ def performance_scalp_fragment():
         rows = simulation.get("scalp_combinations") or []
         return render_template_string(r'''
 <div class="scalp-lazy-wrap">
-  <div class="small">현재 운영 기준(절반/운영 주기)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
+  <div class="small">현재 V93 운영 기준(유효 5분 쿨타임)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
   <div class="scalp-grid">
   {% for combo in rows %}
     <a class="scalp-link" href="/performance/scalp-detail?entry_tf={{combo.entry_timeframe}}&exit_tf={{combo.exit_timeframe}}&period={{period_key}}">
@@ -5677,7 +5663,7 @@ def performance_scalp_detail():
     return render_template_string(r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>코인 단타 상세</title><style>
 :root{--bg:#0d0d0f;--card:#171719;--line:#34343a;--blue:#69c9ff;--green:#55e69a;--red:#ff6b72}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f4f4f5;font-family:Arial,"Noto Sans KR",sans-serif;padding:22px}.wrap{max-width:1500px;margin:auto}.back{display:inline-block;color:var(--blue);text-decoration:none;margin-bottom:16px}.hero{border:1px solid var(--line);border-radius:14px;background:#141416;padding:18px;margin-bottom:16px}.hero h1{margin:0 0 6px;font-size:28px}.small{font-size:12px;color:#aaa}.symbol{border:1px solid var(--line);border-radius:13px;overflow:hidden;margin:13px 0;background:#141416;transition:.15s border-color}.symbol:hover{border-color:var(--blue)}.symbol summary{cursor:pointer;padding:14px 16px;background:#19191c;font-size:19px;font-weight:900;color:var(--blue)}.stats{display:flex;gap:10px;flex-wrap:wrap;padding:12px 16px}.pill{background:#101012;border:1px solid #2c2c31;border-radius:999px;padding:7px 10px}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:10px 12px;border-top:1px solid #2e2e33;text-align:left;vertical-align:top}th{color:var(--blue);font-size:12px;background:#101012}.pos{color:var(--green);font-weight:900}.neg{color:var(--red);font-weight:900}.entrypoint{white-space:nowrap}.row:hover{background:#17232a}</style></head><body><div class="wrap">
 <a class="back" href="/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp">← 코인 단타 4개 조합으로</a>
-<div class="hero"><h1>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}} 상세</h1><div class="small">절반/운영(HALF) 기준 · 종목별 완료 사이클 {{combo.result_count}}건</div></div>
+<div class="hero"><h1>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}} 상세</h1><div class="small">V93 5분 운영(FIVE) 기준 · 종목별 완료 사이클 {{combo.result_count}}건</div></div>
 {% if combo.symbols %}{% for s in combo.symbols %}<details class="symbol" open><summary>{{s.symbol}} · {{s.result_count}}사이클</summary><div class="stats"><span class="pill">평균 <b class="{{'pos' if s.average_return_pct is not none and s.average_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(s.average_return_pct)}}%</b></span><span class="pill">승률 {{'%.1f'|format(s.win_rate_pct)}}%</span><span class="pill">최고 {{'%+.2f'|format(s.best_return_pct)}}%</span><span class="pill">최저 {{'%+.2f'|format(s.worst_return_pct)}}%</span><span class="pill">평균보유 {{format_minutes_compact(s.average_holding_minutes)}}</span></div><div class="tablewrap"><table><thead><tr><th>매수 시각</th><th>분할 매수</th><th>평균 매수가</th><th>매도 시각</th><th>매도가</th><th>보유</th><th>수익률</th></tr></thead><tbody>{% for c in s.cycles %}<tr class="row"><td>{{format_kst(c.entry_time)}}</td><td>{% for ep in c.entry_points %}<div class="entrypoint">{{loop.index}}차 {{ep.price}} · {{format_kst(ep.time)}}</div>{% endfor %}</td><td>{{c.entry_price}}</td><td>{{format_kst(c.exit_time)}}</td><td>{{c.exit_price}}</td><td>{% if c.entry_time and c.exit_time %}{{format_minutes_compact((c.exit_time-c.entry_time).total_seconds()/60)}}{% else %}-{% endif %}</td><td class="{{'pos' if c.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(c.return_pct)}}%</td></tr>{% endfor %}</tbody></table></div></details>{% endfor %}{% else %}<div class="hero">아직 완료 데이터가 없습니다.</div>{% endif %}
 </div></body></html>''', combo=combo, period_key=period_key, format_kst=_format_iso_kst)
 

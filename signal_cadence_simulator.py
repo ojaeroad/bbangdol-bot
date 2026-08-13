@@ -1,12 +1,13 @@
-# V44_FINAL_SIMULATOR: 첫 LOW는 집중, 두 번째 유효 LOW부터 최대 3회 분할진입
+# V93_FIVE_MIN_SIMULATOR: 5분 유효 쿨타임 + 시간봉별 집중 리셋 분석 포함
 """저점·고점 반복 알람 축소 B안 과거 데이터 시뮬레이터 v2.
 
 핵심 계산 원칙
 - 매수 LOW의 첫 신호는 '집중 알림'일 뿐 진입하지 않는다.
 - 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입한다.
-- ALL(현재): 첫 신호 이후 기존 공통 5분 쿨타임으로 최대 3회 진입.
-- FULL(원 주기): 첫 신호 이후 원 시간봉의 다음 자연 경계부터 최대 3회 진입.
-- HALF(운영 주기): 첫 신호 이후 운영 주기의 다음 자연 경계부터 최대 3회 진입.
+- ALL(1분 원본): 첫 신호 이후 기존 공통 5분 쿨타임으로 최대 3회 진입.
+- FIVE(5분 운영): 유효 알람은 마지막 전송 후 5분, 집중 리셋은 5m/15m=15분, 30m=30분, 1h 이상=60분.
+- FULL(자기 시간봉): 첫 신호 이후 원 시간봉의 다음 자연 경계부터 최대 3회 진입.
+- HALF(절반 주기): 첫 신호 이후 기존 절반 주기의 다음 자연 경계부터 최대 3회 진입.
 - 매도 HIGH는 샘플링하지 않고 첫 유효 HIGH 신호에서 전량 종료한다.
 
 이 계산으로 원 주기를 기다리는 동안 LOW 상태가 사라져 진입하지 못한 경우와,
@@ -64,6 +65,15 @@ EXIT_GROUPS = {
 EPISODE_GAP_SECONDS = 125
 CURRENT_ENTRY_COOLDOWN_SECONDS = 300
 MAX_ENTRIES = 3
+FIVE_VALID_COOLDOWN_SECONDS = 300
+FIVE_RESET_MINUTES = {
+    "3m": 15, "5m": 15, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 60, "4h": 60, "6h": 60, "12h": 60,
+    "1d": 60, "3d": 60, "1w": 60, "1M": 60,
+}
+
+def _five_reset_minutes(tf: str) -> int:
+    return FIVE_RESET_MINUTES.get(tf, 60)
 
 
 def _operating_minutes(market: str, tf: str) -> int:
@@ -151,10 +161,9 @@ def _slot(dt: datetime, minutes: int) -> int:
 
 
 def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
-    """실제 텔레그램에 표시될 알람 수를 계산한다.
+    """실제 텔레그램에 표시될 알람 수를 방식별로 계산한다.
 
-    최초 LOW/HIGH는 즉시 포함하고, 같은 상태의 반복만 경계 주기로 줄인다.
-    이 함수는 알람 수 계산용이며, 진입 계산은 _simulate_cycles에서 별도로 한다.
+    FIVE는 V93 실제 운영과 동일하게 '집중 기준 리셋 + 5분 유효 쿨타임'을 적용한다.
     """
     if mode == "ALL":
         return list(signals)
@@ -163,10 +172,27 @@ def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, A
     state: dict[tuple[str, str, str], dict[str, Any]] = {}
     for signal in signals:
         key = (signal["symbol"], signal["type"], signal["tf"])
+        previous = state.get(key)
+
+        if mode == "FIVE":
+            reset_sec = _five_reset_minutes(signal["tf"]) * 60
+            new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= reset_sec
+            if new_episode:
+                sampled.append(signal)
+                state[key] = {"focus_time": signal["time"], "last_sent": signal["time"], "valid_count": 0}
+                continue
+            valid_count = int(previous.get("valid_count", 0))
+            since_sent = (signal["time"] - previous["last_sent"]).total_seconds()
+            if valid_count < MAX_ENTRIES and since_sent >= FIVE_VALID_COOLDOWN_SECONDS:
+                sampled.append(signal)
+                previous["last_sent"] = signal["time"]
+                previous["valid_count"] = valid_count + 1
+            state[key] = previous
+            continue
+
         cadence = signal["mins"] if mode == "FULL" else _operating_minutes(
             signal["market"], signal["tf"]
         )
-        previous = state.get(key)
         new_episode = (
             previous is None
             or (signal["time"] - previous["last_time"]).total_seconds() > EPISODE_GAP_SECONDS
@@ -180,7 +206,6 @@ def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, A
         state[key] = {"last_time": signal["time"], "sent_slot": sent_slot}
     return sampled
 
-
 def _entry_allowed(
     signal: dict[str, Any],
     episode: dict[str, Any],
@@ -190,11 +215,10 @@ def _entry_allowed(
     """첫 집중 신호 이후 해당 방식에서 이 LOW를 실제 분할진입으로 쓸지 판정."""
     if episode["signal_count"] <= 1:
         return False
-
     if position and len(position["entries"]) >= MAX_ENTRIES:
         return False
 
-    if mode == "ALL":
+    if mode in {"ALL", "FIVE"}:
         last_entry_time = position["entries"][-1]["time"] if position else episode["focus_time"]
         return (signal["time"] - last_entry_time).total_seconds() >= CURRENT_ENTRY_COOLDOWN_SECONDS
 
@@ -202,14 +226,12 @@ def _entry_allowed(
         signal["market"], signal["tf"]
     )
     current_slot = _slot(signal["time"], cadence)
-    # 최초 집중 신호가 속한 슬롯은 진입하지 않고, 다음 자연 경계부터 진입한다.
     if current_slot <= episode["focus_slot"]:
         return False
     if episode.get("last_entry_slot") == current_slot:
         return False
     episode["last_entry_slot"] = current_slot
     return True
-
 
 def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]:
     """집중 알림과 실제 진입을 분리하여 완료사이클을 재계산한다."""
@@ -223,14 +245,20 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
         if signal["type"] == "LOW":
             key = (signal["symbol"], signal["group"], signal["tf"])
             previous = episodes.get(key)
-            new_episode = (
-                previous is None
-                or (signal["time"] - previous["last_time"]).total_seconds() > EPISODE_GAP_SECONDS
-            )
-            if new_episode:
-                cadence = signal["mins"] if mode != "HALF" else _operating_minutes(
-                    signal["market"], signal["tf"]
+            if mode == "FIVE":
+                new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= _five_reset_minutes(signal["tf"]) * 60
+            else:
+                new_episode = (
+                    previous is None
+                    or (signal["time"] - previous["last_time"]).total_seconds() > EPISODE_GAP_SECONDS
                 )
+            if new_episode:
+                if mode == "FIVE":
+                    cadence = 5
+                else:
+                    cadence = signal["mins"] if mode != "HALF" else _operating_minutes(
+                        signal["market"], signal["tf"]
+                    )
                 episode = {
                     "id": next_episode_id,
                     "key": key,
@@ -397,7 +425,7 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
     symbols = sorted({str(s.get("symbol") or "") for s in signals if s.get("symbol")})
     by_code: dict[str, dict[tuple[str, str, str, str], list[dict[str, Any]]]] = {}
     all_keys: set[tuple[str, str, str, str]] = set()
-    for code in ("ALL", "FULL", "HALF"):
+    for code in ("ALL", "FIVE", "FULL", "HALF"):
         bucket: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
         for cycle in simulations.get(code, {}).get("cycles", []):
             key = (
@@ -424,7 +452,7 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
             for key in group_keys:
                 _, _, entry_tf, exit_tf = key
                 variants = []
-                for code, label in (("ALL", "1분 원본"), ("FULL", "자기 시간봉"), ("HALF", "절반/운영")):
+                for code, label in (("ALL", "1분 원본"), ("FIVE", "5분 주기"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
                     detail = _latest_cycle_detail(by_code[code].get(key, []), code)
                     variants.append({"code": code, "label": label, "detail": detail})
                 rows.append({"entry_tf": entry_tf, "exit_tf": exit_tf, "variants": variants})
@@ -434,8 +462,8 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
 
 
 def _coin_scalp_combinations(simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """현재 운영(HALF) 기준 코인 단타 5m/15m 매수×매도 4개 조합 성과."""
-    cycles = simulations.get("HALF", {}).get("cycles", [])
+    """V93 현재 운영(FIVE) 기준 코인 단타 5m/15m 매수×매도 4개 조합 성과."""
+    cycles = simulations.get("FIVE", {}).get("cycles", [])
     rows: list[dict[str, Any]] = []
     for entry_tf in ("5m", "15m"):
         for exit_tf in ("5m", "15m"):
@@ -461,8 +489,8 @@ def _coin_scalp_combinations(simulations: dict[str, dict[str, Any]]) -> list[dic
 
 
 def _coin_scalp_details(simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """운영(HALF) 기준 단타 4개 조합의 종목별/사이클별 상세 데이터."""
-    cycles = simulations.get("HALF", {}).get("cycles", [])
+    """V93 운영(FIVE) 기준 단타 4개 조합의 종목별/사이클별 상세 데이터."""
+    cycles = simulations.get("FIVE", {}).get("cycles", [])
     output: list[dict[str, Any]] = []
     for entry_tf in ("5m", "15m"):
         for exit_tf in ("5m", "15m"):
@@ -501,9 +529,10 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     simulations: dict[str, dict[str, Any]] = {}
 
     labels = (
-        ("ALL", "현재 방식"),
-        ("FULL", "B안 · 원 시간봉 주기"),
-        ("HALF", "B안 · 운영 주기"),
+        ("ALL", "1분 원본"),
+        ("FIVE", "5분 주기 · V93 운영"),
+        ("FULL", "자기 시간봉 주기"),
+        ("HALF", "절반 주기"),
     )
     for code, label in labels:
         sampled = _sample_alerts(signals, code)
@@ -519,13 +548,16 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     timeframe_rows: list[dict[str, Any]] = []
     for tf in sorted({s["tf"] for s in signals}, key=lambda value: TF_MINUTES.get(value, 999999)):
         raw = [s for s in signals if s["tf"] == tf]
+        five = _sample_alerts(raw, "FIVE")
         full = _sample_alerts(raw, "FULL")
         half = _sample_alerts(raw, "HALF")
         timeframe_rows.append({
             "timeframe": tf,
             "raw_count": len(raw),
+            "five_count": len(five),
             "full_count": len(full),
             "half_count": len(half),
+            "five_reduction_pct": ((len(raw) - len(five)) / len(raw) * 100) if raw else 0.0,
             "full_reduction_pct": ((len(raw) - len(full)) / len(raw) * 100) if raw else 0.0,
             "half_reduction_pct": ((len(raw) - len(half)) / len(raw) * 100) if raw else 0.0,
         })
@@ -534,7 +566,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     for group in GROUPS.get(market, {}):
         item = {"group": group, "group_label": GROUP_LABEL[group], "variants": []}
         raw_group_count = len([s for s in signals if s["group"] == group])
-        for code, short_label in (("ALL", "현재"), ("FULL", "원 주기"), ("HALF", "운영 주기")):
+        for code, short_label in (("ALL", "1분 원본"), ("FIVE", "5분 주기"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
             group_sample_count = len([s for s in alert_samples[code] if s["group"] == group])
             group_cycles = [c for c in simulations[code]["cycles"] if c["group"] == group]
             group_focus = [
@@ -572,13 +604,13 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     timeframe_performance: list[dict[str, Any]] = []
     for tf in sorted({s["tf"] for s in signals}, key=lambda value: TF_MINUTES.get(value, 999999)):
         row = {"timeframe": tf, "group": _group(market, tf), "group_label": GROUP_LABEL.get(_group(market, tf), ""), "variants": []}
-        for code, label in (("ALL", "1분 원본"), ("FULL", "자기 시간봉"), ("HALF", "절반/운영")):
+        for code, label in (("ALL", "1분 원본"), ("FIVE", "5분 주기"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
             tf_cycles = [c for c in simulations[code]["cycles"] if c["entry_tf"] == tf]
             row["variants"].append({"code": code, "label": label, **_cycle_stats(tf_cycles)})
         timeframe_performance.append(row)
 
     recent_cycles: list[dict[str, Any]] = []
-    for code in ("ALL", "FULL", "HALF"):
+    for code in ("ALL", "FIVE", "FULL", "HALF"):
         for cycle in simulations[code]["cycles"]:
             recent_cycles.append(_serialise_cycle(cycle, code))
     recent_cycles.sort(key=lambda c: c.get("exit_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
@@ -602,8 +634,8 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "
-            "원 주기는 다음 원 시간봉 경계, 운영 주기는 다음 절반 시간봉 경계부터 진입하며, "
-            "매도는 첫 유효 HIGH에서 전량 종료한 저장 신호 기반 가정 결과입니다."
+            "5분 주기는 V93 실제 운영 규칙(유효 5분 쿨타임, 5m/15m=15분·30m=30분·1h+=60분 집중 리셋), "
+            "자기 시간봉과 절반 주기는 비교 연구용이며, 매도는 기존 성과 시뮬레이션 원칙대로 첫 유효 HIGH에서 전량 종료한 저장 신호 기반 가정 결과입니다."
         ),
     }
 
