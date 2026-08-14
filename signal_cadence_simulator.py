@@ -1,3 +1,4 @@
+# V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 × 3/5분할 + 집중 단독 연구
 # V95_RESEARCH_CADENCE: 3분 쿨타임 + 정시5분 연구 + MAE/MFE 성과분석
 # V94_ADMIN_STAGE_RESEARCH: 운영 진입 3회 유지 + 관리자 유효1~5 단계 연구
 # V93_FIVE_MIN_SIMULATOR: 5분 유효 쿨타임 + 시간봉별 집중 리셋 분석 포함
@@ -628,6 +629,180 @@ def _attach_mae_mfe(simulations: dict[str, dict[str, Any]]) -> None:
         c["mfe_pct"] = max(0.0, (high - entry) / entry * 100.0)
         c["mae_mfe_candle_count"] = len(window)
 
+
+
+def _simulate_entry_plan(
+    signals: list[dict[str, Any]],
+    *,
+    include_focus: bool,
+    max_entries: int,
+    focus_only: bool = False,
+) -> dict[str, Any]:
+    """V96 관리자 연구용 5분 단계 진입 시나리오.
+
+    실제 Telegram/실제 운영 진입에는 영향을 주지 않는다.
+    - 집중 단독: 집중에서 1회만 진입
+    - 집중 포함 N분할: 집중 + 유효1... 순서로 최대 N회
+    - 집중 스킵 N분할: 유효1... 순서로 최대 N회
+
+    단계 간격은 현재 운영과 동일한 5분이며 집중 리셋도 현재 운영 규칙을 따른다.
+    HIGH 청산 규칙은 기존 cadence 시뮬레이터와 동일하게 첫 유효 HIGH에서 전량 종료한다.
+    """
+    episodes: dict[tuple[str, str, str], dict[str, Any]] = {}
+    open_positions: dict[tuple[str, str, str], dict[str, Any]] = {}
+    episode_records: list[dict[str, Any]] = []
+    cycles: list[dict[str, Any]] = []
+
+    def add_entry(key: tuple[str, str, str], signal: dict[str, Any], episode: dict[str, Any], stage: int) -> None:
+        position = open_positions.get(key)
+        if position is None:
+            position = {
+                "symbol": signal["symbol"],
+                "group": signal["group"],
+                "entry_tf": signal["tf"],
+                "entries": [],
+            }
+            open_positions[key] = position
+        if len(position["entries"]) >= max_entries:
+            return
+        position["entries"].append({**signal, "research_stage": stage})
+        episode["entered"] = True
+
+    for signal in signals:
+        if signal["type"] == "LOW":
+            key = (signal["symbol"], signal["group"], signal["tf"])
+            previous = episodes.get(key)
+            reset_sec = _five_reset_minutes(signal["tf"]) * 60
+            new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= reset_sec
+
+            if new_episode:
+                episode = {
+                    "key": key,
+                    "group": signal["group"],
+                    "tf": signal["tf"],
+                    "focus_time": signal["time"],
+                    "focus_price": signal["price"],
+                    "last_stage_time": signal["time"],
+                    "stage": 0,
+                    "entered": False,
+                }
+                episodes[key] = episode
+                episode_records.append(episode)
+                if include_focus:
+                    add_entry(key, signal, episode, 0)
+                continue
+
+            episode = previous
+            if focus_only:
+                continue
+            if int(episode.get("stage", 0)) >= MAX_ADMIN_VALID_STAGES:
+                continue
+            if (signal["time"] - episode["last_stage_time"]).total_seconds() < FIVE_VALID_COOLDOWN_SECONDS:
+                continue
+
+            stage = int(episode.get("stage", 0)) + 1
+            episode["stage"] = stage
+            episode["last_stage_time"] = signal["time"]
+
+            position = open_positions.get(key)
+            current_entries = len(position["entries"]) if position else 0
+            if current_entries >= max_entries:
+                continue
+
+            # 집중 포함: 집중이 1차이므로 유효1부터 2차.
+            # 집중 스킵: 유효1이 1차.
+            add_entry(key, signal, episode, stage)
+            continue
+
+        if signal["type"] == "HIGH":
+            for key, position in list(open_positions.items()):
+                symbol, entry_group, _entry_tf = key
+                if symbol != signal["symbol"]:
+                    continue
+                if signal["group"] not in EXIT_GROUPS.get(entry_group, set()):
+                    continue
+                if not position["entries"] or signal["time"] <= position["entries"][-1]["time"]:
+                    continue
+
+                avg_price = sum(item["price"] for item in position["entries"]) / len(position["entries"])
+                return_pct = ((signal["price"] - avg_price) / avg_price * 100) if avg_price else 0.0
+                cycles.append({
+                    "symbol": symbol,
+                    "group": entry_group,
+                    "entry_tf": position["entry_tf"],
+                    "exit_tf": signal["tf"],
+                    "return_pct": return_pct,
+                    "entries": len(position["entries"]),
+                    "entry_price": avg_price,
+                    "entry_time": position["entries"][0]["time"],
+                    "entry_points": [
+                        {
+                            "price": item["price"],
+                            "time": item["time"],
+                            "stage": int(item.get("research_stage", 0)),
+                        }
+                        for item in position["entries"]
+                    ],
+                    "exit_price": signal["price"],
+                    "exit_time": signal["time"],
+                })
+                del open_positions[key]
+
+    return {
+        "cycles": cycles,
+        "episodes": episode_records,
+        "focus_count": len(episode_records),
+        "entered_focus_count": sum(1 for e in episode_records if e.get("entered")),
+        "no_entry_focus_count": sum(1 for e in episode_records if not e.get("entered")),
+        "open_position_count": len(open_positions),
+    }
+
+
+def _entry_plan_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
+    """V96: 같은 원본 신호를 다섯 가지 매수 방식으로 재계산한다."""
+    plans = [
+        ("FOCUS_ONLY", "집중 단독 1회", True, 1, True, "집중 100% 1회 진입"),
+        ("FOCUS_3", "집중 포함 3분할", True, 3, False, "집중 + 유효1 + 유효2"),
+        ("FOCUS_5", "집중 포함 5분할", True, 5, False, "집중 + 유효1 + 유효2 + 유효3 + 유효4"),
+        ("SKIP_3", "집중 스킵 3분할 · 현재운영", False, 3, False, "유효1 + 유효2 + 유효3"),
+        ("SKIP_5", "집중 스킵 5분할 · 연구", False, 5, False, "유효1 + 유효2 + 유효3 + 유효4 + 유효5"),
+    ]
+    sims: dict[str, dict[str, Any]] = {}
+    for code, _label, include_focus, max_entries, focus_only, _desc in plans:
+        sims[code] = _simulate_entry_plan(
+            signals,
+            include_focus=include_focus,
+            max_entries=max_entries,
+            focus_only=focus_only,
+        )
+
+    # 기존 5분봉 저장 데이터로 다섯 연구 시나리오의 MAE/MFE도 한 번에 계산.
+    _attach_mae_mfe(sims)
+
+    rows: list[dict[str, Any]] = []
+    for code, label, _include_focus, max_entries, _focus_only, description in plans:
+        stat = _cycle_stats(sims[code]["cycles"])
+        rows.append({
+            "code": code,
+            "label": label,
+            "description": description,
+            "max_entries": max_entries,
+            **stat,
+        })
+
+    by_timeframe: list[dict[str, Any]] = []
+    timeframes = sorted({s["tf"] for s in signals if s["type"] == "LOW"}, key=lambda x: TF_MINUTES.get(x, 999999))
+    for tf in timeframes:
+        item = {"timeframe": tf, "group": _group(signals[0]["market"], tf) if signals else None, "variants": []}
+        item["group_label"] = GROUP_LABEL.get(item["group"], "")
+        for code, label, _a, _b, _c, description in plans:
+            tf_cycles = [c for c in sims[code]["cycles"] if c.get("entry_tf") == tf]
+            item["variants"].append({"code": code, "label": label, "description": description, **_cycle_stats(tf_cycles)})
+        by_timeframe.append(item)
+
+    return {"plans": rows, "by_timeframe": by_timeframe}
+
+
 def _admin_stage_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
     """Reconstruct focus + VALID1..VALID5 from raw signals without changing trade entries.
 
@@ -770,8 +945,10 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     scalp_details = _coin_scalp_details(simulations) if market == "COIN" else []
 
     admin_stage_research = _admin_stage_research(signals)
+    entry_plan_research = _entry_plan_research(signals)
     return {
         "admin_stage_research": admin_stage_research,
+        "entry_plan_research": entry_plan_research,
         "market": market,
         "period_key": period_key,
         "raw_signal_count": len(signals),
@@ -788,7 +965,8 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "
             "5분 쿨타임은 현재 실제 운영 규칙(5m/15m=15분·30m=30분·1h+=60분 집중 리셋)이며, "
             "3분 쿨타임과 정시 5분봉은 Telegram 전송 없는 관리자 연구용입니다. 자기 시간봉·절반 주기도 비교 연구용입니다. "
-            "MAE/MFE는 저장된 5분봉이 존재하는 완료사이클만 계산하므로 과거 미수집 구간은 빈칸으로 남습니다."
+            "MAE/MFE는 저장된 5분봉이 존재하는 완료사이클만 계산하므로 과거 미수집 구간은 빈칸으로 남습니다. "
+            "V96 관리자 연구에서는 집중 단독, 집중 포함 3/5분할, 집중 스킵 3/5분할을 동일 원본 신호로 별도 비교합니다."
         ),
     }
 

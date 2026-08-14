@@ -1,3 +1,4 @@
+# V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 3·5분할 + 집중 단독 성과연구
 # V95_CADENCE_RESEARCH: 3분 쿨타임 + 정시5분 + MAE/MFE 성과표
 # V94_RESEARCH_COLLECTION: SMA 단일화 + 관리자 유효1~5 + BB/MAE-MFE 연구 수집
 # V93_FIVE_MIN_CADENCE: 전 알람 5분 유효 쿨타임 + 시간봉별 집중 리셋 + 5분 주기 분석
@@ -82,7 +83,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v93-five-minute-cadence")
+APP_VERSION  = os.getenv("APP_VERSION", "v96-entry-plan-research")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -2894,6 +2895,42 @@ def performance_cadence_fragment():
       <td>{{v.mae_mfe_samples or 0}}회</td>
     </tr>{% endfor %}</tbody>
   </table></div>
+
+  <h3 style="margin-top:22px">집중 포함 여부 · 분할매수 5가지 연구</h3>
+  <div class="analysis-note" style="margin-bottom:10px">
+    <b>실제 Telegram 운영은 변경하지 않습니다.</b> 같은 5분 운영 원본을 관리자에서만 다섯 가지 가상 매수 방식으로 다시 계산합니다.<br>
+    ① <b>집중 단독 1회</b> = 집중에서 100% 1회 진입 ·
+    ② <b>집중 포함 3분할</b> = 집중+유효1+유효2 ·
+    ③ <b>집중 포함 5분할</b> = 집중+유효1~유효4 ·
+    ④ <b>집중 스킵 3분할</b> = 유효1~유효3(현재운영) ·
+    ⑤ <b>집중 스킵 5분할</b> = 유효1~유효5(연구).
+    <br><span class="small">모든 분할은 동일 비중으로 평균진입가를 계산합니다. MAE(최대 불리 움직임)는 진입 후 가장 크게 불리해진 폭, MFE(최대 유리 움직임)는 가장 크게 유리해진 폭입니다.</span>
+  </div>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>매수 방식</th><th>진입 구성</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>평균 진입횟수</th><th>평균 보유</th><th>평균 MAE<br><span class="small">최대 불리</span></th><th>평균 MFE<br><span class="small">최대 유리</span></th><th>표본</th></tr></thead>
+    <tbody>{% for v in cadence_simulation.entry_plan_research.plans %}<tr>
+      <td><b>{{v.label}}</b></td><td class="small">{{v.description}}</td><td>{{v.completed_cycles}}회</td>
+      <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
+      <td>{% if v.average_holding_minutes is not none %}{{format_minutes_compact(v.average_holding_minutes)}}{% else %}-{% endif %}</td>
+      <td class="neg">{% if v.average_mae_pct is not none %}{{'%+.2f'|format(v.average_mae_pct)}}%{% else %}-{% endif %}</td>
+      <td class="pos">{% if v.average_mfe_pct is not none %}{{'%+.2f'|format(v.average_mfe_pct)}}%{% else %}-{% endif %}</td><td>{{v.mae_mfe_samples or 0}}회</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+
+  <details style="margin-top:12px"><summary style="cursor:pointer;font-weight:900">시간봉별 5가지 매수 방식 상세</summary>
+  <div style="overflow-x:auto;margin-top:10px"><table class="cadence-table">
+    <thead><tr><th>포지션</th><th>시간봉</th><th>매수 방식</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>평균 진입</th><th>MAE</th><th>MFE</th><th>표본</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.entry_plan_research.by_timeframe %}{% for v in r.variants %}<tr>
+      <td>{{r.group_label}}</td><td><b>{{r.timeframe}}</b></td><td>{{v.label}}</td><td>{{v.completed_cycles}}회</td>
+      <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
+      <td class="neg">{% if v.average_mae_pct is not none %}{{'%+.2f'|format(v.average_mae_pct)}}%{% else %}-{% endif %}</td>
+      <td class="pos">{% if v.average_mfe_pct is not none %}{{'%+.2f'|format(v.average_mfe_pct)}}%{% else %}-{% endif %}</td><td>{{v.mae_mfe_samples or 0}}회</td>
+    </tr>{% endfor %}{% endfor %}</tbody>
+  </table></div></details>
 
   <h3 style="margin-top:22px">시간봉별 6가지 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
