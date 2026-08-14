@@ -7,7 +7,7 @@
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V92_DETAIL_UI: 단타 상세/예측 종목정렬/클릭 hover 강화
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
-# app.py — unified webhook + BNC trade + TG UI (multi-symbol & risk modes)
+# app.py — V99 spot-symbol migration + unified webhook + BNC trade + TG UI
 import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile, gc
 import csv
 import io
@@ -1695,8 +1695,26 @@ KRX_SYMBOL_NAMES = {
 }
 
 
-def _clean_symbol_code(symbol):
+# V99: SOL/SUI는 현물 심볼을 공식 표시/저장명으로 사용한다.
+_V99_SPOT_SYMBOL_MAP = {"SOLUSDT.P": "SOLUSDT", "SUIUSDT.P": "SUIUSDT"}
+
+def _canonical_alert_symbol(symbol):
     text = str(symbol or "").strip().upper()
+    return _V99_SPOT_SYMBOL_MAP.get(text, text)
+
+def _canonicalize_tv_payload(data):
+    out = dict(data or {})
+    old = str(out.get("symbol", "") or "").strip().upper()
+    new = _canonical_alert_symbol(old)
+    if old and new != old:
+        out["symbol"] = new
+        for key in ("msg", "message"):
+            if out.get(key) is not None:
+                out[key] = str(out[key]).replace(old, new)
+    return out
+
+def _clean_symbol_code(symbol):
+    text = _canonical_alert_symbol(symbol)
     if ":" in text:
         text = text.split(":")[-1]
     if text.endswith(".KS") or text.endswith(".KQ"):
@@ -5979,6 +5997,7 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
 @app.post("/bot")
 def tv_webhook_legacy():
     data = request.get_json(silent=True, force=True) or {}
+    data = _canonicalize_tv_payload(data)
     bad = _require_webhook_secret(data)
     if bad: return bad
     event_type = str(data.get("event_type", "")).upper()
@@ -5999,6 +6018,7 @@ def tv_webhook_legacy():
 @app.post("/webhook")
 def tv_webhook_new():
     data = request.get_json(silent=True, force=True) or {}
+    data = _canonicalize_tv_payload(data)
     bad = _require_webhook_secret(data)
     if bad: return bad
     event_type = str(data.get("event_type", "")).upper()

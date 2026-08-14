@@ -24,6 +24,28 @@ log = logging.getLogger("bbangdol-performance")
 
 PERFORMANCE_DATABASE_URL = os.getenv("PERFORMANCE_DATABASE_URL", "").strip()
 
+# V99: SOL/SUI 현물 전환. 과거 선물 심볼을 현물 심볼로 1회 치환하고,
+# 이후 동일 두 심볼이 .P로 들어와도 성과 DB에는 현물명으로 저장한다.
+_SYMBOL_CANONICAL_MAP = {
+    "SOLUSDT.P": "SOLUSDT",
+    "SUIUSDT.P": "SUIUSDT",
+}
+
+def canonical_performance_symbol(symbol: Any) -> str:
+    text = str(symbol or "").strip().upper()
+    return _SYMBOL_CANONICAL_MAP.get(text, text)
+
+def _canonicalize_payload_symbol(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload or {})
+    old = str(out.get("symbol", "") or "").strip().upper()
+    new = canonical_performance_symbol(old)
+    if old and new != old:
+        out["symbol"] = new
+        for key in ("msg", "message"):
+            if out.get(key) is not None:
+                out[key] = str(out[key]).replace(old, new)
+    return out
+
 # V63_MEMORY_FIX: webhook 1건마다 새 Thread를 만들지 않는다.
 # Render 512MB 인스턴스에서 반복 알람이 몰릴 때 수백 개의 스레드/DB 연결이
 # 동시에 생겨 OOM이 발생하는 것을 막기 위해 저장 작업을 고정 worker pool로 제한한다.
@@ -201,6 +223,12 @@ CREATE TABLE IF NOT EXISTS performance_prediction_watch (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS performance_data_migrations (
+    migration_key VARCHAR(100) PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    detail JSONB
+);
+
 CREATE TABLE IF NOT EXISTS performance_page_visits (
     id BIGSERIAL PRIMARY KEY,
     page_path VARCHAR(200) NOT NULL,
@@ -235,8 +263,103 @@ def _connect() -> psycopg.Connection:
     )
 
 
+def _apply_v99_spot_symbol_migration(conn: psycopg.Connection) -> None:
+    """One-time merge: SOLUSDT.P/SUIUSDT.P -> spot names without losing history."""
+    migration_key = "v99_sol_sui_futures_to_spot"
+    exists = conn.execute(
+        "SELECT 1 FROM performance_data_migrations WHERE migration_key=%s",
+        (migration_key,),
+    ).fetchone()
+    if exists:
+        return
+
+    merged = {}
+    for old_symbol, new_symbol in _SYMBOL_CANONICAL_MAP.items():
+        counts = {}
+
+        # Time-series tables have UNIQUE(symbol, bar_time). Remove only true overlaps first.
+        for table in ("performance_candles_1m", "performance_candles_5m"):
+            deleted = conn.execute(
+                f"""DELETE FROM {table} old_row
+                    USING {table} new_row
+                    WHERE old_row.symbol=%s AND new_row.symbol=%s
+                      AND old_row.bar_time=new_row.bar_time""",
+                (old_symbol, new_symbol),
+            ).rowcount
+            updated = conn.execute(
+                f"UPDATE {table} SET symbol=%s WHERE symbol=%s",
+                (new_symbol, old_symbol),
+            ).rowcount
+            counts[table] = {"dedup_deleted": int(deleted or 0), "renamed": int(updated or 0)}
+
+        # Merge active candle-watch state if both old/new keys exist.
+        conn.execute(
+            """INSERT INTO performance_candle_watch(
+                       symbol,exchange,raw_exchange,started_at,active,need_1m,need_5m,updated_at
+                   )
+                   SELECT %s,exchange,raw_exchange,started_at,active,need_1m,need_5m,updated_at
+                   FROM performance_candle_watch WHERE symbol=%s
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     exchange=COALESCE(EXCLUDED.exchange, performance_candle_watch.exchange),
+                     raw_exchange=COALESCE(EXCLUDED.raw_exchange, performance_candle_watch.raw_exchange),
+                     started_at=LEAST(EXCLUDED.started_at, performance_candle_watch.started_at),
+                     active=(EXCLUDED.active OR performance_candle_watch.active),
+                     need_1m=(EXCLUDED.need_1m OR performance_candle_watch.need_1m),
+                     need_5m=(EXCLUDED.need_5m OR performance_candle_watch.need_5m),
+                     updated_at=GREATEST(EXCLUDED.updated_at, performance_candle_watch.updated_at)""",
+            (new_symbol, old_symbol),
+        )
+        conn.execute("DELETE FROM performance_candle_watch WHERE symbol=%s", (old_symbol,))
+
+        # Merge prediction watch using the later expiry.
+        conn.execute(
+            """INSERT INTO performance_prediction_watch(symbol,active_until,updated_at)
+                   SELECT %s,active_until,updated_at FROM performance_prediction_watch WHERE symbol=%s
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     active_until=GREATEST(EXCLUDED.active_until, performance_prediction_watch.active_until),
+                     updated_at=GREATEST(EXCLUDED.updated_at, performance_prediction_watch.updated_at)""",
+            (new_symbol, old_symbol),
+        )
+        conn.execute("DELETE FROM performance_prediction_watch WHERE symbol=%s", (old_symbol,))
+
+        # Event/history tables can be renamed in place; their hashes remain historical IDs.
+        counts["performance_signals"] = int(conn.execute(
+            """UPDATE performance_signals
+                   SET symbol=%s,
+                       raw_message=REPLACE(raw_message,%s,%s),
+                       raw_payload=jsonb_set(raw_payload,'{symbol}',to_jsonb(%s::text),true)
+                   WHERE symbol=%s""",
+            (new_symbol, old_symbol, new_symbol, new_symbol, old_symbol),
+        ).rowcount or 0)
+        counts["performance_prediction_snapshots"] = int(conn.execute(
+            """UPDATE performance_prediction_snapshots
+                   SET symbol=%s,
+                       raw_payload=jsonb_set(raw_payload,'{symbol}',to_jsonb(%s::text),true)
+                   WHERE symbol=%s""",
+            (new_symbol, new_symbol, old_symbol),
+        ).rowcount or 0)
+        counts["performance_cadence_stage_events"] = int(conn.execute(
+            """UPDATE performance_cadence_stage_events
+                   SET symbol=%s, raw_message=REPLACE(COALESCE(raw_message,''),%s,%s)
+                   WHERE symbol=%s""",
+            (new_symbol, old_symbol, new_symbol, old_symbol),
+        ).rowcount or 0)
+        counts["performance_cycle_chart_archive"] = int(conn.execute(
+            "UPDATE performance_cycle_chart_archive SET symbol=%s WHERE symbol=%s",
+            (new_symbol, old_symbol),
+        ).rowcount or 0)
+        merged[old_symbol] = counts
+
+    conn.execute(
+        """INSERT INTO performance_data_migrations(migration_key,detail)
+               VALUES (%s,%s) ON CONFLICT(migration_key) DO NOTHING""",
+        (migration_key, Jsonb(merged)),
+    )
+    log.warning("V99 spot-symbol migration applied: %s", merged)
+
+
 def ensure_schema() -> None:
-    """Create the table and indexes once per process."""
+    """Create schema and apply safe one-time data migrations once per process."""
     global _SCHEMA_READY
     if _SCHEMA_READY:
         return
@@ -245,6 +368,7 @@ def ensure_schema() -> None:
             return
         with _connect() as conn:
             conn.execute(_CREATE_TABLE_SQL)
+            _apply_v99_spot_symbol_migration(conn)
         _SCHEMA_READY = True
         log.info("Performance database schema is ready")
 
@@ -561,7 +685,7 @@ def _prediction_detail_signature(metrics: dict[str, Any]) -> str:
 
 
 def _prediction_hash(payload: dict[str, Any]) -> str:
-    symbol = str(payload.get("symbol", "")).strip()
+    symbol = canonical_performance_symbol(payload.get("symbol", ""))
     source_tf = str(payload.get("source_timeframe", "")).strip()
     target_tf = str(payload.get("target_timeframe", "")).strip()
     signal_time = str(payload.get("signal_time", "")).strip()
@@ -571,8 +695,9 @@ def _prediction_hash(payload: dict[str, Any]) -> str:
 def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
     if str(payload.get("event_type", "")).strip().upper() != "PREDICTION_SNAPSHOT_1Q":
         return False
+    payload = _canonicalize_payload_symbol(payload)
 
-    symbol = str(payload.get("symbol", "")).strip()
+    symbol = canonical_performance_symbol(payload.get("symbol", ""))
     source_tf = str(payload.get("source_timeframe", "")).strip()
     target_tf = str(payload.get("target_timeframe", "")).strip()
     if not symbol or not source_tf or not target_tf:
@@ -854,12 +979,13 @@ def prediction_research_summary(limit: int = 100, category_key: str | None = Non
 
 def save_signal(payload: dict[str, Any]) -> bool:
     """Save one eligible TradingView signal. Returns True if inserted."""
+    payload = _canonicalize_payload_symbol(payload)
     route = str(payload.get("route", payload.get("type", ""))).strip().upper()
     if not is_performance_route(route):
         return False
 
     message = str(payload.get("msg", payload.get("message", ""))).strip()
-    symbol = str(payload.get("symbol", "")).strip()
+    symbol = canonical_performance_symbol(payload.get("symbol", ""))
     if not message or not symbol:
         raise ValueError("performance signal is missing symbol or msg")
 
@@ -965,7 +1091,8 @@ def queue_signal_save(payload: dict[str, Any]) -> None:
 
 def save_cadence_stage_event(payload: dict[str, Any]) -> bool:
     """Persist visible stages 0~3 and admin-only research stages 4~5."""
-    symbol = str(payload.get("symbol", "")).strip()
+    payload = _canonicalize_payload_symbol(payload)
+    symbol = canonical_performance_symbol(payload.get("symbol", ""))
     timeframe = str(payload.get("timeframe", "")).strip()
     direction = str(payload.get("direction", "")).strip().upper()
     if not symbol or not timeframe or direction not in {"LOW", "HIGH"}:
@@ -1015,11 +1142,20 @@ def health_summary() -> dict[str, Any]:
         row = conn.execute(
             "SELECT COUNT(*), MAX(received_at) FROM performance_signals"
         ).fetchone()
+        mig = conn.execute(
+            "SELECT applied_at, detail FROM performance_data_migrations WHERE migration_key=%s",
+            ("v99_sol_sui_futures_to_spot",),
+        ).fetchone()
     return {
         "ok": True,
         "database": "connected",
         "signal_count": int(row[0]),
         "latest_signal_at": row[1].isoformat() if row[1] else None,
+        "v99_spot_symbol_migration": {
+            "applied": bool(mig),
+            "applied_at": mig[0].isoformat() if mig and mig[0] else None,
+            "detail": mig[1] if mig else None,
+        },
     }
 
 
@@ -1083,7 +1219,8 @@ def _candle_interval(payload: dict[str, Any]) -> int:
 
 def save_candle(payload: dict[str, Any]) -> bool:
     """Store confirmed TradingView 1m/5m OHLC only while its resolution is required."""
-    symbol = str(payload.get("symbol", "")).strip()
+    payload = _canonicalize_payload_symbol(payload)
+    symbol = canonical_performance_symbol(payload.get("symbol", ""))
     if not symbol:
         raise ValueError("candle payload missing symbol")
     interval = _candle_interval(payload)
