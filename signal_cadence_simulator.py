@@ -1,3 +1,4 @@
+# V98_HIGHER_TREND_REGIME_RESEARCH: 스윙 이상 D/W Stoch 큰형 + SMA20/60 조합 연구
 # V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 빈칸 표시
 # V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 × 3/5분할 + 집중 단독 연구
 # V95_RESEARCH_CADENCE: 3분 쿨타임 + 정시5분 연구 + MAE/MFE 성과분석
@@ -20,6 +21,7 @@
 from __future__ import annotations
 
 import os
+import json
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
@@ -131,7 +133,7 @@ def _period_start(period_key: str) -> datetime | None:
 def _load(market_filter: str, period_key: str) -> list[dict[str, Any]]:
     start = _period_start(period_key)
     sql = """SELECT id,strategy,COALESCE(exchange,raw_exchange),symbol,signal_type,timeframe,
-                    COALESCE(timeframe_minutes,0),signal_price,received_at
+                    COALESCE(timeframe_minutes,0),signal_price,received_at,raw_payload
              FROM performance_signals
              WHERE signal_price IS NOT NULL
                AND signal_type IN ('LOW','HIGH')
@@ -155,11 +157,20 @@ def _load(market_filter: str, period_key: str) -> list[dict[str, Any]]:
         minutes = int(row[6] or TF_MINUTES.get(tf, 0))
         if not minutes:
             continue
+        raw_payload = row[9] or {}
+        if isinstance(raw_payload, str):
+            try:
+                raw_payload = json.loads(raw_payload)
+            except Exception:
+                raw_payload = {}
+        trend_context = raw_payload.get("trend_context") if isinstance(raw_payload, dict) else None
+        if not isinstance(trend_context, dict):
+            trend_context = {}
         result.append({
             "id": row[0], "market": market, "exchange": row[2],
             "symbol": row[3], "type": row[4], "tf": tf,
             "mins": minutes, "price": float(row[7]), "time": row[8],
-            "group": group,
+            "group": group, "trend_context": trend_context,
         })
     return result
 
@@ -353,6 +364,7 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
                     "group": entry_group,
                     "entry_tf": position["entry_tf"],
                     "exit_tf": signal["tf"],
+                    "trend_context": dict((position["entries"][0].get("trend_context") or {})),
                     "return_pct": return_pct,
                     "entries": len(position["entries"]),
                     "entry_price": avg_price,
@@ -768,6 +780,7 @@ def _simulate_entry_plan(
                     "group": entry_group,
                     "entry_tf": position["entry_tf"],
                     "exit_tf": signal["tf"],
+                    "trend_context": dict((position["entries"][0].get("trend_context") or {})),
                     "return_pct": return_pct,
                     "entries": len(position["entries"]),
                     "entry_price": avg_price,
@@ -876,8 +889,132 @@ def _entry_plan_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
             symbol_item["by_timeframe"].append(tf_item)
         by_symbol.append(symbol_item)
 
-    return {"plans": rows, "by_timeframe": by_timeframe, "by_symbol": by_symbol}
+    return {"plans": rows, "by_timeframe": by_timeframe, "by_symbol": by_symbol, "_simulations": sims}
 
+
+
+def _trend_pair_label(day_value: str, week_value: str, *, kind: str) -> str:
+    d = str(day_value or "NA").upper()
+    w = str(week_value or "NA").upper()
+    if kind == "sma":
+        names = {"GOLDEN": "정배열", "DEAD": "역배열", "EQUAL": "동일", "NA": "미수집"}
+    else:
+        names = {"UP": "상승", "DOWN": "하락", "FLAT": "횡보", "NA": "미수집"}
+    return f"일봉 {names.get(d,d)} · 주봉 {names.get(w,w)}"
+
+
+def _trend_cycle_stats(cycles: list[dict[str, Any]]) -> dict[str, Any]:
+    stat = _cycle_stats(cycles)
+    return {
+        "samples": stat.get("completed_cycles", 0),
+        "win_rate_pct": stat.get("win_rate_pct"),
+        "average_return_pct": stat.get("average_return_pct"),
+        "average_entries": stat.get("average_entries"),
+        "average_holding_minutes": stat.get("average_holding_minutes"),
+        "average_mae_pct": stat.get("average_mae_pct"),
+        "average_mfe_pct": stat.get("average_mfe_pct"),
+        "mae_mfe_samples": stat.get("mae_mfe_samples", 0),
+    }
+
+
+def _group_trend_cycles(cycles: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for cycle in cycles:
+        if cycle.get("group") not in {"SWING", "LONG", "LIFE"}:
+            continue
+        ctx = cycle.get("trend_context") or {}
+        if not ctx:
+            continue
+        if mode == "sma":
+            d = str(ctx.get("daily_sma_state") or "NA").upper()
+            w = str(ctx.get("weekly_sma_state") or "NA").upper()
+            if d not in {"GOLDEN", "DEAD"} or w not in {"GOLDEN", "DEAD"}:
+                continue
+        else:
+            d = str(ctx.get("daily_stoch_dir") or "NA").upper()
+            w = str(ctx.get("weekly_stoch_dir") or "NA").upper()
+            if d not in {"UP", "DOWN"} or w not in {"UP", "DOWN"}:
+                continue
+        buckets[(d, w)].append(cycle)
+    rows = []
+    for (d, w), bucket in buckets.items():
+        rows.append({
+            "day": d, "week": w,
+            "label": _trend_pair_label(d, w, kind=mode),
+            **_trend_cycle_stats(bucket),
+        })
+    rows.sort(key=lambda r: (-int(r.get("samples") or 0), str(r.get("label") or "")))
+    return rows
+
+
+def _combined_trend_cycles(cycles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for cycle in cycles:
+        if cycle.get("group") not in {"SWING", "LONG", "LIFE"}:
+            continue
+        ctx = cycle.get("trend_context") or {}
+        ds = str(ctx.get("daily_sma_state") or "NA").upper()
+        ws = str(ctx.get("weekly_sma_state") or "NA").upper()
+        dk = str(ctx.get("daily_stoch_dir") or "NA").upper()
+        wk = str(ctx.get("weekly_stoch_dir") or "NA").upper()
+        if ds not in {"GOLDEN", "DEAD"} or ws not in {"GOLDEN", "DEAD"}:
+            continue
+        if dk not in {"UP", "DOWN"} or wk not in {"UP", "DOWN"}:
+            continue
+        buckets[(ds, ws, dk, wk)].append(cycle)
+    rows = []
+    for (ds, ws, dk, wk), bucket in buckets.items():
+        rows.append({
+            "sma_label": _trend_pair_label(ds, ws, kind="sma"),
+            "stoch_label": _trend_pair_label(dk, wk, kind="stoch"),
+            "daily_sma": ds, "weekly_sma": ws,
+            "daily_stoch": dk, "weekly_stoch": wk,
+            **_trend_cycle_stats(bucket),
+        })
+    rows.sort(key=lambda r: (-int(r.get("samples") or 0), str(r.get("sma_label") or ""), str(r.get("stoch_label") or "")))
+    return rows
+
+
+def _higher_trend_research(
+    cadence_sims: dict[str, dict[str, Any]],
+    entry_plan_sims: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """V98: 스윙 이상 완료사이클을 일/주봉 대추세 태그로 분류한다.
+
+    원본 신호 payload의 trend_context만 사용하며 신규 DB 조회나 신규 TradingView request는 없다.
+    따라서 데이터가 수집되기 시작한 V98 이후 완료사이클부터 표본이 생성된다.
+    """
+    cadence_labels = {
+        "ALL": "1분 원본", "THREE": "3분 쿨타임", "FIVE": "5분 현재운영",
+        "CLOCK5": "정시 5분봉", "FULL": "자기 시간봉", "HALF": "절반 주기",
+    }
+    entry_labels = {
+        "FOCUS_ONLY": "집중 단독 1회", "FOCUS_3": "집중 포함 3분할",
+        "FOCUS_5": "집중 포함 5분할", "SKIP_3": "집중 스킵 3분할 · 현재운영",
+        "SKIP_5": "집중 스킵 5분할 · 연구",
+    }
+    def pack(sims: dict[str, dict[str, Any]], labels: dict[str, str]) -> list[dict[str, Any]]:
+        out = []
+        for code, label in labels.items():
+            cycles = list((sims.get(code) or {}).get("cycles") or [])
+            tagged = [c for c in cycles if c.get("group") in {"SWING", "LONG", "LIFE"} and c.get("trend_context")]
+            out.append({
+                "code": code, "label": label, "tagged_samples": len(tagged),
+                "sma": _group_trend_cycles(tagged, "sma"),
+                "stoch": _group_trend_cycles(tagged, "stoch"),
+                "combined": _combined_trend_cycles(tagged),
+            })
+        return out
+    cadence = pack(cadence_sims, cadence_labels)
+    entries = pack(entry_plan_sims, entry_labels)
+    five = next((x for x in cadence if x["code"] == "FIVE"), {"sma": [], "stoch": [], "combined": [], "tagged_samples": 0})
+    return {
+        "current_five": five,
+        "cadence_variants": cadence,
+        "entry_plan_variants": entries,
+        "scope": "스윙 이상(SWING/LONG/LIFE)만 적용",
+        "minimum_sample_recommendation": 20,
+    }
 
 def _admin_stage_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
     """Reconstruct focus + VALID1..VALID5 from raw signals without changing trade entries.
@@ -1022,9 +1159,12 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
 
     admin_stage_research = _admin_stage_research(signals)
     entry_plan_research = _entry_plan_research(signals)
+    higher_trend_research = _higher_trend_research(simulations, entry_plan_research.get("_simulations") or {})
+    entry_plan_research.pop("_simulations", None)
     return {
         "admin_stage_research": admin_stage_research,
         "entry_plan_research": entry_plan_research,
+        "higher_trend_research": higher_trend_research,
         "market": market,
         "period_key": period_key,
         "raw_signal_count": len(signals),
@@ -1042,7 +1182,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
             "5분 쿨타임은 현재 실제 운영 규칙(5m/15m=15분·30m=30분·1h+=60분 집중 리셋)이며, "
             "3분 쿨타임과 정시 5분봉은 Telegram 전송 없는 관리자 연구용입니다. 자기 시간봉·절반 주기도 비교 연구용입니다. "
             "MAE/MFE는 저장된 5분봉이 존재하는 완료사이클만 계산하므로 과거 미수집 구간은 빈칸으로 남습니다. "
-            "V97 관리자 연구에서는 집중 단독, 집중 포함 3/5분할, 집중 스킵 3/5분할을 종목별·시간봉별로도 별도 비교하며, 미완료 시간봉 조합은 빈칸으로 유지합니다."
+            "V98 관리자 연구에서는 스윙 이상 신호에 일봉/주봉 Stoch(20,12,12) 큰형 방향과 SMA20/60 정·역배열 태그를 추가하며, V98 이후 태그가 있는 완료사이클부터 조합별 성과를 계산합니다. V97 관리자 연구에서는 집중 단독, 집중 포함 3/5분할, 집중 스킵 3/5분할을 종목별·시간봉별로도 별도 비교하며, 미완료 시간봉 조합은 빈칸으로 유지합니다."
         ),
     }
 

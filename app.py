@@ -1,3 +1,4 @@
+# V98_HIGHER_TREND_REGIME_RESEARCH
 # V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 표시
 # V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 3·5분할 + 집중 단독 성과연구
 # V95_CADENCE_RESEARCH: 3분 쿨타임 + 정시5분 + MAE/MFE 성과표
@@ -2963,6 +2964,75 @@ def performance_cadence_fragment():
       <td class="pos">{% if v.average_mfe_pct is not none %}{{'%+.2f'|format(v.average_mfe_pct)}}%{% else %}-{% endif %}</td><td>{{v.mae_mfe_samples or 0}}회</td>
     </tr>{% endfor %}{% endfor %}</tbody>
   </table></div></details>
+
+
+  <h3 style="margin-top:24px">상위 추세 태그 연구 · 스윙 이상</h3>
+  <div class="analysis-note" style="margin-bottom:12px">
+    <b>적용 범위:</b> 스윙·장기·인생타점만 분석하며 코인 단타 5m/15m에는 적용하지 않습니다.<br>
+    <b>스토캐스틱 큰형</b> = Stoch(20,12,12)의 K선 기울기를 일봉·주봉 각각 상승/하락으로 태깅합니다. K/D 실제값과 골든·데드 교차도 원본 payload에 함께 저장합니다.<br>
+    <b>SMA 정·역배열</b> = 일봉과 주봉 각각 SMA20 &gt; SMA60이면 정배열, SMA20 &lt; SMA60이면 역배열입니다. 따라서 일·주봉 조합은 정/정 · 정/역 · 역/정 · 역/역 4가지입니다.<br>
+    <b>중요:</b> 이 표는 V98 적용 이후 상위 추세 태그가 저장된 완료사이클부터 집계됩니다. 기존 과거 신호를 억지로 소급하지 않습니다. 조합 결론은 표본 <b>20건 이상</b>부터 우선 검토하세요.
+  </div>
+
+  <h4 style="margin:14px 0 8px">현재운영 5분 쿨타임 · SMA20/60 일봉×주봉 4조합</h4>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>상위 추세 조합</th><th>표본</th><th>승률</th><th>평균 수익률</th><th>평균 진입</th><th>평균 보유</th><th>평균 MAE</th><th>평균 MFE</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.higher_trend_research.current_five.sma %}<tr>
+      <td><b>{{r.label}}</b></td><td>{{r.samples}}회</td>
+      <td>{% if r.win_rate_pct is not none %}{{'%.1f'|format(r.win_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td class="{{'pos' if r.average_return_pct is not none and r.average_return_pct >= 0 else 'neg' if r.average_return_pct is not none else ''}}">{% if r.average_return_pct is not none %}{{'%+.2f'|format(r.average_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if r.average_entries is not none %}{{'%.2f'|format(r.average_entries)}}회{% else %}-{% endif %}</td>
+      <td>{% if r.average_holding_minutes is not none %}{{format_minutes_compact(r.average_holding_minutes)}}{% else %}-{% endif %}</td>
+      <td class="neg">{% if r.average_mae_pct is not none %}{{'%+.2f'|format(r.average_mae_pct)}}%{% else %}-{% endif %}</td>
+      <td class="pos">{% if r.average_mfe_pct is not none %}{{'%+.2f'|format(r.average_mfe_pct)}}%{% else %}-{% endif %}</td>
+    </tr>{% else %}<tr><td colspan="8" class="small">V98 상위 추세 태그 데이터가 아직 없습니다. 새 완료사이클부터 자동 누적됩니다.</td></tr>{% endfor %}</tbody>
+  </table></div>
+
+  <h4 style="margin:18px 0 8px">현재운영 5분 쿨타임 · Stoch 큰형 일봉×주봉 4방향</h4>
+  <div style="overflow-x:auto"><table class="cadence-table">
+    <thead><tr><th>큰형 방향 조합</th><th>표본</th><th>승률</th><th>평균 수익률</th><th>평균 진입</th><th>평균 보유</th><th>평균 MAE</th><th>평균 MFE</th></tr></thead>
+    <tbody>{% for r in cadence_simulation.higher_trend_research.current_five.stoch %}<tr>
+      <td><b>{{r.label}}</b></td><td>{{r.samples}}회</td>
+      <td>{% if r.win_rate_pct is not none %}{{'%.1f'|format(r.win_rate_pct)}}%{% else %}-{% endif %}</td>
+      <td class="{{'pos' if r.average_return_pct is not none and r.average_return_pct >= 0 else 'neg' if r.average_return_pct is not none else ''}}">{% if r.average_return_pct is not none %}{{'%+.2f'|format(r.average_return_pct)}}%{% else %}-{% endif %}</td>
+      <td>{% if r.average_entries is not none %}{{'%.2f'|format(r.average_entries)}}회{% else %}-{% endif %}</td>
+      <td>{% if r.average_holding_minutes is not none %}{{format_minutes_compact(r.average_holding_minutes)}}{% else %}-{% endif %}</td>
+      <td class="neg">{% if r.average_mae_pct is not none %}{{'%+.2f'|format(r.average_mae_pct)}}%{% else %}-{% endif %}</td>
+      <td class="pos">{% if r.average_mfe_pct is not none %}{{'%+.2f'|format(r.average_mfe_pct)}}%{% else %}-{% endif %}</td>
+    </tr>{% else %}<tr><td colspan="8" class="small">새 데이터 수집 대기 중입니다.</td></tr>{% endfor %}</tbody>
+  </table></div>
+
+  <details style="margin-top:14px"><summary style="cursor:pointer;font-weight:900">SMA + Stoch 결합 조합 보기</summary>
+    <div class="small" style="margin:8px 0">최대 16조합까지 생길 수 있으므로 표본 수가 작은 조합은 결론에 사용하지 않습니다.</div>
+    <div style="overflow-x:auto"><table class="cadence-table">
+      <thead><tr><th>SMA 일/주봉</th><th>Stoch 큰형 일/주봉</th><th>표본</th><th>승률</th><th>평균 수익률</th><th>MAE</th><th>MFE</th></tr></thead>
+      <tbody>{% for r in cadence_simulation.higher_trend_research.current_five.combined %}<tr>
+        <td>{{r.sma_label}}</td><td>{{r.stoch_label}}</td><td>{{r.samples}}회</td>
+        <td>{% if r.win_rate_pct is not none %}{{'%.1f'|format(r.win_rate_pct)}}%{% else %}-{% endif %}</td>
+        <td class="{{'pos' if r.average_return_pct is not none and r.average_return_pct >= 0 else 'neg' if r.average_return_pct is not none else ''}}">{% if r.average_return_pct is not none %}{{'%+.2f'|format(r.average_return_pct)}}%{% else %}-{% endif %}</td>
+        <td class="neg">{% if r.average_mae_pct is not none %}{{'%+.2f'|format(r.average_mae_pct)}}%{% else %}-{% endif %}</td>
+        <td class="pos">{% if r.average_mfe_pct is not none %}{{'%+.2f'|format(r.average_mfe_pct)}}%{% else %}-{% endif %}</td>
+      </tr>{% else %}<tr><td colspan="7" class="small">결합 표본 수집 대기 중입니다.</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </details>
+
+  <details style="margin-top:12px"><summary style="cursor:pointer;font-weight:900">6가지 알람주기별 상위 추세 결과</summary>
+    {% for mode in cadence_simulation.higher_trend_research.cadence_variants %}
+      <div style="font-weight:900;margin:14px 0 6px">{{mode.label}} · 태그 완료 {{mode.tagged_samples}}회</div>
+      <div style="overflow-x:auto"><table class="cadence-table"><thead><tr><th>SMA 일/주봉 조합</th><th>표본</th><th>승률</th><th>평균 수익률</th></tr></thead><tbody>
+      {% for r in mode.sma %}<tr><td>{{r.label}}</td><td>{{r.samples}}회</td><td>{% if r.win_rate_pct is not none %}{{'%.1f'|format(r.win_rate_pct)}}%{% else %}-{% endif %}</td><td class="{{'pos' if r.average_return_pct is not none and r.average_return_pct >= 0 else 'neg' if r.average_return_pct is not none else ''}}">{% if r.average_return_pct is not none %}{{'%+.2f'|format(r.average_return_pct)}}%{% else %}-{% endif %}</td></tr>{% else %}<tr><td colspan="4">-</td></tr>{% endfor %}
+      </tbody></table></div>
+    {% endfor %}
+  </details>
+
+  <details style="margin-top:12px"><summary style="cursor:pointer;font-weight:900">5가지 매수방식별 상위 추세 결과</summary>
+    {% for mode in cadence_simulation.higher_trend_research.entry_plan_variants %}
+      <div style="font-weight:900;margin:14px 0 6px">{{mode.label}} · 태그 완료 {{mode.tagged_samples}}회</div>
+      <div style="overflow-x:auto"><table class="cadence-table"><thead><tr><th>SMA 일/주봉 조합</th><th>표본</th><th>승률</th><th>평균 수익률</th></tr></thead><tbody>
+      {% for r in mode.sma %}<tr><td>{{r.label}}</td><td>{{r.samples}}회</td><td>{% if r.win_rate_pct is not none %}{{'%.1f'|format(r.win_rate_pct)}}%{% else %}-{% endif %}</td><td class="{{'pos' if r.average_return_pct is not none and r.average_return_pct >= 0 else 'neg' if r.average_return_pct is not none else ''}}">{% if r.average_return_pct is not none %}{{'%+.2f'|format(r.average_return_pct)}}%{% else %}-{% endif %}</td></tr>{% else %}<tr><td colspan="4">-</td></tr>{% endfor %}
+      </tbody></table></div>
+    {% endfor %}
+  </details>
 
   <h3 style="margin-top:22px">시간봉별 6가지 주기 비교</h3>
   <div style="overflow-x:auto"><table class="cadence-table">
