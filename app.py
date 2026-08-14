@@ -1,3 +1,4 @@
+# V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 표시
 # V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 3·5분할 + 집중 단독 성과연구
 # V95_CADENCE_RESEARCH: 3분 쿨타임 + 정시5분 + MAE/MFE 성과표
 # V94_RESEARCH_COLLECTION: SMA 단일화 + 관리자 유효1~5 + BB/MAE-MFE 연구 수집
@@ -2919,6 +2920,37 @@ def performance_cadence_fragment():
     </tr>{% endfor %}</tbody>
   </table></div>
 
+  <h3 style="margin-top:22px">종목별 5가지 매수 방식 결과</h3>
+  <div class="small" style="margin-bottom:10px">같은 종목의 원본 신호를 집중 단독·집중 포함 3/5분할·집중 스킵 3/5분할로 각각 다시 계산합니다. 완료 결과가 없는 방식은 빈칸(-)으로 남겨 비교 기준을 유지합니다.</div>
+  {% for item in cadence_simulation.entry_plan_research.by_symbol %}
+  <details class="cadence-symbol-card" style="margin-bottom:12px">
+    <summary class="cadence-symbol-title" style="cursor:pointer;font-weight:900;font-size:18px">{{symbol_display(item.symbol, 'KRX' if category == 'KOREA_1Q' else '')}}</summary>
+    <div style="overflow-x:auto;margin-top:10px"><table class="cadence-table">
+      <thead><tr><th>매수 방식</th><th>진입 구성</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>평균 진입</th><th>평균 보유</th><th>MAE</th><th>MFE</th><th>표본</th></tr></thead>
+      <tbody>{% for v in item.plans %}<tr>
+        <td><b>{{v.label}}</b></td><td class="small">{{v.description}}</td><td>{{v.completed_cycles}}회</td>
+        <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
+        <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+        <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
+        <td>{% if v.average_holding_minutes is not none %}{{format_minutes_compact(v.average_holding_minutes)}}{% else %}-{% endif %}</td>
+        <td class="neg">{% if v.average_mae_pct is not none %}{{'%+.2f'|format(v.average_mae_pct)}}%{% else %}-{% endif %}</td>
+        <td class="pos">{% if v.average_mfe_pct is not none %}{{'%+.2f'|format(v.average_mfe_pct)}}%{% else %}-{% endif %}</td><td>{{v.mae_mfe_samples or 0}}회</td>
+      </tr>{% endfor %}</tbody>
+    </table></div>
+    <details style="margin:10px 0 0"><summary style="cursor:pointer;font-weight:800">시간봉별 보기</summary>
+      <div style="overflow-x:auto;margin-top:8px"><table class="cadence-table">
+        <thead><tr><th>포지션</th><th>시간봉</th><th>매수 방식</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>평균 진입</th></tr></thead>
+        <tbody>{% for r in item.by_timeframe %}{% for v in r.variants %}<tr>
+          <td>{{r.group_label}}</td><td><b>{{r.timeframe}}</b></td><td>{{v.label}}</td><td>{{v.completed_cycles}}회</td>
+          <td>{% if v.win_rate_pct is not none %}{{'%.1f'|format(v.win_rate_pct)}}%{% else %}-{% endif %}</td>
+          <td class="{{'pos' if v.average_return_pct is not none and v.average_return_pct >= 0 else 'neg' if v.average_return_pct is not none else ''}}">{% if v.average_return_pct is not none %}{{'%+.2f'|format(v.average_return_pct)}}%{% else %}-{% endif %}</td>
+          <td>{% if v.average_entries is not none %}{{'%.2f'|format(v.average_entries)}}회{% else %}-{% endif %}</td>
+        </tr>{% endfor %}{% endfor %}</tbody>
+      </table></div>
+    </details>
+  </details>
+  {% else %}<div class="empty-note">종목별 매수 방식 연구 데이터가 아직 없습니다.</div>{% endfor %}
+
   <details style="margin-top:12px"><summary style="cursor:pointer;font-weight:900">시간봉별 5가지 매수 방식 상세</summary>
   <div style="overflow-x:auto;margin-top:10px"><table class="cadence-table">
     <thead><tr><th>포지션</th><th>시간봉</th><th>매수 방식</th><th>완료</th><th>승률</th><th>평균 수익률</th><th>평균 진입</th><th>MAE</th><th>MFE</th><th>표본</th></tr></thead>
@@ -2957,7 +2989,7 @@ def performance_cadence_fragment():
   </table></div>
 
   <h3 style="margin-top:22px">최근 실제 진입 타점 비교 · 종목별</h3>
-  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 1분 원본·3분 연구·5분 현재운영·정시5분 연구·자기 시간봉·절반 주기를 나란히 비교하며 아직 결과가 없는 방식은 빈칸(-)으로 둡니다.</div>
+  <div class="small" style="margin-bottom:10px">종목 → 포지션 → 매수/매도 시간봉 조합 순서로 묶었습니다. 해당 종목에서 실제 LOW 신호가 있었던 4h 등 진입 시간봉은 완료 사이클이 없어도 표시하고, 허용 매도 시간봉 조합의 미집계 결과는 빈칸(-)으로 둡니다. 1분 원본·3분 연구·5분 현재운영·정시5분 연구·자기 시간봉·절반 주기를 나란히 비교합니다.</div>
   {% for item in cadence_simulation.symbol_recent_comparison %}
   <details class="cadence-symbol-card" style="margin-bottom:12px">
     <summary class="cadence-symbol-title" style="cursor:pointer;font-weight:900;font-size:18px">{{symbol_display(item.symbol, 'KRX' if category == 'KOREA_1Q' else '')}}</summary>

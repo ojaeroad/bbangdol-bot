@@ -1,3 +1,4 @@
+# V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 빈칸 표시
 # V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 × 3/5분할 + 집중 단독 연구
 # V95_RESEARCH_CADENCE: 3분 쿨타임 + 정시5분 연구 + MAE/MFE 성과분석
 # V94_ADMIN_STAGE_RESEARCH: 운영 진입 3회 유지 + 관리자 유효1~5 단계 연구
@@ -460,11 +461,26 @@ def _latest_cycle_detail(cycles: list[dict[str, Any]], code: str) -> dict[str, A
     return _serialise_cycle(latest, code)
 
 
-def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """종목별로 1분원본/자기시간봉/절반운영의 최근 실제 진입 타점을 같은 조합에서 비교한다.
+def _allowed_exit_timeframes(market: str, entry_group: str) -> list[str]:
+    """해당 진입 포지션에서 분석 가능한 매도 시간봉 후보를 운영 규칙 순서대로 반환한다."""
+    allowed_groups = EXIT_GROUPS.get(entry_group, set())
+    candidates: list[str] = []
+    for group_name, tfs in GROUPS.get(market, {}).items():
+        if group_name not in allowed_groups:
+            continue
+        for tf in tfs:
+            if tf not in candidates:
+                candidates.append(tf)
+    return sorted(candidates, key=lambda tf: TF_MINUTES.get(tf, 999999))
 
-    동일 종목·포지션·매수TF→매도TF 조합 중 세 방식 어느 하나라도 완료 결과가 있으면 한 줄을 만들고,
-    아직 결과가 없는 방식은 None으로 남겨 화면에서 빈칸(-)으로 보여준다.
+
+def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simulations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """종목별 최근 실제 진입 타점 비교.
+
+    V97:
+    - 완료 사이클이 없어도 해당 종목에서 LOW 신호가 존재한 진입 시간봉은 분석 행을 만든다.
+    - 허용 가능한 매도 시간봉 조합을 미리 생성하고 결과가 없으면 빈칸(-)으로 남긴다.
+    - 따라서 4h 같은 장기 시간봉도 '완료 0회'라는 이유만으로 화면에서 사라지지 않는다.
     """
     symbols = sorted({str(s.get("symbol") or "") for s in signals if s.get("symbol")})
     by_code: dict[str, dict[tuple[str, str, str, str], list[dict[str, Any]]]] = {}
@@ -482,13 +498,27 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
             all_keys.add(key)
         by_code[code] = bucket
 
+    for sig in signals:
+        if sig.get("type") != "LOW":
+            continue
+        symbol = str(sig.get("symbol") or "")
+        group = str(sig.get("group") or "")
+        tf = str(sig.get("tf") or "")
+        if symbol and group and tf:
+            for exit_tf in _allowed_exit_timeframes(market, group):
+                all_keys.add((symbol, group, tf, exit_tf))
+
     output: list[dict[str, Any]] = []
     for symbol in symbols:
         symbol_keys = [k for k in all_keys if k[0] == symbol]
         if not symbol_keys:
             continue
         groups_out = []
-        group_names = sorted({k[1] for k in symbol_keys}, key=lambda g: list(GROUPS.get(market, {})).index(g) if g in GROUPS.get(market, {}) else 99)
+        market_group_order = list(GROUPS.get(market, {}))
+        group_names = sorted(
+            {k[1] for k in symbol_keys},
+            key=lambda g: market_group_order.index(g) if g in market_group_order else 99,
+        )
         for group in group_names:
             rows = []
             group_keys = [k for k in symbol_keys if k[1] == group]
@@ -496,7 +526,14 @@ def _symbol_recent_comparison(market: str, signals: list[dict[str, Any]], simula
             for key in group_keys:
                 _, _, entry_tf, exit_tf = key
                 variants = []
-                for code, label in (("ALL", "1분 원본"), ("THREE", "3분 쿨타임 · 연구"), ("FIVE", "5분 쿨타임 · 현재운영"), ("CLOCK5", "정시 5분봉 · 연구"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
+                for code, label in (
+                    ("ALL", "1분 원본"),
+                    ("THREE", "3분 쿨타임 · 연구"),
+                    ("FIVE", "5분 쿨타임 · 현재운영"),
+                    ("CLOCK5", "정시 5분봉 · 연구"),
+                    ("FULL", "자기 시간봉"),
+                    ("HALF", "절반 주기"),
+                ):
                     detail = _latest_cycle_detail(by_code[code].get(key, []), code)
                     variants.append({"code": code, "label": label, "detail": detail})
                 rows.append({"entry_tf": entry_tf, "exit_tf": exit_tf, "variants": variants})
@@ -800,7 +837,46 @@ def _entry_plan_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
             item["variants"].append({"code": code, "label": label, "description": description, **_cycle_stats(tf_cycles)})
         by_timeframe.append(item)
 
-    return {"plans": rows, "by_timeframe": by_timeframe}
+    by_symbol: list[dict[str, Any]] = []
+    symbols = sorted({str(s.get("symbol") or "") for s in signals if s.get("symbol")})
+    market = signals[0]["market"] if signals else ""
+    for symbol in symbols:
+        symbol_item = {"symbol": symbol, "plans": [], "by_timeframe": []}
+        symbol_low_tfs = sorted(
+            {str(s.get("tf") or "") for s in signals if s.get("type") == "LOW" and str(s.get("symbol") or "") == symbol},
+            key=lambda x: TF_MINUTES.get(x, 999999),
+        )
+        for code, label, _include_focus, max_entries, _focus_only, description in plans:
+            symbol_cycles = [c for c in sims[code]["cycles"] if str(c.get("symbol") or "") == symbol]
+            symbol_item["plans"].append({
+                "code": code,
+                "label": label,
+                "description": description,
+                "max_entries": max_entries,
+                **_cycle_stats(symbol_cycles),
+            })
+        for tf in symbol_low_tfs:
+            tf_item = {
+                "timeframe": tf,
+                "group": _group(market, tf),
+                "group_label": GROUP_LABEL.get(_group(market, tf), ""),
+                "variants": [],
+            }
+            for code, label, _a, _b, _c, description in plans:
+                tf_cycles = [
+                    c for c in sims[code]["cycles"]
+                    if str(c.get("symbol") or "") == symbol and c.get("entry_tf") == tf
+                ]
+                tf_item["variants"].append({
+                    "code": code,
+                    "label": label,
+                    "description": description,
+                    **_cycle_stats(tf_cycles),
+                })
+            symbol_item["by_timeframe"].append(tf_item)
+        by_symbol.append(symbol_item)
+
+    return {"plans": rows, "by_timeframe": by_timeframe, "by_symbol": by_symbol}
 
 
 def _admin_stage_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
@@ -966,7 +1042,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
             "5분 쿨타임은 현재 실제 운영 규칙(5m/15m=15분·30m=30분·1h+=60분 집중 리셋)이며, "
             "3분 쿨타임과 정시 5분봉은 Telegram 전송 없는 관리자 연구용입니다. 자기 시간봉·절반 주기도 비교 연구용입니다. "
             "MAE/MFE는 저장된 5분봉이 존재하는 완료사이클만 계산하므로 과거 미수집 구간은 빈칸으로 남습니다. "
-            "V96 관리자 연구에서는 집중 단독, 집중 포함 3/5분할, 집중 스킵 3/5분할을 동일 원본 신호로 별도 비교합니다."
+            "V97 관리자 연구에서는 집중 단독, 집중 포함 3/5분할, 집중 스킵 3/5분할을 종목별·시간봉별로도 별도 비교하며, 미완료 시간봉 조합은 빈칸으로 유지합니다."
         ),
     }
 
