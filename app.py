@@ -7,7 +7,7 @@
 # V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
 # V92_DETAIL_UI: 단타 상세/예측 종목정렬/클릭 hover 강화
 # V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
-# app.py — V99 spot-symbol migration + unified webhook + BNC trade + TG UI
+# app.py — V100 admin collapsible menu + V99 spot-symbol migration + unified webhook + BNC trade + TG UI
 import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile, gc
 import csv
 import io
@@ -3881,7 +3881,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </div>
 </details>
 
-<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="symbols-performance" open>
+<details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="symbols-performance">
 <summary id="admin-symbol-performance-title" class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목별로 묶고, 각 종목 안에서 매수 시간봉별 성과를 정리합니다. 최근 수익률은 해당 시간봉의 가장 최근 완료 사이클입니다.</div>
@@ -5229,7 +5229,7 @@ summary{cursor:pointer;font-weight:bold}
 .group-card{background:#141416;border:1px solid #303035;border-radius:12px;padding:13px}.group-card.life{border-color:#8c6b20;box-shadow:0 0 0 1px rgba(255,200,87,.12)}.group-title{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--blue);font-size:19px;font-weight:bold;margin-bottom:10px}.group-card.life .group-title{color:var(--yellow)}.tf-row{display:grid;grid-template-columns:55px 55px 70px 85px 85px 80px;gap:7px;padding:8px 0;border-bottom:1px solid #29292d;font-size:13px;align-items:center}.tf-row:last-child{border-bottom:0}.tf-head{color:#aaa;font-size:12px}.life-section{border:2px solid #c89b2b!important;box-shadow:0 0 0 1px rgba(255,200,87,.22),0 0 18px rgba(255,200,87,.08)!important}.life-section>.life-title{color:var(--yellow)!important}.life-section .group-card.life{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#141416)!important;box-shadow:0 0 14px rgba(255,200,87,.08)!important}.life-metric{border:2px solid #c89b2b!important;background:linear-gradient(145deg,#241d0b,#151517)!important}.life-metric .title{color:var(--yellow)!important}.scalp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.scalp-link{display:block;color:inherit;text-decoration:none}.scalp-card{background:#151517;border:1px solid #35353a;border-radius:14px;padding:15px;transition:.16s border-color,.16s transform,.16s box-shadow,.16s background}.scalp-link:hover .scalp-card,.scalp-link:focus .scalp-card{border-color:#62caff;transform:translateY(-2px);box-shadow:0 0 0 1px rgba(98,202,255,.12),0 10px 26px rgba(0,0,0,.22);background:#181a1e}.scalp-card h3{margin:0 0 12px;color:var(--blue);font-size:19px}.scalp-main{font-size:27px;font-weight:900;margin:7px 0}.scalp-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.scalp-stat{background:#101012;border-radius:9px;padding:9px}.scalp-stat small{display:block;color:#aaa;margin-bottom:5px}.scalp-empty{min-height:150px;display:flex;align-items:center;justify-content:center;color:#777}@media(max-width:1100px){.scalp-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.scalp-grid{grid-template-columns:1fr}}
 
 /* v47 관리자 목차: 기존 관리자 전용 기능은 삭제하지 않고 빠른 이동만 추가 */
-.admin-menu-button{display:none;position:sticky;top:8px;z-index:95;width:100%;border:1px solid #56c5fa;background:#12384b;color:#fff;border-radius:11px;padding:11px;font-weight:900;margin-bottom:10px}.admin-side{position:fixed;left:12px;top:150px;width:210px;max-height:calc(100vh - 170px);overflow:auto;background:#15171b;border:1px solid #353943;border-radius:15px;padding:11px;z-index:80}.admin-side-title{color:var(--blue);font-size:18px;font-weight:950;padding:7px 8px 11px}.admin-nav{display:grid;gap:5px}.admin-nav a{display:block;border:0;border-radius:9px;background:transparent;color:#d8dbe1;text-align:left;padding:10px;font-weight:800;cursor:pointer;text-decoration:none}.admin-nav a:hover,.admin-nav a:focus{background:#113b50;color:#fff}.admin-nav a.life{color:var(--yellow)}.admin-nav .admin-only{border-top:1px solid #343840;margin-top:5px;padding-top:12px;color:#ffbf69}.admin-nav .top-link{border-top:1px solid #343840;margin-top:8px;color:#8ed7ff}.cadence-compare-cell{min-width:220px;line-height:1.45}.cadence-compare-cell .ret{font-size:16px;font-weight:900}.cadence-compare-cell .entry{font-size:12px;color:#ddd}.cadence-group-label{color:var(--yellow);font-weight:900}.admin-backdrop{display:none}body.admin-menu-ready{padding-left:246px}.admin-target{scroll-margin-top:16px}
+.admin-menu-button{display:none;position:sticky;top:8px;z-index:95;width:100%;border:1px solid #56c5fa;background:#12384b;color:#fff;border-radius:11px;padding:11px;font-weight:900;margin-bottom:10px}.admin-side{position:fixed;left:12px;top:150px;width:210px;max-height:calc(100vh - 170px);overflow:auto;background:#15171b;border:1px solid #353943;border-radius:15px;padding:11px;z-index:80}.admin-side-title{color:var(--blue);font-size:18px;font-weight:950;padding:7px 8px 11px}.admin-nav{display:grid;gap:6px}.admin-nav a{display:block;border:1px solid transparent;border-radius:9px;background:transparent;color:#d8dbe1;text-align:left;padding:10px;font-weight:800;cursor:pointer;text-decoration:none;transition:.15s background,.15s border-color,.15s color}.admin-nav a:hover,.admin-nav a:focus{background:#113b50;border-color:#3f9bc5;color:#fff}.admin-nav a.life{color:var(--yellow)}.admin-nav .admin-only{color:#ffbf69}.admin-nav .top-link{border-top:1px solid #343840;margin-top:8px;color:#8ed7ff}.admin-menu-group{margin:0;background:transparent;border:1px solid #2f343c;border-radius:10px;padding:0;overflow:hidden}.admin-menu-group>summary{list-style:none;cursor:pointer;padding:10px;color:#9fdcff;font-weight:900;background:#171a1f;display:flex;align-items:center;justify-content:space-between}.admin-menu-group>summary::-webkit-details-marker{display:none}.admin-menu-group>summary:after{content:"＋";font-size:16px;color:#7fcfff}.admin-menu-group[open]>summary:after{content:"－"}.admin-menu-group>summary:hover{background:#1b2630}.admin-menu-group .admin-menu-items{display:grid;gap:2px;padding:5px}.admin-nav>.primary-link{background:#17242c;border-color:#2f6d89;color:#dff5ff}.admin-nav>.primary-link:hover{border-color:#69c9ff;background:#113b50}.cadence-compare-cell{min-width:220px;line-height:1.45}.cadence-compare-cell .ret{font-size:16px;font-weight:900}.cadence-compare-cell .entry{font-size:12px;color:#ddd}.cadence-group-label{color:var(--yellow);font-weight:900}.admin-backdrop{display:none}body.admin-menu-ready{padding-left:246px}.admin-target{scroll-margin-top:16px}
 .card,.group-card,.symbol-card,.cadence-symbol-card,.metric,.member-hook,.detail-symbol,.prediction-symbol-card{transition:.16s border-color,.16s transform,.16s box-shadow,.16s background}.card:hover,.group-card:hover,.symbol-card:hover,.cadence-symbol-card:hover,.metric[href]:hover,.member-hook[href]:hover,.detail-symbol:hover,.prediction-symbol-card:hover{border-color:#62caff}.category-nav a,.period-nav a,.toplinks a,.back-link{transition:.15s border-color,.15s background,.15s color,.15s transform}.category-nav a:hover,.period-nav a:hover{border-color:#62caff!important;background:#143549!important;transform:translateY(-1px)}.toplinks a:hover,.back-link:hover{color:#8ed7ff}.clickable-row{cursor:pointer;transition:.14s background,.14s box-shadow}.clickable-row:hover{background:#18232a!important;box-shadow:inset 3px 0 #62caff}.prediction-symbol-card{border:1px solid #303035;border-radius:13px;overflow:hidden;margin:12px 0;background:#121214}.prediction-symbol-title{padding:12px 14px;background:#18181b;color:#8ed7ff;font-size:18px;font-weight:900;border-bottom:1px solid #303035}.research-guide{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:12px 0 18px}.research-guide>div{background:#111318;border:1px solid #30343b;border-radius:11px;padding:11px}.research-guide b{display:block;color:#8ed7ff;margin-bottom:5px}.research-guide span{color:#aaa;font-size:12px;line-height:1.45}@media(max-width:950px){.research-guide{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.research-guide{grid-template-columns:1fr}}
 @media(max-width:1050px){body.admin-menu-ready{padding-left:12px}.admin-side{display:none;left:12px;right:12px;top:62px;width:auto;max-height:calc(100vh - 80px);box-shadow:0 18px 55px rgba(0,0,0,.58)}.admin-side.open{display:block}.admin-menu-button{display:block}.admin-backdrop.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:70}}
 </style>
@@ -5238,7 +5238,20 @@ summary{cursor:pointer;font-weight:bold}
 <button class="admin-menu-button" id="adminMenuButton" type="button">☰ 관리센터 메뉴</button>
 <div class="admin-backdrop" id="adminBackdrop"></div>
 <aside class="admin-side" id="adminSide"><div class="admin-side-title">관리센터 메뉴</div><nav class="admin-nav" id="adminNav">
-<a href="#admin-positions">포지션별 성과</a><a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a><a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a><a href="#admin-cadence">알람 분석</a><a href="#admin-prediction">상위시간봉 예측 연구</a>{% if selected_category == 'COIN' %}<a href="#admin-scalp">코인 단타 4개 조합</a>{% endif %}<a class="admin-only" href="#admin-only-analysis">관리자 전용 분석</a><a class="top-link" href="#admin-top">↑ 맨 위로</a>
+<a class="primary-link" href="#admin-positions">포지션별 성과</a>
+<details class="admin-menu-group"><summary>성과 요약</summary><div class="admin-menu-items">
+<a href="#admin-top5">수익률·승률 TOP5</a><a href="#admin-recent">최근 완료 10건</a><a class="life" href="#admin-life-title">인생타점 상세</a>
+</div></details>
+<details class="admin-menu-group"><summary>종목 · 시간봉</summary><div class="admin-menu-items">
+<a href="#admin-symbol-performance-title">종목별 성과</a><a href="#admin-timeframe-title">시간봉별 상세</a><a href="#admin-symbols">종목 목록</a>
+</div></details>
+<details class="admin-menu-group"><summary>알람 · 연구</summary><div class="admin-menu-items">
+<a href="#admin-cadence">알람 분석</a><a href="#admin-prediction">상위시간봉 예측 연구</a>{% if selected_category == 'COIN' %}<a href="#admin-scalp">코인 단타 4개 조합</a>{% endif %}
+</div></details>
+<details class="admin-menu-group"><summary>관리자 분석</summary><div class="admin-menu-items">
+<a class="admin-only" href="#admin-only-analysis">관리자 전용 분석</a>
+</div></details>
+<a class="top-link" href="#admin-top">↑ 맨 위로</a>
 </nav></aside>
 <h1>성과운영센터 · 관리센터</h1>
 <div class="toplinks">
@@ -5338,7 +5351,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 
 {% if admin_average_ranking or admin_best_ranking or admin_win_rate_ranking %}
-<details id="admin-top5" class="card collapsible-block" open><summary class="section-title">수익률·승률 TOP 5</summary>
+<details id="admin-top5" class="card collapsible-block"><summary class="section-title">수익률·승률 TOP 5</summary>
 <div class="ranking-grid" style="margin-top:14px">
 <div class="admin-ranking"><h3>평균 수익률 TOP 5</h3>
 {% for s in admin_average_ranking %}
@@ -5368,7 +5381,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endif %}
 
 {% if market_stats.recent_completed %}
-<details id="admin-recent" class="card collapsible-block" open><summary class="section-title">최근 완료 10건</summary><div style="margin-top:14px">
+<details id="admin-recent" class="card collapsible-block"><summary class="section-title">최근 완료 10건</summary><div style="margin-top:14px">
 {% for detail in market_stats.recent_completed %}
 <a class="metric" style="display:grid;grid-template-columns:1fr 2fr 90px;gap:12px;color:#f4f4f4;text-decoration:none;margin:8px 0" href="/performance/member/symbol?category={{selected_category}}&symbol={{detail.symbol}}&from=admin">
 <div><b>{{symbol_display(detail.symbol, detail.exchange)}}</b><div class="small">사이클 #{{detail.cycle}}</div></div>
@@ -5379,7 +5392,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 {% endif %}
 
-<details class="card collapsible-block life-block life-section" open>
+<details class="card collapsible-block life-block life-section">
 <summary id="admin-life-title" class="section-title life-title">인생타점 상세 성과</summary>
 <div class="collapsible-content">
 {% set life_ns = namespace(has_any=false) %}
@@ -5400,12 +5413,12 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% if not life_ns.has_any %}<div class="muted">완료 결과 없음</div>{% endif %}
 </div></details>
 
-<details class="card collapsible-block" open>
+<details class="card collapsible-block">
 <summary class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목별로 묶고, 각 종목 안에서 매수 시간봉별 누적·최근 성과를 비교합니다.</div>
 {% for sym in admin_symbol_rows %}
-<details class="detail-symbol" style="margin-bottom:10px" open>
+<details class="detail-symbol" style="margin-bottom:10px">
 <summary>{{symbol_display(sym.symbol, sym.exchange)}} · 전체 {{sym.member_stats.completed_cycle_count}}사이클</summary>
 <div style="overflow-x:auto">
 <table>
@@ -5453,7 +5466,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 현재 저장된 {{selected.category_label}} 신호가 없습니다.
 </div></div>
 {% elif not selected_symbol %}
-<details id="admin-symbols" class="card collapsible-block" open><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbol-list">
+<details id="admin-symbols" class="card collapsible-block"><summary class="section-title">종목 목록</summary><div class="collapsible-content"><div class="symbol-list">
 {% for s in selected.symbols %}
 <a class="symbol-card" href="/performance/member/symbol?category={{selected_category}}&symbol={{s.symbol}}&from=admin">
 <div class="symbol-card-head">
@@ -5778,6 +5791,15 @@ summary{cursor:pointer;font-weight:bold}
  btn&&btn.addEventListener('click',()=>{side&&side.classList.toggle('open');back&&back.classList.toggle('open')});
  back&&back.addEventListener('click',close);
  document.querySelectorAll('#adminNav a').forEach(a=>a.addEventListener('click',()=>{
+   const href=a.getAttribute('href')||'';
+   if(href.startsWith('#') && href.length>1){
+     const target=document.querySelector(href);
+     if(target){
+       if(target.tagName==='DETAILS') target.open=true;
+       const parentDetails=target.closest('details.collapsible-block');
+       if(parentDetails) parentDetails.open=true;
+     }
+   }
    const id=(a.getAttribute('href')||'').slice(1), target=document.getElementById(id);
    if(target){const details=target.closest('details');if(details)details.open=true;}
    close();
