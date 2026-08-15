@@ -1,5 +1,6 @@
 # V98_HIGHER_TREND_REGIME_RESEARCH
 # V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 표시
+# V102_CADENCE_EPISODE_COOLDOWN: 전 단계 5분 + 종료 후 단타/스윙 자기봉, 장기/인생 60분 재집중
 # V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 3·5분할 + 집중 단독 성과연구
 # V95_CADENCE_RESEARCH: 3분 쿨타임 + 정시5분 + MAE/MFE 성과표
 # V94_RESEARCH_COLLECTION: SMA 단일화 + 관리자 유효1~5 + BB/MAE-MFE 연구 수집
@@ -85,7 +86,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v96-entry-plan-research")
+APP_VERSION  = os.getenv("APP_VERSION", "v102-cadence-episode-cooldown")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -163,10 +164,11 @@ def _mark_sent(bucket: str):
 
 # === Telegram cadence filter (실제 회원 알람 축소) ===
 # Pine/DB 원본 신호는 그대로 저장하고, Telegram 전송만 줄인다.
-# V93 운영 고정 규칙:
-# - 집중 이후 유효 알람은 모든 매수/매도 시간봉에서 5분 쿨타임.
-# - 5m/15m는 집중 시작 후 15분, 30m는 30분, 1h 이상은 60분 뒤 새 집중으로 리셋.
-# - Telegram은 집중 + 유효1~3만 표시. 관리자 연구 DB는 동일 5분 간격으로 유효4~5까지 숨김 수집.
+# V102 운영 고정 규칙:
+# - 집중 → 유효1 → 유효2 → 유효3의 인정 간격은 모든 시간봉에서 5분.
+# - 유효 흐름이 끝난 뒤 새 집중까지의 재집중 쿨타임은 5m=5분, 15m=15분, 30m=30분, 1h 이상=60분.
+# - 흐름 도중 신호가 끊겼다가 같은 재집중 쿨타임 이상 지난 뒤 다시 들어오면 새 집중으로 시작한다.
+# - Telegram은 집중 + 유효1~3만 표시. 관리자 유효4~5는 원본 신호에서 별도 연구 재구성한다.
 TELEGRAM_CADENCE_ENABLED = os.getenv("TELEGRAM_CADENCE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 TELEGRAM_CADENCE_MODE = os.getenv("TELEGRAM_CADENCE_MODE", "CUSTOM").strip().upper()
 TELEGRAM_EPISODE_GAP_SEC = int(os.getenv("TELEGRAM_EPISODE_GAP_SEC", "125"))  # 하위 호환용(실제 판정에는 사용하지 않음)
@@ -190,14 +192,19 @@ _CADENCE_1Q_CUSTOM_MIN = {
 
 # V93 실제 Telegram 운영 규칙. 자연 경계가 아니라 마지막 전송 시점 기준 5분 경과를 사용한다.
 TELEGRAM_VALID_COOLDOWN_MINUTES = 5
-_CADENCE_FOCUS_RESET_MIN = {
-    "3m": 15, "5m": 15, "15m": 15, "30m": 30,
+_CADENCE_POST_EPISODE_COOLDOWN_MIN = {
+    "3m": 3, "5m": 5, "15m": 15, "30m": 30,
     "1h": 60, "2h": 60, "4h": 60, "6h": 60, "12h": 60,
     "1d": 60, "3d": 60, "1w": 60, "1M": 60,
 }
 
 def _focus_reset_minutes(timeframe: str) -> int:
-    return _CADENCE_FOCUS_RESET_MIN.get(_canonical_timeframe(timeframe or ""), 60)
+    """V102: 유효 흐름 종료/중지 후 다음 집중까지의 쿨타임.
+
+    단타·스윙은 자기 시간봉, 장기·인생타점은 60분이다.
+    결과적으로 5m=5, 15m=15, 30m=30, 1h 이상=60분이 된다.
+    """
+    return _CADENCE_POST_EPISODE_COOLDOWN_MIN.get(_canonical_timeframe(timeframe or ""), 60)
 _CADENCE_STATE: Dict[str, Dict[str, Any]] = {}
 _CADENCE_LOCK = threading.Lock()
 
@@ -483,12 +490,18 @@ def _decorate_asset_header(msg: str, symbol: str, route: str = "") -> str:
     return f"{left}{tag}{right}\n{text}"
 
 def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
-    """Telegram V94: visible 0~3, admin research hidden 4~5.
+    """Telegram V102 운영 cadence.
 
-    Visible operation is unchanged from V93:
-      focus -> valid1 -> valid2 -> valid3, five-minute cooldown.
-    Research-only stages valid4/valid5 are persisted to DB but never sent to Telegram.
-    Episode reset: 5m/15m=15m, 30m=30m, 1h+=60m.
+    운영 단계: 집중(0) -> 유효1 -> 유효2 -> 유효3.
+    모든 단계 사이 최소 간격은 5분이다.
+
+    유효 흐름이 완료된 뒤 다음 집중까지:
+      5m=5분, 15m=15분, 30m=30분, 1h 이상=60분.
+    완료 전 신호가 끊긴 경우에도 마지막 원본 신호 이후 같은 시간 이상 공백이
+    생겼다가 다시 들어오면 새 집중으로 본다.
+
+    관리자 유효4/5 연구는 signal_cadence_simulator가 원본 신호로 별도 재구성하므로
+    Telegram 상태와 섞지 않는다.
     """
     if not TELEGRAM_CADENCE_ENABLED:
         return True, msg, "disabled"
@@ -507,7 +520,6 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
     key = f"{sym}|{route_family}|{direction}|{timeframe}"
 
     def record_stage(stage: int, episode_started: float, visible: bool):
-        # DB failures are isolated by the async performance-store worker.
         price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
         try:
             signal_price = float(price_match.group(1).replace(",", "")) if price_match else None
@@ -534,12 +546,33 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                     state.pop(old_key, None)
 
             prev = state.get(key)
+            # V102 이전 상태파일에는 관리자 hidden stage(4/5)가 섞여 있을 수 있으므로
+            # 배포 직후 한 번은 새 규칙으로 깨끗하게 시작한다.
+            if prev is not None and int((prev or {}).get("cadence_schema", 0) or 0) != 102:
+                prev = None
             if prev is not None:
                 try:
-                    episode_started = float(prev.get("episode_started", prev.get("last_stage_at", prev.get("last_sent", 0))) or 0)
+                    episode_count = int(prev.get("episode_count", 0) or 0)
                 except (TypeError, ValueError):
-                    episode_started = 0.0
-                if episode_started <= 0 or now_ts - episode_started >= reset_sec:
+                    episode_count = 0
+                try:
+                    last_stage_at = float(prev.get("last_stage_at", prev.get("last_sent", 0)) or 0)
+                except (TypeError, ValueError):
+                    last_stage_at = 0.0
+                try:
+                    previous_last_seen = float(prev.get("last_seen", last_stage_at) or last_stage_at)
+                except (TypeError, ValueError):
+                    previous_last_seen = last_stage_at
+
+                # V102 핵심:
+                # 1) 유효3까지 완료되면 마지막 유효 시각부터 재집중 쿨타임을 잰다.
+                # 2) 완료 전이라도 원본 신호 자체가 재집중 쿨타임만큼 끊겼다가
+                #    다시 들어오면 이전 흐름은 종료된 것으로 보고 새 집중한다.
+                episode_complete = episode_count >= 3
+                if episode_complete:
+                    if last_stage_at <= 0 or now_ts - last_stage_at >= reset_sec:
+                        prev = None
+                elif previous_last_seen > 0 and now_ts - previous_last_seen >= reset_sec:
                     prev = None
 
             stage_to_record = None
@@ -558,46 +591,41 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
                 episode_started = float(prev.get("episode_started", now_ts) or now_ts)
                 last_stage_at = float(prev.get("last_stage_at", prev.get("last_sent", episode_started)) or episode_started)
                 last_sent = float(prev.get("last_sent", episode_started) or episode_started)
-                if episode_count >= 5:
-                    phase = "SUPPRESS"
+
+                if episode_count >= 3:
+                    phase = "POST_EPISODE_COOLDOWN"
                     should_send = False
                 elif now_ts - last_stage_at >= valid_cooldown_sec:
                     episode_count += 1
                     last_stage_at = now_ts
+                    last_sent = now_ts
                     stage_to_record = episode_count
-                    if episode_count <= 3:
-                        telegram_visible = True
-                        should_send = True
-                        last_sent = now_ts
-                        if direction == "LOW":
-                            phase = "HOLD"
-                        else:
-                            phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
+                    telegram_visible = True
+                    should_send = True
+                    if direction == "LOW":
+                        phase = "HOLD"
                     else:
-                        # Admin-only VALID_4 / VALID_5 research stage.
-                        phase = "ADMIN_RESEARCH"
-                        should_send = False
+                        phase = "EXIT_FINAL" if episode_count == 3 else "EXIT_RECHECK"
                 else:
                     phase = "SUPPRESS"
                     should_send = False
 
+            # 모든 원본 신호에서 last_seen을 갱신해 '신호가 실제로 끊긴 시간'을 판별한다.
             state[key] = {
                 "last_seen": now_ts, "last_sent": last_sent, "last_stage_at": last_stage_at,
                 "episode_started": episode_started, "timeframe": timeframe,
                 "valid_cooldown_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
                 "focus_reset_minutes": reset_minutes, "phase": phase,
-                "episode_count": episode_count,
+                "episode_count": episode_count, "cadence_schema": 102,
             }
             commit_state(state)
             if stage_to_record is not None:
                 record_stage(stage_to_record, episode_started, telegram_visible)
 
             if not should_send:
-                if phase == "ADMIN_RESEARCH":
-                    return False, msg, f"admin_hidden_valid_{episode_count}_of_5"
-                if episode_count >= 5:
-                    return False, msg, f"research_max_5_reached_until_reset_{reset_minutes}m"
-                return False, msg, f"waiting_5m_cooldown_reset_{reset_minutes}m"
+                if phase == "POST_EPISODE_COOLDOWN":
+                    return False, msg, f"episode_complete_wait_reset_{reset_minutes}m"
+                return False, msg, f"waiting_5m_stage_cooldown_reset_{reset_minutes}m"
 
             if direction == "LOW":
                 reason = "low_focus" if phase == "FOCUS" else f"low_valid_{episode_count}_of_3"
@@ -2896,7 +2924,7 @@ def performance_cadence_fragment():
     <b>알람 주기 비교 기준</b><br>
     ① 1분 원본 = TradingView에서 들어온 원본 반복 신호 ·
     ② 3분 쿨타임 = <b>관리자 연구 전용</b> (Telegram 전송 없음) ·
-    ③ 5분 쿨타임 = <b>현재 실제 운영</b> (집중 리셋 5m/15m=15분 · 30m=30분 · 1h 이상=60분) ·
+    ③ 5분 쿨타임 = <b>현재 실제 운영</b> (집중→유효1→유효2→유효3는 모두 5분 간격, 종료/중지 뒤 재집중은 5m=5분 · 15m=15분 · 30m=30분 · 1h 이상=60분) ·
     ④ 정시 5분봉 = <b>:00/:05/:10… 자연 5분 경계 연구</b> (Telegram 전송 없음) ·
     ⑤ 자기 시간봉 = 해당 시간봉의 자연 경계 · ⑥ 절반 주기 = 이전 방식 비교 연구입니다.
     <br><span class="small"><b>MAE(최대 불리 움직임)</b> = 진입 후 종료 전까지 평균진입가보다 가장 불리하게 움직인 최대 하락폭. <b>MFE(최대 유리 움직임)</b> = 같은 구간에서 가장 유리하게 움직인 최대 상승폭. 저장된 5분봉이 있는 완료사이클만 계산하므로 표본 수를 함께 확인하세요.</span>
@@ -2924,6 +2952,7 @@ def performance_cadence_fragment():
     ③ <b>집중 포함 5분할</b> = 집중+유효1~유효4 ·
     ④ <b>집중 스킵 3분할</b> = 유효1~유효3(현재운영) ·
     ⑤ <b>집중 스킵 5분할</b> = 유효1~유효5(연구).
+    <br><span class="small"><b>V102 공통 규칙:</b> 각 방식은 자기 마지막 단계가 끝난 시점부터 재집중 쿨타임을 적용합니다. 집중 단독은 집중 직후 바로 시작하며, 5m=5분 · 15m=15분 · 30m=30분 · 1h 이상=60분 뒤 새 집중이 가능합니다.</span>
     <br><span class="small">모든 분할은 동일 비중으로 평균진입가를 계산합니다. MAE(최대 불리 움직임)는 진입 후 가장 크게 불리해진 폭, MFE(최대 유리 움직임)는 가장 크게 유리해진 폭입니다.</span>
   </div>
   <div style="overflow-x:auto"><table class="cadence-table">
@@ -5822,7 +5851,7 @@ def performance_scalp_fragment():
         rows = simulation.get("scalp_combinations") or []
         return render_template_string(r'''
 <div class="scalp-lazy-wrap">
-  <div class="small">현재 V93 운영 기준(유효 5분 쿨타임)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
+  <div class="small">현재 V102 운영 기준(전 단계 5분 간격 + 종료 후 재집중 쿨타임)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
   <div class="scalp-grid">
   {% for combo in rows %}
     <a class="scalp-link" href="/performance/scalp-detail?entry_tf={{combo.entry_timeframe}}&exit_tf={{combo.exit_timeframe}}&period={{period_key}}">
@@ -5866,7 +5895,7 @@ def performance_scalp_detail():
     return render_template_string(r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>코인 단타 상세</title><style>
 :root{--bg:#0d0d0f;--card:#171719;--line:#34343a;--blue:#69c9ff;--green:#55e69a;--red:#ff6b72}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f4f4f5;font-family:Arial,"Noto Sans KR",sans-serif;padding:22px}.wrap{max-width:1500px;margin:auto}.back{display:inline-block;color:var(--blue);text-decoration:none;margin-bottom:16px}.hero{border:1px solid var(--line);border-radius:14px;background:#141416;padding:18px;margin-bottom:16px}.hero h1{margin:0 0 6px;font-size:28px}.small{font-size:12px;color:#aaa}.symbol{border:1px solid var(--line);border-radius:13px;overflow:hidden;margin:13px 0;background:#141416;transition:.15s border-color}.symbol:hover{border-color:var(--blue)}.symbol summary{cursor:pointer;padding:14px 16px;background:#19191c;font-size:19px;font-weight:900;color:var(--blue)}.stats{display:flex;gap:10px;flex-wrap:wrap;padding:12px 16px}.pill{background:#101012;border:1px solid #2c2c31;border-radius:999px;padding:7px 10px}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:10px 12px;border-top:1px solid #2e2e33;text-align:left;vertical-align:top}th{color:var(--blue);font-size:12px;background:#101012}.pos{color:var(--green);font-weight:900}.neg{color:var(--red);font-weight:900}.entrypoint{white-space:nowrap}.row:hover{background:#17232a}</style></head><body><div class="wrap">
 <a class="back" href="/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp">← 코인 단타 4개 조합으로</a>
-<div class="hero"><h1>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}} 상세</h1><div class="small">V93 5분 운영(FIVE) 기준 · 종목별 완료 사이클 {{combo.result_count}}건</div></div>
+<div class="hero"><h1>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}} 상세</h1><div class="small">V102 5분 운영(FIVE) 기준 · 종목별 완료 사이클 {{combo.result_count}}건</div></div>
 {% if combo.symbols %}{% for s in combo.symbols %}<details class="symbol" open><summary>{{s.symbol}} · {{s.result_count}}사이클</summary><div class="stats"><span class="pill">평균 <b class="{{'pos' if s.average_return_pct is not none and s.average_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(s.average_return_pct)}}%</b></span><span class="pill">승률 {{'%.1f'|format(s.win_rate_pct)}}%</span><span class="pill">최고 {{'%+.2f'|format(s.best_return_pct)}}%</span><span class="pill">최저 {{'%+.2f'|format(s.worst_return_pct)}}%</span><span class="pill">평균보유 {{format_minutes_compact(s.average_holding_minutes)}}</span></div><div class="tablewrap"><table><thead><tr><th>매수 시각</th><th>분할 매수</th><th>평균 매수가</th><th>매도 시각</th><th>매도가</th><th>보유</th><th>수익률</th></tr></thead><tbody>{% for c in s.cycles %}<tr class="row"><td>{{format_kst(c.entry_time)}}</td><td>{% for ep in c.entry_points %}<div class="entrypoint">{{loop.index}}차 {{ep.price}} · {{format_kst(ep.time)}}</div>{% endfor %}</td><td>{{c.entry_price}}</td><td>{{format_kst(c.exit_time)}}</td><td>{{c.exit_price}}</td><td>{% if c.entry_time and c.exit_time %}{{format_minutes_compact((c.exit_time-c.entry_time).total_seconds()/60)}}{% else %}-{% endif %}</td><td class="{{'pos' if c.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(c.return_pct)}}%</td></tr>{% endfor %}</tbody></table></div></details>{% endfor %}{% else %}<div class="hero">아직 완료 데이터가 없습니다.</div>{% endif %}
 </div></body></html>''', combo=combo, period_key=period_key, format_kst=_format_iso_kst)
 

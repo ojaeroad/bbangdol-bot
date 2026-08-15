@@ -1,3 +1,4 @@
+# V102_CADENCE_EPISODE_COOLDOWN: 전 단계 5분 + 종료 후 자기봉/60분 재집중
 # V98_HIGHER_TREND_REGIME_RESEARCH: 스윙 이상 D/W Stoch 큰형 + SMA20/60 조합 연구
 # V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 빈칸 표시
 # V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 × 3/5분할 + 집중 단독 연구
@@ -10,7 +11,7 @@
 - 매수 LOW의 첫 신호는 '집중 알림'일 뿐 진입하지 않는다.
 - 같은 LOW 상태의 두 번째 유효 신호부터 최대 3회 분할진입한다.
 - ALL(1분 원본): 첫 신호 이후 기존 공통 5분 쿨타임으로 최대 3회 진입.
-- FIVE(5분 운영): 유효 알람은 마지막 전송 후 5분, 집중 리셋은 5m/15m=15분, 30m=30분, 1h 이상=60분.
+- FIVE(5분 운영): 집중→유효1→유효2→유효3는 모두 5분 간격. 완료/중지 뒤 재집중은 5m=5분, 15m=15분, 30m=30분, 1h 이상=60분.
 - FULL(자기 시간봉): 첫 신호 이후 원 시간봉의 다음 자연 경계부터 최대 3회 진입.
 - HALF(절반 주기): 첫 신호 이후 기존 절반 주기의 다음 자연 경계부터 최대 3회 진입.
 - 매도 HIGH는 샘플링하지 않고 첫 유효 HIGH 신호에서 전량 종료한다.
@@ -76,14 +77,15 @@ MAX_ADMIN_VALID_STAGES = 5  # Telegram/실제 진입은 3 유지, 관리자 연�
 FIVE_VALID_COOLDOWN_SECONDS = 300
 THREE_VALID_COOLDOWN_SECONDS = 180
 CLOCK5_MINUTES = 5
-FIVE_RESET_MINUTES = {
-    "3m": 15, "5m": 15, "15m": 15, "30m": 30,
+POST_EPISODE_COOLDOWN_MINUTES = {
+    "3m": 3, "5m": 5, "15m": 15, "30m": 30,
     "1h": 60, "2h": 60, "4h": 60, "6h": 60, "12h": 60,
     "1d": 60, "3d": 60, "1w": 60, "1M": 60,
 }
 
 def _five_reset_minutes(tf: str) -> int:
-    return FIVE_RESET_MINUTES.get(tf, 60)
+    """V102 종료/중지 후 다음 집중까지의 재집중 쿨타임."""
+    return POST_EPISODE_COOLDOWN_MINUTES.get(tf, 60)
 
 
 def _operating_minutes(market: str, tf: str) -> int:
@@ -180,9 +182,13 @@ def _slot(dt: datetime, minutes: int) -> int:
 
 
 def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
-    """실제 텔레그램에 표시될 알람 수를 방식별로 계산한다.
+    """실제/연구 알람 수를 방식별로 계산한다.
 
-    FIVE는 V93 실제 운영과 동일하게 '집중 기준 리셋 + 5분 유효 쿨타임'을 적용한다.
+    FIVE/THREE/CLOCK5는 V102 에피소드 규칙을 공유한다.
+    - 집중 후 유효 최대 3단계
+    - FIVE는 단계 사이 5분, THREE는 3분, CLOCK5는 자연 5분 경계
+    - 유효3 완료 후 재집중: 5m=5, 15m=15, 30m=30, 1h+=60분
+    - 완료 전 원본 신호가 같은 재집중 시간 이상 끊기면 새 집중
     """
     if mode == "ALL":
         return list(signals)
@@ -195,33 +201,47 @@ def _sample_alerts(signals: list[dict[str, Any]], mode: str) -> list[dict[str, A
 
         if mode in {"FIVE", "THREE", "CLOCK5"}:
             reset_sec = _five_reset_minutes(signal["tf"]) * 60
-            new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= reset_sec
+            new_episode = previous is None
+            if previous is not None:
+                complete = int(previous.get("valid_count", 0)) >= MAX_ENTRIES
+                if complete:
+                    new_episode = (signal["time"] - previous["last_stage"]).total_seconds() >= reset_sec
+                else:
+                    new_episode = (signal["time"] - previous["last_seen"]).total_seconds() >= reset_sec
+
             if new_episode:
                 sampled.append(signal)
                 state[key] = {
                     "focus_time": signal["time"],
                     "last_sent": signal["time"],
+                    "last_stage": signal["time"],
+                    "last_seen": signal["time"],
                     "valid_count": 0,
                     "sent_slot": _slot(signal["time"], CLOCK5_MINUTES),
                 }
                 continue
+
+            previous["last_seen"] = signal["time"]
             valid_count = int(previous.get("valid_count", 0))
             if valid_count >= MAX_ENTRIES:
                 state[key] = previous
                 continue
+
             should_send = False
             if mode == "CLOCK5":
                 slot = _slot(signal["time"], CLOCK5_MINUTES)
-                focus_slot = _slot(previous["focus_time"], CLOCK5_MINUTES)
-                should_send = slot > focus_slot and slot != previous.get("sent_slot")
+                last_slot = _slot(previous["last_stage"], CLOCK5_MINUTES)
+                should_send = slot > last_slot and slot != previous.get("sent_slot")
                 if should_send:
                     previous["sent_slot"] = slot
             else:
                 cooldown = FIVE_VALID_COOLDOWN_SECONDS if mode == "FIVE" else THREE_VALID_COOLDOWN_SECONDS
-                should_send = (signal["time"] - previous["last_sent"]).total_seconds() >= cooldown
+                should_send = (signal["time"] - previous["last_stage"]).total_seconds() >= cooldown
+
             if should_send:
                 sampled.append(signal)
                 previous["last_sent"] = signal["time"]
+                previous["last_stage"] = signal["time"]
                 previous["valid_count"] = valid_count + 1
             state[key] = previous
             continue
@@ -291,34 +311,35 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
         if signal["type"] == "LOW":
             key = (signal["symbol"], signal["group"], signal["tf"])
             previous = episodes.get(key)
+
             if mode in {"FIVE", "THREE", "CLOCK5"}:
-                new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= _five_reset_minutes(signal["tf"]) * 60
+                reset_sec = _five_reset_minutes(signal["tf"]) * 60
+                new_episode = previous is None
+                if previous is not None:
+                    complete = int(previous.get("valid_stage", 0)) >= MAX_ENTRIES
+                    if complete:
+                        new_episode = (signal["time"] - previous["last_stage_time"]).total_seconds() >= reset_sec
+                    else:
+                        new_episode = (signal["time"] - previous["last_time"]).total_seconds() >= reset_sec
             else:
                 new_episode = (
                     previous is None
                     or (signal["time"] - previous["last_time"]).total_seconds() > EPISODE_GAP_SECONDS
                 )
+
             if new_episode:
                 if mode in {"FIVE", "CLOCK5"}:
                     cadence = 5
                 elif mode == "THREE":
                     cadence = 3
                 else:
-                    cadence = signal["mins"] if mode != "HALF" else _operating_minutes(
-                        signal["market"], signal["tf"]
-                    )
+                    cadence = signal["mins"] if mode != "HALF" else _operating_minutes(signal["market"], signal["tf"])
                 episode = {
-                    "id": next_episode_id,
-                    "key": key,
-                    "group": signal["group"],
-                    "tf": signal["tf"],
-                    "focus_time": signal["time"],
-                    "focus_price": signal["price"],
-                    "focus_slot": _slot(signal["time"], cadence),
-                    "last_time": signal["time"],
-                    "signal_count": 1,
-                    "last_entry_slot": None,
-                    "entered": False,
+                    "id": next_episode_id, "key": key, "group": signal["group"], "tf": signal["tf"],
+                    "focus_time": signal["time"], "focus_price": signal["price"],
+                    "focus_slot": _slot(signal["time"], cadence), "last_time": signal["time"],
+                    "last_stage_time": signal["time"], "valid_stage": 0, "signal_count": 1,
+                    "last_entry_slot": None, "entered": False,
                 }
                 episodes[key] = episode
                 episode_records[next_episode_id] = episode
@@ -326,27 +347,44 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
                 continue
 
             episode = previous
+            previous_last_time = episode["last_time"]
             episode["last_time"] = signal["time"]
             episode["signal_count"] += 1
             position = open_positions.get(key)
-            if not _entry_allowed(signal, episode, position, mode):
-                continue
+
+            if mode in {"FIVE", "THREE", "CLOCK5"}:
+                if int(episode.get("valid_stage", 0)) >= MAX_ENTRIES:
+                    continue
+                allowed = False
+                if mode == "CLOCK5":
+                    current_slot = _slot(signal["time"], CLOCK5_MINUTES)
+                    last_slot = _slot(episode["last_stage_time"], CLOCK5_MINUTES)
+                    allowed = current_slot > last_slot
+                else:
+                    cooldown = FIVE_VALID_COOLDOWN_SECONDS if mode == "FIVE" else THREE_VALID_COOLDOWN_SECONDS
+                    allowed = (signal["time"] - episode["last_stage_time"]).total_seconds() >= cooldown
+                if not allowed:
+                    continue
+                episode["valid_stage"] = int(episode.get("valid_stage", 0)) + 1
+                episode["last_stage_time"] = signal["time"]
+                if position and len(position["entries"]) >= MAX_ENTRIES:
+                    continue
+            else:
+                if not _entry_allowed(signal, episode, position, mode):
+                    continue
 
             if position is None:
                 position = {
-                    "symbol": signal["symbol"],
-                    "group": signal["group"],
-                    "entry_tf": signal["tf"],
-                    "entries": [],
-                    "episode_ids": set(),
+                    "symbol": signal["symbol"], "group": signal["group"], "entry_tf": signal["tf"],
+                    "entries": [], "episode_ids": set(),
                 }
                 open_positions[key] = position
-            position["entries"].append(signal)
-            position["episode_ids"].add(episode["id"])
-            episode["entered"] = True
+            if len(position["entries"]) < MAX_ENTRIES:
+                position["entries"].append(signal)
+                position["episode_ids"].add(episode["id"])
+                episode["entered"] = True
             continue
 
-        # HIGH: 첫 유효 매도 신호에서 전량 종료. HIGH 자체는 원/운영 주기로 지연하지 않는다.
         if signal["type"] == "HIGH":
             for key, position in list(open_positions.items()):
                 symbol, entry_group, _entry_tf = key
@@ -360,66 +398,23 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
                 avg_price = sum(item["price"] for item in position["entries"]) / len(position["entries"])
                 return_pct = ((signal["price"] - avg_price) / avg_price * 100) if avg_price else 0.0
                 cycles.append({
-                    "symbol": symbol,
-                    "group": entry_group,
-                    "entry_tf": position["entry_tf"],
+                    "symbol": symbol, "group": entry_group, "entry_tf": position["entry_tf"],
                     "exit_tf": signal["tf"],
                     "trend_context": dict((position["entries"][0].get("trend_context") or {})),
-                    "return_pct": return_pct,
-                    "entries": len(position["entries"]),
-                    "entry_price": avg_price,
-                    "entry_time": position["entries"][0]["time"],
-                    "entry_points": [
-                        {"price": item["price"], "time": item["time"]}
-                        for item in position["entries"]
-                    ],
-                    "exit_price": signal["price"],
-                    "exit_time": signal["time"],
+                    "return_pct": return_pct, "entries": len(position["entries"]),
+                    "entry_price": avg_price, "entry_time": position["entries"][0]["time"],
+                    "entry_points": [{"price": item["price"], "time": item["time"]} for item in position["entries"]],
+                    "exit_price": signal["price"], "exit_time": signal["time"],
                 })
                 del open_positions[key]
 
     focus_count = len(episode_records)
     entered_focus_count = sum(1 for episode in episode_records.values() if episode["entered"])
-    no_entry_focus_count = focus_count - entered_focus_count
     return {
-        "cycles": cycles,
-        "episodes": list(episode_records.values()),
-        "focus_count": focus_count,
-        "entered_focus_count": entered_focus_count,
-        "no_entry_focus_count": no_entry_focus_count,
+        "cycles": cycles, "episodes": episode_records, "focus_count": focus_count,
+        "entered_focus_count": entered_focus_count, "no_entry_focus_count": focus_count - entered_focus_count,
         "open_position_count": len(open_positions),
     }
-
-
-def _stats(
-    raw_count: int,
-    sampled_count: int,
-    simulation: dict[str, Any],
-) -> dict[str, Any]:
-    cycles = simulation["cycles"]
-    values = [cycle["return_pct"] for cycle in cycles]
-    entry_counts = [cycle["entries"] for cycle in cycles]
-    focus_count = simulation["focus_count"]
-    entered_focus_count = simulation["entered_focus_count"]
-    return {
-        "alert_count": sampled_count,
-        "alert_reduction_pct": ((raw_count - sampled_count) / raw_count * 100) if raw_count else 0.0,
-        "focus_count": focus_count,
-        "entered_focus_count": entered_focus_count,
-        "no_entry_focus_count": simulation["no_entry_focus_count"],
-        "entry_capture_rate_pct": (entered_focus_count / focus_count * 100) if focus_count else None,
-        "completed_cycles": len(values),
-        "average_entries": (sum(entry_counts) / len(entry_counts)) if entry_counts else None,
-        "one_entry_cycles": sum(1 for count in entry_counts if count == 1),
-        "two_entry_cycles": sum(1 for count in entry_counts if count == 2),
-        "three_entry_cycles": sum(1 for count in entry_counts if count >= 3),
-        "average_return_pct": (sum(values) / len(values)) if values else None,
-        "win_rate_pct": (sum(1 for value in values if value > 0) / len(values) * 100) if values else None,
-        "best_return_pct": max(values) if values else None,
-        "worst_return_pct": min(values) if values else None,
-    }
-
-
 
 def _cycle_stats(cycles: list[dict[str, Any]]) -> dict[str, Any]:
     values = [float(c["return_pct"]) for c in cycles]
@@ -687,30 +682,28 @@ def _simulate_entry_plan(
     max_entries: int,
     focus_only: bool = False,
 ) -> dict[str, Any]:
-    """V96 관리자 연구용 5분 단계 진입 시나리오.
+    """V102 관리자 연구용 5분 단계 진입 시나리오.
 
-    실제 Telegram/실제 운영 진입에는 영향을 주지 않는다.
-    - 집중 단독: 집중에서 1회만 진입
-    - 집중 포함 N분할: 집중 + 유효1... 순서로 최대 N회
-    - 집중 스킵 N분할: 유효1... 순서로 최대 N회
+    각 방식은 '자기 방식의 마지막 진입 단계'가 끝난 순간부터 재집중 쿨타임을 시작한다.
+    - 집중 단독: 집중 자체가 마지막 단계
+    - 집중 포함 3분할: 유효2가 마지막
+    - 집중 포함 5분할: 유효4가 마지막
+    - 집중 스킵 3분할: 유효3이 마지막
+    - 집중 스킵 5분할: 유효5가 마지막
 
-    단계 간격은 현재 운영과 동일한 5분이며 집중 리셋도 현재 운영 규칙을 따른다.
-    HIGH 청산 규칙은 기존 cadence 시뮬레이터와 동일하게 첫 유효 HIGH에서 전량 종료한다.
+    단계 간격은 모두 5분. 종료/중지 후 재집중은 5m=5, 15m=15, 30m=30, 1h+=60분.
     """
     episodes: dict[tuple[str, str, str], dict[str, Any]] = {}
     open_positions: dict[tuple[str, str, str], dict[str, Any]] = {}
     episode_records: list[dict[str, Any]] = []
     cycles: list[dict[str, Any]] = []
 
-    def add_entry(key: tuple[str, str, str], signal: dict[str, Any], episode: dict[str, Any], stage: int) -> None:
+    completion_stage = 0 if focus_only else (max_entries - 1 if include_focus else max_entries)
+
+    def add_entry(key, signal, episode, stage):
         position = open_positions.get(key)
         if position is None:
-            position = {
-                "symbol": signal["symbol"],
-                "group": signal["group"],
-                "entry_tf": signal["tf"],
-                "entries": [],
-            }
+            position = {"symbol": signal["symbol"], "group": signal["group"], "entry_tf": signal["tf"], "entries": []}
             open_positions[key] = position
         if len(position["entries"]) >= max_entries:
             return
@@ -722,18 +715,20 @@ def _simulate_entry_plan(
             key = (signal["symbol"], signal["group"], signal["tf"])
             previous = episodes.get(key)
             reset_sec = _five_reset_minutes(signal["tf"]) * 60
-            new_episode = previous is None or (signal["time"] - previous["focus_time"]).total_seconds() >= reset_sec
+            new_episode = previous is None
+            if previous is not None:
+                complete = int(previous.get("stage", 0)) >= completion_stage
+                if complete:
+                    new_episode = (signal["time"] - previous["last_stage_time"]).total_seconds() >= reset_sec
+                else:
+                    new_episode = (signal["time"] - previous["last_seen"]).total_seconds() >= reset_sec
 
             if new_episode:
                 episode = {
-                    "key": key,
-                    "group": signal["group"],
-                    "tf": signal["tf"],
-                    "focus_time": signal["time"],
-                    "focus_price": signal["price"],
-                    "last_stage_time": signal["time"],
-                    "stage": 0,
-                    "entered": False,
+                    "key": key, "group": signal["group"], "tf": signal["tf"],
+                    "focus_time": signal["time"], "focus_price": signal["price"],
+                    "last_stage_time": signal["time"], "last_seen": signal["time"],
+                    "stage": 0, "entered": False, "complete": completion_stage == 0,
                 }
                 episodes[key] = episode
                 episode_records.append(episode)
@@ -742,9 +737,8 @@ def _simulate_entry_plan(
                 continue
 
             episode = previous
-            if focus_only:
-                continue
-            if int(episode.get("stage", 0)) >= MAX_ADMIN_VALID_STAGES:
+            episode["last_seen"] = signal["time"]
+            if int(episode.get("stage", 0)) >= completion_stage:
                 continue
             if (signal["time"] - episode["last_stage_time"]).total_seconds() < FIVE_VALID_COOLDOWN_SECONDS:
                 continue
@@ -752,14 +746,8 @@ def _simulate_entry_plan(
             stage = int(episode.get("stage", 0)) + 1
             episode["stage"] = stage
             episode["last_stage_time"] = signal["time"]
-
-            position = open_positions.get(key)
-            current_entries = len(position["entries"]) if position else 0
-            if current_entries >= max_entries:
-                continue
-
-            # 집중 포함: 집중이 1차이므로 유효1부터 2차.
-            # 집중 스킵: 유효1이 1차.
+            if stage >= completion_stage:
+                episode["complete"] = True
             add_entry(key, signal, episode, stage)
             continue
 
@@ -772,41 +760,25 @@ def _simulate_entry_plan(
                     continue
                 if not position["entries"] or signal["time"] <= position["entries"][-1]["time"]:
                     continue
-
                 avg_price = sum(item["price"] for item in position["entries"]) / len(position["entries"])
                 return_pct = ((signal["price"] - avg_price) / avg_price * 100) if avg_price else 0.0
                 cycles.append({
-                    "symbol": symbol,
-                    "group": entry_group,
-                    "entry_tf": position["entry_tf"],
+                    "symbol": symbol, "group": entry_group, "entry_tf": position["entry_tf"],
                     "exit_tf": signal["tf"],
                     "trend_context": dict((position["entries"][0].get("trend_context") or {})),
-                    "return_pct": return_pct,
-                    "entries": len(position["entries"]),
-                    "entry_price": avg_price,
-                    "entry_time": position["entries"][0]["time"],
-                    "entry_points": [
-                        {
-                            "price": item["price"],
-                            "time": item["time"],
-                            "stage": int(item.get("research_stage", 0)),
-                        }
-                        for item in position["entries"]
-                    ],
-                    "exit_price": signal["price"],
-                    "exit_time": signal["time"],
+                    "return_pct": return_pct, "entries": len(position["entries"]),
+                    "entry_price": avg_price, "entry_time": position["entries"][0]["time"],
+                    "entry_points": [{"price": item["price"], "time": item["time"], "stage": int(item.get("research_stage", 0))} for item in position["entries"]],
+                    "exit_price": signal["price"], "exit_time": signal["time"],
                 })
                 del open_positions[key]
 
     return {
-        "cycles": cycles,
-        "episodes": episode_records,
-        "focus_count": len(episode_records),
+        "cycles": cycles, "episodes": episode_records, "focus_count": len(episode_records),
         "entered_focus_count": sum(1 for e in episode_records if e.get("entered")),
         "no_entry_focus_count": sum(1 for e in episode_records if not e.get("entered")),
         "open_position_count": len(open_positions),
     }
-
 
 def _entry_plan_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
     """V96: 같은 원본 신호를 다섯 가지 매수 방식으로 재계산한다."""
@@ -1017,34 +989,44 @@ def _higher_trend_research(
     }
 
 def _admin_stage_research(signals: list[dict[str, Any]]) -> dict[str, Any]:
-    """Reconstruct focus + VALID1..VALID5 from raw signals without changing trade entries.
+    """관리자용 집중 + VALID1..VALID5 재구성.
 
-    This mirrors V94 live collection: 5-minute stage spacing and the same focus reset.
-    Stages 4/5 are research-only and never count as entries or Telegram messages.
+    단계는 5분 간격, VALID5 완료 뒤 재집중 쿨타임은 V102 운영 규칙과 동일하다.
+    완료 전 원본 신호가 해당 재집중 시간 이상 끊겨도 새 집중으로 시작한다.
     """
     state: dict[tuple[str, str, str], dict[str, Any]] = {}
     counts = {i: 0 for i in range(6)}
     by_tf: dict[str, dict[int, int]] = {}
     for sig in signals:
-        key=(sig["symbol"],sig["type"],sig["tf"])
-        prev=state.get(key)
-        reset_sec=_five_reset_minutes(sig["tf"])*60
-        if prev is None or (sig["time"]-prev["focus_time"]).total_seconds() >= reset_sec:
-            stage=0
-            state[key]={"focus_time":sig["time"],"last_stage":sig["time"],"stage":0}
+        key = (sig["symbol"], sig["type"], sig["tf"])
+        prev = state.get(key)
+        reset_sec = _five_reset_minutes(sig["tf"]) * 60
+        new_episode = prev is None
+        if prev is not None:
+            complete = int(prev.get("stage", 0)) >= MAX_ADMIN_VALID_STAGES
+            if complete:
+                new_episode = (sig["time"] - prev["last_stage"]).total_seconds() >= reset_sec
+            else:
+                new_episode = (sig["time"] - prev["last_seen"]).total_seconds() >= reset_sec
+
+        if new_episode:
+            stage = 0
+            state[key] = {"focus_time": sig["time"], "last_stage": sig["time"], "last_seen": sig["time"], "stage": 0}
         else:
-            stage=int(prev.get("stage",0))
-            if stage>=MAX_ADMIN_VALID_STAGES:
+            prev["last_seen"] = sig["time"]
+            stage = int(prev.get("stage", 0))
+            if stage >= MAX_ADMIN_VALID_STAGES:
                 continue
-            if (sig["time"]-prev["last_stage"]).total_seconds() < FIVE_VALID_COOLDOWN_SECONDS:
+            if (sig["time"] - prev["last_stage"]).total_seconds() < FIVE_VALID_COOLDOWN_SECONDS:
                 continue
             stage += 1
-            prev["stage"]=stage; prev["last_stage"]=sig["time"]
-            state[key]=prev
-        counts[stage]+=1
-        by_tf.setdefault(sig["tf"],{i:0 for i in range(6)})[stage]+=1
-    return {"counts":counts,"by_timeframe":by_tf,"max_stage":MAX_ADMIN_VALID_STAGES}
+            prev["stage"] = stage
+            prev["last_stage"] = sig["time"]
+            state[key] = prev
 
+        counts[stage] += 1
+        by_tf.setdefault(sig["tf"], {i: 0 for i in range(6)})[stage] += 1
+    return {"counts": counts, "by_timeframe": by_tf, "max_stage": MAX_ADMIN_VALID_STAGES}
 
 def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
     signals = _load(market, period_key)
@@ -1179,7 +1161,7 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "note": (
             "매수 첫 LOW는 집중 알림으로만 사용하고, 두 번째 유효 LOW부터 최대 3회 분할진입했습니다. "
-            "5분 쿨타임은 현재 실제 운영 규칙(5m/15m=15분·30m=30분·1h+=60분 집중 리셋)이며, "
+            "5분 쿨타임은 현재 실제 운영 규칙(집중→유효1→유효2→유효3 모두 5분 간격, 종료/중지 뒤 5m=5분·15m=15분·30m=30분·1h+=60분 재집중)이며, "
             "3분 쿨타임과 정시 5분봉은 Telegram 전송 없는 관리자 연구용입니다. 자기 시간봉·절반 주기도 비교 연구용입니다. "
             "MAE/MFE는 저장된 5분봉이 존재하는 완료사이클만 계산하므로 과거 미수집 구간은 빈칸으로 남습니다. "
             "V98 관리자 연구에서는 스윙 이상 신호에 일봉/주봉 Stoch(20,12,12) 큰형 방향과 SMA20/60 정·역배열 태그를 추가하며, V98 이후 태그가 있는 완료사이클부터 조합별 성과를 계산합니다. V97 관리자 연구에서는 집중 단독, 집중 포함 3/5분할, 집중 스킵 3/5분할을 종목별·시간봉별로도 별도 비교하며, 미완료 시간봉 조합은 빈칸으로 유지합니다."
