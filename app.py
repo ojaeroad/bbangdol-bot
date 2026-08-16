@@ -1,3 +1,4 @@
+# V104_ADMIN_UI_HIERARCHY_NAV: 큰/작은 메뉴 색상 분리 + 접힌 상태에서도 세부메뉴명 노출 + 클릭 세부섹션 자동 펼침/강조 + 중복 관리자분석 메뉴 통합
 # V98_HIGHER_TREND_REGIME_RESEARCH
 # V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 표시
 # V103_CADENCE_EPISODE_COOLDOWN: 전 단계 5분 + 종료 후 단타/스윙 자기봉, 장기/인생 60분 재집중
@@ -2952,7 +2953,7 @@ def performance_cadence_fragment():
     ③ <b>집중 포함 5분할</b> = 집중+유효1~유효4 ·
     ④ <b>집중 스킵 3분할</b> = 유효1~유효3(현재운영) ·
     ⑤ <b>집중 스킵 5분할</b> = 유효1~유효5(연구).
-    <br><span class="small"><b>V103 공통 규칙:</b> 각 방식은 자기 마지막 단계가 끝난 시점부터 재집중 쿨타임을 적용합니다. 집중 단독은 집중 직후 바로 시작하며, 5m=5분 · 15m=15분 · 30m=30분 · 1h 이상=60분 뒤 새 집중이 가능합니다.</span>
+    <br><span class="small"><b>V104 공통 규칙:</b> 각 방식은 자기 마지막 단계가 끝난 시점부터 재집중 쿨타임을 적용합니다. 집중 단독은 집중 직후 바로 시작하며, 5m=5분 · 15m=15분 · 30m=30분 · 1h 이상=60분 뒤 새 집중이 가능합니다.</span>
     <br><span class="small">모든 분할은 동일 비중으로 평균진입가를 계산합니다. MAE(최대 불리 움직임)는 진입 후 가장 크게 불리해진 폭, MFE(최대 유리 움직임)는 가장 크게 유리해진 폭입니다.</span>
   </div>
   <div style="overflow-x:auto"><table class="cadence-table">
@@ -5262,7 +5263,18 @@ summary{cursor:pointer;font-weight:bold}
 .admin-content-group{margin:18px 0;border:1px solid #3b4653;border-radius:14px;background:#121417;overflow:hidden;box-shadow:0 0 0 1px rgba(105,201,255,.035)}
 .admin-content-group>summary{list-style:none;cursor:pointer;padding:15px 18px;background:#171b20;color:#91d7ff;font-size:21px;font-weight:950;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid transparent;transition:.15s background,.15s border-color,.15s color}
 .admin-content-group>summary::-webkit-details-marker{display:none}.admin-content-group>summary:before{content:"▶";font-size:14px;margin-right:10px}.admin-content-group[open]>summary:before{content:"▼"}.admin-content-group>summary:after{content:"펼치기";font-size:12px;color:#7892a3;font-weight:700}.admin-content-group[open]>summary:after{content:"접기"}.admin-content-group>summary:hover{background:#1a2832;color:#c8efff}.admin-content-group[open]>summary{border-bottom-color:#33414d}.admin-content-group-body{padding:14px}.admin-content-group-body>.card:first-child,.admin-content-group-body>details.card:first-child{margin-top:0}.admin-content-group-body>.card:last-child,.admin-content-group-body>details.card:last-child{margin-bottom:0}
-.admin-content-group.summary-group{border-color:#36536a}.admin-content-group.symbol-group{border-color:#355348}.admin-content-group.research-group{border-color:#514838}.admin-content-group.research-group>summary{color:#ffd071}
+/* v104: 큰 카테고리와 세부 메뉴의 계층을 색/크기로 명확히 분리 */
+.admin-content-group.summary-group{border-color:#36536a}.admin-content-group.symbol-group{border-color:#355348}.admin-content-group.research-group{border-color:#514838}
+.admin-content-group>summary{justify-content:flex-start;gap:10px}.admin-content-group>summary:after{margin-left:auto}
+.admin-group-heading{display:flex;flex-direction:column;gap:4px;min-width:0}.admin-group-title{font-size:22px;font-weight:950;line-height:1.1}.admin-group-sub{font-size:12px;font-weight:750;color:#aeb9c2;line-height:1.35;white-space:normal}
+.summary-group>summary .admin-group-title{color:#72ccff}.summary-group>summary .admin-group-sub{color:#9fc5db}
+.symbol-group>summary .admin-group-title{color:#66d9b1}.symbol-group>summary .admin-group-sub{color:#9fcdbd}
+.research-group>summary .admin-group-title{color:#ffd071}.research-group>summary .admin-group-sub{color:#d6bd82}
+.admin-content-group .section-title{color:#dbe7ee;font-size:22px}.summary-group .section-title{color:#b9e6ff}.symbol-group .section-title{color:#b8ead8}.research-group .section-title{color:#ffe0a0}
+.admin-nav a.active-nav{background:#123c52;border-color:#62caff;color:#fff;box-shadow:inset 3px 0 #62caff}.admin-nav a.active-nav.life{color:#ffe08a}.admin-nav a.active-nav.admin-only{color:#ffd19a}
+.collapsible-block.admin-section-active,.card.admin-section-active{border-color:#62caff!important;box-shadow:0 0 0 1px rgba(98,202,255,.17),0 0 18px rgba(98,202,255,.06)}
+.admin-menu-group>summary{color:#8fd6ff}.admin-menu-group .admin-menu-items a{color:#d8dbe1}.admin-menu-group .admin-menu-items a.life{color:#ffd071}
+
 .admin-nav>.primary-link{background:#17242c;border-color:#2f6d89;color:#dff5ff}.admin-nav>.primary-link:hover{border-color:#69c9ff;background:#113b50}.cadence-compare-cell{min-width:220px;line-height:1.45}.cadence-compare-cell .ret{font-size:16px;font-weight:900}.cadence-compare-cell .entry{font-size:12px;color:#ddd}.cadence-group-label{color:var(--yellow);font-weight:900}.admin-backdrop{display:none}body.admin-menu-ready{padding-left:246px}.admin-target{scroll-margin-top:16px}
 .card,.group-card,.symbol-card,.cadence-symbol-card,.metric,.member-hook,.detail-symbol,.prediction-symbol-card{transition:.16s border-color,.16s transform,.16s box-shadow,.16s background}.card:hover,.group-card:hover,.symbol-card:hover,.cadence-symbol-card:hover,.metric[href]:hover,.member-hook[href]:hover,.detail-symbol:hover,.prediction-symbol-card:hover{border-color:#62caff}.category-nav a,.period-nav a,.toplinks a,.back-link{transition:.15s border-color,.15s background,.15s color,.15s transform}.category-nav a:hover,.period-nav a:hover{border-color:#62caff!important;background:#143549!important;transform:translateY(-1px)}.toplinks a:hover,.back-link:hover{color:#8ed7ff}.clickable-row{cursor:pointer;transition:.14s background,.14s box-shadow}.clickable-row:hover{background:#18232a!important;box-shadow:inset 3px 0 #62caff}.prediction-symbol-card{border:1px solid #303035;border-radius:13px;overflow:hidden;margin:12px 0;background:#121214}.prediction-symbol-title{padding:12px 14px;background:#18181b;color:#8ed7ff;font-size:18px;font-weight:900;border-bottom:1px solid #303035}.research-guide{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:12px 0 18px}.research-guide>div{background:#111318;border:1px solid #30343b;border-radius:11px;padding:11px}.research-guide b{display:block;color:#8ed7ff;margin-bottom:5px}.research-guide span{color:#aaa;font-size:12px;line-height:1.45}@media(max-width:950px){.research-guide{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.research-guide{grid-template-columns:1fr}}
 @media(max-width:1050px){body.admin-menu-ready{padding-left:12px}.admin-side{display:none;left:12px;right:12px;top:62px;width:auto;max-height:calc(100vh - 80px);box-shadow:0 18px 55px rgba(0,0,0,.58)}.admin-side.open{display:block}.admin-menu-button{display:block}.admin-backdrop.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:70}}
@@ -5281,9 +5293,6 @@ summary{cursor:pointer;font-weight:bold}
 </div></details>
 <details class="admin-menu-group"><summary>알람 · 연구</summary><div class="admin-menu-items">
 <a href="#admin-cadence">알람 분석</a><a href="#admin-prediction">상위시간봉 예측 연구</a>{% if selected_category == 'COIN' %}<a href="#admin-scalp">코인 단타 4개 조합</a>{% endif %}
-</div></details>
-<details class="admin-menu-group"><summary>관리자 분석</summary><div class="admin-menu-items">
-<a class="admin-only" href="#admin-only-analysis">관리자 전용 분석</a>
 </div></details>
 <a class="top-link" href="#admin-top">↑ 맨 위로</a>
 </nav></aside>
@@ -5384,7 +5393,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 {% endfor %}
 </div></details>
 
-<details class="admin-content-group summary-group" id="admin-group-summary"><summary>성과 요약</summary><div class="admin-content-group-body">
+<details class="admin-content-group summary-group" id="admin-group-summary"><summary><span class="admin-group-heading"><span class="admin-group-title">성과 요약</span><span class="admin-group-sub">수익률·승률 TOP5 · 최근 완료 10건 · 인생타점 상세</span></span></summary><div class="admin-content-group-body">
 {% if admin_average_ranking or admin_best_ranking or admin_win_rate_ranking %}
 <details id="admin-top5" class="card collapsible-block"><summary class="section-title">수익률·승률 TOP 5</summary>
 <div class="ranking-grid" style="margin-top:14px">
@@ -5449,7 +5458,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 </div></details>
 
-<details class="admin-content-group symbol-group" id="admin-group-symbols"><summary>종목 · 시간봉</summary><div class="admin-content-group-body">
+<details class="admin-content-group symbol-group" id="admin-group-symbols"><summary><span class="admin-group-heading"><span class="admin-group-title">종목 · 시간봉</span><span class="admin-group-sub">종목별 성과 · 시간봉별 상세 · 종목 목록</span></span></summary><div class="admin-content-group-body">
 <details class="card collapsible-block">
 <summary id="admin-symbol-performance-title" class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
@@ -5553,7 +5562,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></div></details>
 </div></details>
 
-<details class="admin-content-group research-group" id="admin-group-research"><summary>알람 · 연구</summary><div class="admin-content-group-body">
+<details class="admin-content-group research-group" id="admin-group-research"><summary><span class="admin-group-heading"><span class="admin-group-title">알람 · 연구</span><span class="admin-group-sub">알람 주기 분석 · 상위시간봉 예측{% if selected_category == 'COIN' %} · 코인 단타 4개 조합{% endif %}</span></span></summary><div class="admin-content-group-body">
 <div id="admin-only-analysis" class="admin-target"></div>
 {% if selected_category == 'COIN' %}
 <details id="admin-scalp" class="card collapsible-block">
@@ -5828,32 +5837,48 @@ summary{cursor:pointer;font-weight:bold}
 <script>
 (function(){
  const side=document.getElementById('adminSide'),btn=document.getElementById('adminMenuButton'),back=document.getElementById('adminBackdrop');
+ const nav=document.getElementById('adminNav');
  function close(){side&&side.classList.remove('open');back&&back.classList.remove('open')}
+ function clearActive(){
+   document.querySelectorAll('#adminNav a.active-nav').forEach(x=>x.classList.remove('active-nav'));
+   document.querySelectorAll('.admin-section-active').forEach(x=>x.classList.remove('admin-section-active'));
+ }
+ function openTarget(target){
+   if(!target)return null;
+   // 세부 제목(summary)을 눌렀다면 해당 details 자체를 확실히 연다.
+   if(target.tagName==='SUMMARY' && target.parentElement && target.parentElement.tagName==='DETAILS') target.parentElement.open=true;
+   if(target.tagName==='DETAILS') target.open=true;
+   let node=target;
+   while(node){if(node.tagName==='DETAILS')node.open=true;node=node.parentElement;}
+   const block=target.tagName==='DETAILS' ? target : target.closest('details.card,details.collapsible-block');
+   if(block) block.classList.add('admin-section-active');
+   return block||target;
+ }
+ function activate(hash,link,doScroll=true){
+   if(!hash||hash==='#')return;
+   const target=document.querySelector(hash); if(!target)return;
+   clearActive();
+   const focus=openTarget(target);
+   const matched=link || nav?.querySelector('a[href="'+hash+'"]');
+   if(matched){
+     matched.classList.add('active-nav');
+     const menuGroup=matched.closest('details.admin-menu-group'); if(menuGroup)menuGroup.open=true;
+   }
+   if(history.replaceState) history.replaceState(null,'',hash);
+   if(doScroll){
+     requestAnimationFrame(()=>setTimeout(()=>{(focus||target).scrollIntoView({behavior:'smooth',block:'start'});},40));
+   }
+ }
  btn&&btn.addEventListener('click',()=>{side&&side.classList.toggle('open');back&&back.classList.toggle('open')});
  back&&back.addEventListener('click',close);
- document.querySelectorAll('#adminNav a').forEach(a=>a.addEventListener('click',()=>{
+ nav&&nav.querySelectorAll('a').forEach(a=>a.addEventListener('click',(e)=>{
    const href=a.getAttribute('href')||'';
-   if(href.startsWith('#') && href.length>1){
-     const target=document.querySelector(href);
-     if(target){
-       if(target.tagName==='DETAILS') target.open=true;
-       let node=target;
-       while(node){
-         if(node.tagName==='DETAILS') node.open=true;
-         node=node.parentElement;
-       }
-     }
-   }
+   if(href.startsWith('#') && href.length>1){e.preventDefault();activate(href,a,true);}
    close();
  }));
- function openHashParents(){
-   const id=(location.hash||'').slice(1); if(!id)return;
-   const target=document.getElementById(id); if(!target)return;
-   if(target.tagName==='DETAILS') target.open=true;
-   let node=target; while(node){if(node.tagName==='DETAILS')node.open=true;node=node.parentElement;}
- }
- openHashParents();
- window.addEventListener('hashchange',openHashParents);
+ function activateHash(){const hash=location.hash||'';if(hash.length>1)activate(hash,null,false);}
+ activateHash();
+ window.addEventListener('hashchange',activateHash);
 })();
 </script>
 </body></html>
@@ -5872,7 +5897,7 @@ def performance_scalp_fragment():
         rows = simulation.get("scalp_combinations") or []
         return render_template_string(r'''
 <div class="scalp-lazy-wrap">
-  <div class="small">현재 V103 운영 기준(전 단계 5분 간격 + 종료 후 재집중 쿨타임)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
+  <div class="small">현재 V104 운영 기준(전 단계 5분 간격 + 종료 후 재집중 쿨타임)의 단타 매수 5m·15m × 매도 5m·15m 완료 사이클을 집계합니다.</div>
   <div class="scalp-grid">
   {% for combo in rows %}
     <a class="scalp-link" href="/performance/scalp-detail?entry_tf={{combo.entry_timeframe}}&exit_tf={{combo.exit_timeframe}}&period={{period_key}}">
@@ -5916,7 +5941,7 @@ def performance_scalp_detail():
     return render_template_string(r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>코인 단타 상세</title><style>
 :root{--bg:#0d0d0f;--card:#171719;--line:#34343a;--blue:#69c9ff;--green:#55e69a;--red:#ff6b72}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f4f4f5;font-family:Arial,"Noto Sans KR",sans-serif;padding:22px}.wrap{max-width:1500px;margin:auto}.back{display:inline-block;color:var(--blue);text-decoration:none;margin-bottom:16px}.hero{border:1px solid var(--line);border-radius:14px;background:#141416;padding:18px;margin-bottom:16px}.hero h1{margin:0 0 6px;font-size:28px}.small{font-size:12px;color:#aaa}.symbol{border:1px solid var(--line);border-radius:13px;overflow:hidden;margin:13px 0;background:#141416;transition:.15s border-color}.symbol:hover{border-color:var(--blue)}.symbol summary{cursor:pointer;padding:14px 16px;background:#19191c;font-size:19px;font-weight:900;color:var(--blue)}.stats{display:flex;gap:10px;flex-wrap:wrap;padding:12px 16px}.pill{background:#101012;border:1px solid #2c2c31;border-radius:999px;padding:7px 10px}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:10px 12px;border-top:1px solid #2e2e33;text-align:left;vertical-align:top}th{color:var(--blue);font-size:12px;background:#101012}.pos{color:var(--green);font-weight:900}.neg{color:var(--red);font-weight:900}.entrypoint{white-space:nowrap}.row:hover{background:#17232a}</style></head><body><div class="wrap">
 <a class="back" href="/performance/dashboard?category=COIN&period={{period_key}}#admin-scalp">← 코인 단타 4개 조합으로</a>
-<div class="hero"><h1>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}} 상세</h1><div class="small">V103 5분 운영(FIVE) 기준 · 종목별 완료 사이클 {{combo.result_count}}건</div></div>
+<div class="hero"><h1>매수 {{combo.entry_timeframe}} → 매도 {{combo.exit_timeframe}} 상세</h1><div class="small">V104 5분 운영(FIVE) 기준 · 종목별 완료 사이클 {{combo.result_count}}건</div></div>
 {% if combo.symbols %}{% for s in combo.symbols %}<details class="symbol" open><summary>{{s.symbol}} · {{s.result_count}}사이클</summary><div class="stats"><span class="pill">평균 <b class="{{'pos' if s.average_return_pct is not none and s.average_return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(s.average_return_pct)}}%</b></span><span class="pill">승률 {{'%.1f'|format(s.win_rate_pct)}}%</span><span class="pill">최고 {{'%+.2f'|format(s.best_return_pct)}}%</span><span class="pill">최저 {{'%+.2f'|format(s.worst_return_pct)}}%</span><span class="pill">평균보유 {{format_minutes_compact(s.average_holding_minutes)}}</span></div><div class="tablewrap"><table><thead><tr><th>매수 시각</th><th>분할 매수</th><th>평균 매수가</th><th>매도 시각</th><th>매도가</th><th>보유</th><th>수익률</th></tr></thead><tbody>{% for c in s.cycles %}<tr class="row"><td>{{format_kst(c.entry_time)}}</td><td>{% for ep in c.entry_points %}<div class="entrypoint">{{loop.index}}차 {{ep.price}} · {{format_kst(ep.time)}}</div>{% endfor %}</td><td>{{c.entry_price}}</td><td>{{format_kst(c.exit_time)}}</td><td>{{c.exit_price}}</td><td>{% if c.entry_time and c.exit_time %}{{format_minutes_compact((c.exit_time-c.entry_time).total_seconds()/60)}}{% else %}-{% endif %}</td><td class="{{'pos' if c.return_pct >= 0 else 'neg'}}">{{'%+.2f'|format(c.return_pct)}}%</td></tr>{% endfor %}</tbody></table></div></details>{% endfor %}{% else %}<div class="hero">아직 완료 데이터가 없습니다.</div>{% endif %}
 </div></body></html>''', combo=combo, period_key=period_key, format_kst=_format_iso_kst)
 
