@@ -3912,7 +3912,7 @@ href="/performance/member?category={{selected_category}}&period=all">전체</a>
 </details>
 
 <details class="chart-section collapsible-block member-view member-view-hidden" data-member-view="symbols-performance">
-<summary id="admin-symbol-performance-title" class="section-title">종목별 성과</summary>
+<summary id="member-symbol-performance-title" class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목별로 묶고, 각 종목 안에서 매수 시간봉별 성과를 정리합니다. 최근 수익률은 해당 시간봉의 가장 최근 완료 사이클입니다.</div>
 <div class="symbol-perf-list">
@@ -5436,8 +5436,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 {% endif %}
 
-<details class="card collapsible-block life-block life-section">
-<summary id="admin-life-title" class="section-title life-title">인생타점 상세 성과</summary>
+<details id="admin-life-title" class="card collapsible-block life-block life-section">
+<summary class="section-title life-title">인생타점 상세 성과</summary>
 <div class="collapsible-content">
 {% set life_ns = namespace(has_any=false) %}
 {% for s in selected.symbols|sort(attribute='symbol') %}
@@ -5459,8 +5459,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div></details>
 
 <details class="admin-content-group symbol-group" id="admin-group-symbols"><summary><span class="admin-group-heading"><span class="admin-group-title">종목 · 시간봉</span><span class="admin-group-sub">종목별 성과 · 시간봉별 상세 · 종목 목록</span></span></summary><div class="admin-content-group-body">
-<details class="card collapsible-block">
-<summary id="admin-symbol-performance-title" class="section-title">종목별 성과</summary>
+<details id="admin-symbol-performance-title" class="card collapsible-block">
+<summary class="section-title">종목별 성과</summary>
 <div class="collapsible-content">
 <div class="small" style="margin-bottom:12px">종목별로 묶고, 각 종목 안에서 매수 시간봉별 누적·최근 성과를 비교합니다.</div>
 {% for sym in admin_symbol_rows %}
@@ -5491,8 +5491,8 @@ class="{{'active-category' if category.category_key == selected_category else ''
 </div>
 </details>
 
-<details class="card collapsible-block">
-<summary id="admin-timeframe-title" class="section-title">매수·매도 시간봉별 상세 성과</summary>
+<details id="admin-timeframe-title" class="card collapsible-block">
+<summary class="section-title">매수·매도 시간봉별 상세 성과</summary>
 <div class="collapsible-content">
 {% for s in selected.symbols|sort(attribute='symbol') %}
 {% if s.member_stats.has_results %}
@@ -5676,6 +5676,7 @@ class="{{'active-category' if category.category_key == selected_category else ''
  // v83: 화면 진입 후 브라우저가 한가할 때 미리 불러와 메뉴 클릭 체감 대기를 줄인다.
  if(window.requestIdleCallback){requestIdleCallback(()=>loadPrediction(),{timeout:2500});}else{setTimeout(loadPrediction,1400);}
 })();
+// v105: 관리자 사이드 상세 메뉴 클릭 시 해당 본문 details까지 강제 펼침.
 // v91: 시장 전환 체감 속도 개선. 현재 화면이 안정된 뒤 다른 두 시장 HTML을 순차적으로 미리 계산해 서버 페이지 캐시에 올린다.
 (()=>{
  const current='{{selected_category}}', period='{{period_key}}';
@@ -5856,7 +5857,8 @@ summary{cursor:pointer;font-weight:bold}
  }
  function activate(hash,link,doScroll=true){
    if(!hash||hash==='#')return;
-   const target=document.querySelector(hash); if(!target)return;
+   const id=hash.slice(1);
+   const target=document.getElementById(id); if(!target)return;
    clearActive();
    const focus=openTarget(target);
    const matched=link || nav?.querySelector('a[href="'+hash+'"]');
@@ -5873,7 +5875,17 @@ summary{cursor:pointer;font-weight:bold}
  back&&back.addEventListener('click',close);
  nav&&nav.querySelectorAll('a').forEach(a=>a.addEventListener('click',(e)=>{
    const href=a.getAttribute('href')||'';
-   if(href.startsWith('#') && href.length>1){e.preventDefault();activate(href,a,true);}
+   if(href.startsWith('#') && href.length>1){
+     e.preventDefault();
+     const t=document.getElementById(href.slice(1));
+     if(t){
+       const detail=t.tagName==='DETAILS' ? t : t.closest('details');
+       if(detail) detail.open=true;
+       let n=detail ? detail.parentElement : t.parentElement;
+       while(n){if(n.tagName==='DETAILS')n.open=true;n=n.parentElement;}
+     }
+     activate(href,a,true);
+   }
    close();
  }));
  function activateHash(){const hash=location.hash||'';if(hash.length>1)activate(hash,null,false);}
