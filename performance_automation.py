@@ -284,6 +284,7 @@ def _release(delivery_key: str) -> None:
 _FONT_LOCK = threading.Lock()
 _FONT_PATHS: dict[str, str] = {}
 _FONT_ERROR: str | None = None
+_FONT_RETRY_AFTER = 0.0
 _FONT_DIR = Path("/tmp/bbangdol-fonts")
 _FONT_URLS = {
     "regular": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
@@ -293,7 +294,7 @@ _FONT_URLS = {
 
 def _prepare_korean_fonts() -> dict[str, str]:
     """한글 폰트를 찾거나 공식 Noto CJK 저장소에서 /tmp로 준비한다."""
-    global _FONT_ERROR
+    global _FONT_ERROR, _FONT_RETRY_AFTER
     if _FONT_PATHS.get("regular") and _FONT_PATHS.get("bold"):
         return dict(_FONT_PATHS)
     with _FONT_LOCK:
@@ -301,11 +302,15 @@ def _prepare_korean_fonts() -> dict[str, str]:
             return dict(_FONT_PATHS)
         system_candidates = {
             "regular": [
+                str(Path(__file__).resolve().parent / "assets" / "NotoSansCJKkr-Regular.otf"),
+                str(Path(__file__).resolve().parent / "fonts" / "NotoSansCJKkr-Regular.otf"),
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             ],
             "bold": [
+                str(Path(__file__).resolve().parent / "assets" / "NotoSansCJKkr-Bold.otf"),
+                str(Path(__file__).resolve().parent / "fonts" / "NotoSansCJKkr-Bold.otf"),
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Bold.otf",
                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
@@ -317,22 +322,26 @@ def _prepare_korean_fonts() -> dict[str, str]:
                     _FONT_PATHS[weight] = candidate
                     break
         try:
+            now_mono = time.monotonic()
+            if now_mono < _FONT_RETRY_AFTER:
+                raise RuntimeError(_FONT_ERROR or "Korean font remote retry cooling down")
             _FONT_DIR.mkdir(parents=True, exist_ok=True)
             for weight, url in _FONT_URLS.items():
                 if _FONT_PATHS.get(weight):
                     continue
                 target = _FONT_DIR / f"NotoSansCJKkr-{weight}.otf"
                 if not target.exists() or target.stat().st_size < 1_000_000:
-                    response = requests.get(url, timeout=45)
+                    response = requests.get(url, timeout=20)
                     response.raise_for_status()
                     target.write_bytes(response.content)
-                # 실제 Pillow 로딩으로 파일 유효성 확인
                 ImageFont.truetype(str(target), 24)
                 _FONT_PATHS[weight] = str(target)
             _FONT_ERROR = None
+            _FONT_RETRY_AFTER = 0.0
         except Exception as exc:
             _FONT_ERROR = str(exc)
-            log.exception("Korean font preparation failed")
+            _FONT_RETRY_AFTER = time.monotonic() + 1800.0
+            log.warning("Korean font unavailable; image reports will use text fallback: %s", exc)
         if not (_FONT_PATHS.get("regular") and _FONT_PATHS.get("bold")):
             raise RuntimeError(f"Korean font is not ready: {_FONT_ERROR or 'font not found'}")
         return dict(_FONT_PATHS)
@@ -427,6 +436,48 @@ def _send_photo(chat_id: str, png: bytes, caption: str) -> None:
     result = response.json()
     if not response.ok or not result.get("ok"):
         raise RuntimeError(f"Telegram sendPhoto failed: {result}")
+
+
+def _send_text(chat_id: str, text: str) -> None:
+    """v110: 이미지 생성 실패 시에도 결과 알람을 전송한다."""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN/TELEGRAM_BOT_TOKEN is not configured")
+    response = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={"chat_id": chat_id, "text": text[:4096]},
+        timeout=30,
+    )
+    result = response.json()
+    if not response.ok or not result.get("ok"):
+        raise RuntimeError(f"Telegram sendMessage failed: {result}")
+
+
+def _exit_caption(symbol: str, exit_group: str, position: dict[str, Any], result: dict[str, Any]) -> str:
+    return (
+        f"📈 {symbol} · 매도 {GROUP_LABEL.get(exit_group, exit_group)} 결과\n"
+        f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
+        f"종료 {result.get('exit_timeframe','-')} · {_format_kst(result.get('exit_time'))}\n"
+        f"수익률 {float(result.get('return_pct') or 0):+.3f}% · "
+        f"보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}\n"
+        f"최대손절 {float(result.get('signal_adverse_pct') or position.get('signal_adverse_pct') or 0):+.2f}%"
+    )
+
+
+def _send_exit_result_resilient(chat_id: str, market: str, symbol: str, position: dict[str, Any], result: dict[str, Any]) -> str:
+    """v110: 결과 이미지를 우선 보내고, 폰트/이미지 오류면 텍스트로 즉시 대체한다."""
+    exit_group = str(result.get("exit_group") or "")
+    caption = _exit_caption(symbol, exit_group, position, result)
+    try:
+        png = render_exit_image(market, symbol, position, result)
+        _send_photo(chat_id, png, caption)
+        return "photo"
+    except Exception as exc:
+        log.warning(
+            "exit result image unavailable; text fallback market=%s symbol=%s group=%s tf=%s error=%s",
+            market, symbol, exit_group, result.get("exit_timeframe"), exc,
+        )
+        _send_text(chat_id, caption)
+        return "text"
 
 
 def _base_canvas(height: int = 1350):
@@ -641,24 +692,15 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                     scan_claimed += 1
 
                     try:
-                        png = render_exit_image(market, symbol, position, result)
-                        caption = (
-                            f"📈 {symbol} · 매도 "
-                            f"{GROUP_LABEL.get(exit_group, exit_group)} 결과\n"
-                            f"매수 {position.get('entry_timeframe','-')} · "
-                            f"{_format_kst(position.get('entry_first_time'))}\n"
-                            f"종료 {result.get('exit_timeframe','-')} · "
-                            f"{_format_kst(result.get('exit_time'))}\n"
-                            f"수익률 {float(result['return_pct']):+.3f}% · "
-                            f"보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
+                        delivery_mode = _send_exit_result_resilient(
+                            chat_id, market, symbol, position, result
                         )
-                        _send_photo(chat_id, png, caption)
                         _mark_sent(delivery_key)
                         log.info(
                             "sell result sent market=%s symbol=%s exit_id=%s "
-                            "exit_group=%s exit_tf=%s env=%s",
+                            "exit_group=%s exit_tf=%s env=%s mode=%s",
                             market, symbol, exit_id, exit_group,
-                            result.get("exit_timeframe"), env_name,
+                            result.get("exit_timeframe"), env_name, delivery_mode,
                         )
                     except Exception:
                         _release(delivery_key)
@@ -1041,19 +1083,14 @@ def process_visible_sell_result_fallback() -> None:
                 "signal_adverse_pct": adverse_pct,
                 "exit_signal_id": source_id,
             }
-            png = render_exit_image(market, event["symbol"], position, result)
-            caption = (
-                f"📈 {event['symbol']} · 매도 {GROUP_LABEL.get(exit_group, exit_group)} 결과\n"
-                f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
-                f"종료 {event['timeframe']} · {_format_kst(event_time)}\n"
-                f"수익률 {return_pct:+.3f}% · 보유 {_duration(holding_minutes)}"
+            delivery_mode = _send_exit_result_resilient(
+                chat_id, market, event["symbol"], position, result
             )
-            _send_photo(chat_id, png, caption)
             _mark_sent(delivery_key)
             sent_count += 1
             log.info(
-                "visible sell result sent market=%s symbol=%s event_id=%s raw_exit_id=%s group=%s tf=%s",
-                market, event["symbol"], event["event_id"], raw_exit_id, exit_group, event["timeframe"],
+                "visible sell result sent market=%s symbol=%s event_id=%s raw_exit_id=%s group=%s tf=%s mode=%s",
+                market, event["symbol"], event["event_id"], raw_exit_id, exit_group, event["timeframe"], delivery_mode,
             )
         except Exception:
             _release(delivery_key)
