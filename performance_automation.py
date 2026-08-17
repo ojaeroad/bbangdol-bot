@@ -47,6 +47,7 @@ POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60"
 RESULT_RETRY_INTERVAL_SECONDS = max(60, int(os.getenv("PERFORMANCE_RESULT_RETRY_INTERVAL_SECONDS", "300")))
 RESULT_RETRY_LOOKBACK_HOURS = max(1, int(os.getenv("PERFORMANCE_RESULT_RETRY_LOOKBACK_HOURS", "24")))
 RESULT_RETRY_BACKFILL = os.getenv("PERFORMANCE_RESULT_RETRY_BACKFILL", "0").strip().lower() not in {"0", "false", "off", "no"}
+VISIBLE_SELL_FALLBACK_LOOKBACK_HOURS = max(1, int(os.getenv("PERFORMANCE_VISIBLE_SELL_FALLBACK_LOOKBACK_HOURS", "6")))
 
 def _automation_enabled() -> bool:
     return os.getenv(
@@ -835,6 +836,233 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
     return observed_max
 
 
+
+def _exit_group_for_timeframe(market: str, timeframe: str) -> str | None:
+    for group in ("SWING", "LONG", "LIFE"):
+        if timeframe in MARKET_GROUPS.get(market, {}).get(group, []):
+            return group
+    return None
+
+
+def _market_for_stage_event(route_family: str, exchange: str | None, symbol: str) -> str:
+    route = str(route_family or "").upper()
+    exch = str(exchange or "").upper()
+    sym = str(symbol or "").upper()
+    if route.startswith("BD_") or route == "STARFLOWER" or "COIN" in route or exch in {"BINANCE", "BYBIT", "UPBIT"}:
+        return "COIN"
+    if sym.isdigit() or any(token in exch for token in ("KRX", "KOSPI", "KOSDAQ", "KOREA")):
+        return "KOREA"
+    return "US"
+
+
+def _recent_visible_sell_focus_events(after_event_id: int) -> list[dict[str, Any]]:
+    """실제 Telegram에 노출된 매도 집중(stage 0)만 읽는다.
+
+    성과 엔진은 모든 원본 HIGH를 저장하므로, 5분 cadence에서 Telegram에 보이지 않은
+    더 이른 HIGH가 exit_results의 '첫 HIGH'를 선점할 수 있다. 그 경우 이후 실제 회원이
+    본 매도 집중 신호가 와도 result delivery의 new_results가 0이 된다.
+    이 보조 경로는 '실제 노출된 매도 집중'을 기준으로 결과카드만 보강한다.
+    """
+    ensure_schema()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, route_family, route, exchange, raw_exchange, symbol,
+                   timeframe, signal_price, occurred_at
+            FROM performance_cadence_stage_events
+            WHERE id > %s
+              AND direction='HIGH'
+              AND stage=0
+              AND telegram_visible=TRUE
+              AND occurred_at >= NOW() - (%s * INTERVAL '1 hour')
+            ORDER BY id
+            """,
+            (int(after_event_id), int(VISIBLE_SELL_FALLBACK_LOOKBACK_HOURS)),
+        ).fetchall()
+    return [
+        {
+            "event_id": int(r[0]), "route_family": r[1], "route": r[2],
+            "exchange": r[3] or r[4], "symbol": str(r[5]), "timeframe": str(r[6]),
+            "price": float(r[7]) if r[7] is not None else None, "occurred_at": r[8],
+        }
+        for r in rows
+    ]
+
+
+def _matching_high_signal_id(market: str, symbol: str, timeframe: str, occurred_at: datetime) -> int:
+    """stage event와 같은 원본 HIGH id를 가능한 한 찾아 기존 delivery key와 합친다."""
+    with _connect() as conn:
+        if market == "COIN":
+            extra = "AND strategy='STARFLOWER'"
+        else:
+            extra = "AND strategy='1Q'"
+        row = conn.execute(
+            f"""
+            SELECT id
+            FROM performance_signals
+            WHERE signal_type='HIGH' AND symbol=%s AND timeframe=%s
+              {extra}
+              AND received_at BETWEEN %s - INTERVAL '3 seconds' AND %s + INTERVAL '3 seconds'
+            ORDER BY ABS(EXTRACT(EPOCH FROM (received_at - %s))), id DESC
+            LIMIT 1
+            """,
+            (symbol, timeframe, occurred_at, occurred_at, occurred_at),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _event_adverse_pct(market: str, symbol: str, entry_time: datetime, exit_time: datetime, entry_price: float) -> float:
+    """진입~실제 노출 매도 신호 사이 원본 LOW 최저가 기준 최대손절을 계산한다."""
+    if not entry_price:
+        return 0.0
+    with _connect() as conn:
+        strategy = "STARFLOWER" if market == "COIN" else "1Q"
+        row = conn.execute(
+            """
+            SELECT MIN(signal_price)
+            FROM performance_signals
+            WHERE strategy=%s AND symbol=%s AND signal_type='LOW'
+              AND signal_price IS NOT NULL
+              AND received_at BETWEEN %s AND %s
+            """,
+            (strategy, symbol, entry_time, exit_time),
+        ).fetchone()
+    low = float(row[0]) if row and row[0] is not None else float(entry_price)
+    return (low - float(entry_price)) / float(entry_price) * 100.0
+
+
+def process_visible_sell_result_fallback() -> None:
+    """v109: 실제 Telegram 매도 집중은 왔는데 결과카드가 누락되는 경우 보강.
+
+    정상 exit_results 경로는 그대로 1순위로 유지한다. 이 함수는 cadence stage table의
+    'Telegram에 실제 노출된 HIGH stage 0'만 대상으로 하고, position+매도TF 단위
+    delivery key로 한 번만 발송한다. 단타는 애초에 MARKET_GROUPS/허용그룹에 없으므로 제외된다.
+    """
+    key = "visible_sell_fallback_v109_stage_event_id"
+    baseline = _get_state(key)
+    if baseline is None:
+        ensure_schema()
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id),0) FROM performance_cadence_stage_events"
+            ).fetchone()
+        baseline = int(row[0] or 0)
+        _set_state(key, baseline)
+        log.warning("visible sell fallback baseline initialized event_id=%s", baseline)
+        return
+
+    events = _recent_visible_sell_focus_events(baseline)
+    if not events:
+        return
+
+    market_cache: dict[str, dict[str, Any]] = {}
+    max_event_id = baseline
+    sent_count = 0
+    unmatched = 0
+
+    for event in events:
+        max_event_id = max(max_event_id, int(event["event_id"]))
+        market = _market_for_stage_event(event.get("route_family"), event.get("exchange"), event["symbol"])
+        exit_group = _exit_group_for_timeframe(market, event["timeframe"])
+        if exit_group not in {"SWING", "LONG", "LIFE"} or not _telegram_send_allowed(market, exit_group):
+            continue
+        if event.get("price") is None:
+            continue
+
+        if market not in market_cache:
+            market_cache[market] = group_analysis_market_data(market)
+        symbol_info = market_cache[market].get("symbol_data", {}).get(event["symbol"])
+        if not symbol_info:
+            unmatched += 1
+            log.warning("visible sell fallback no symbol data market=%s symbol=%s", market, event["symbol"])
+            continue
+
+        event_time = event["occurred_at"]
+        candidates = []
+        for position in symbol_info.get("positions", []):
+            if position.get("entry_group") not in {"SWING", "LONG", "LIFE"}:
+                continue
+            try:
+                entry_last = datetime.fromisoformat(str(position.get("entry_last_time")))
+            except Exception:
+                continue
+            if entry_last.tzinfo is None:
+                entry_last = entry_last.replace(tzinfo=UTC)
+            if entry_last >= event_time:
+                continue
+            candidates.append((entry_last, position))
+        if not candidates:
+            unmatched += 1
+            log.info("visible sell fallback no eligible position market=%s symbol=%s tf=%s event_id=%s", market, event["symbol"], event["timeframe"], event["event_id"])
+            continue
+
+        # 가장 최근에 매수가 끝난 포지션을 실제 운영 포지션으로 간주한다.
+        _, position = max(candidates, key=lambda x: x[0])
+        position_key = _position_key(market, event["symbol"], position)
+        env_name, chat_id = _exit_destination(market, exit_group)
+        if not env_name or not chat_id:
+            log.warning("visible sell fallback destination missing market=%s group=%s env=%s", market, exit_group, env_name)
+            continue
+
+        raw_exit_id = _matching_high_signal_id(market, event["symbol"], event["timeframe"], event_time)
+        source_id = raw_exit_id or int(event["event_id"])
+        # 이 key는 '포지션+매도 시간봉' 기준이라 같은 매수 포지션에 동일 TF 결과를 반복 발송하지 않는다.
+        delivery_key = f"exit-visible-v109:{position_key}:{exit_group}:{event['timeframe']}"
+        if not _claim(delivery_key, "EXIT_IMAGE_VISIBLE", market, event["symbol"], env_name):
+            continue
+
+        try:
+            entry_price = float(position.get("entry_price") or 0)
+            try:
+                entry_first = datetime.fromisoformat(str(position.get("entry_first_time")))
+            except Exception:
+                entry_first = event_time
+            if entry_first.tzinfo is None:
+                entry_first = entry_first.replace(tzinfo=UTC)
+            return_pct = (float(event["price"]) - entry_price) / entry_price * 100.0 if entry_price else 0.0
+            try:
+                entry_last = datetime.fromisoformat(str(position.get("entry_last_time")))
+            except Exception:
+                entry_last = entry_first
+            if entry_last.tzinfo is None:
+                entry_last = entry_last.replace(tzinfo=UTC)
+            holding_minutes = max(0, int((event_time - entry_last).total_seconds() / 60))
+            adverse_pct = _event_adverse_pct(market, event["symbol"], entry_first, event_time, entry_price)
+            result = {
+                "exit_group": exit_group,
+                "exit_group_label": GROUP_LABEL.get(exit_group, exit_group),
+                "exit_timeframe": event["timeframe"],
+                "exit_timeframe_minutes": {"30m":30,"1h":60,"4h":240,"6h":360,"12h":720,"1d":1440,"3d":4320,"1w":10080,"1M":43200}.get(event["timeframe"], 0),
+                "exit_time": event_time.isoformat(),
+                "exit_price": float(event["price"]),
+                "holding_minutes": holding_minutes,
+                "holding_text": _duration(holding_minutes),
+                "return_pct": return_pct,
+                "signal_adverse_pct": adverse_pct,
+                "exit_signal_id": source_id,
+            }
+            png = render_exit_image(market, event["symbol"], position, result)
+            caption = (
+                f"📈 {event['symbol']} · 매도 {GROUP_LABEL.get(exit_group, exit_group)} 결과\n"
+                f"매수 {position.get('entry_timeframe','-')} · {_format_kst(position.get('entry_first_time'))}\n"
+                f"종료 {event['timeframe']} · {_format_kst(event_time)}\n"
+                f"수익률 {return_pct:+.3f}% · 보유 {_duration(holding_minutes)}"
+            )
+            _send_photo(chat_id, png, caption)
+            _mark_sent(delivery_key)
+            sent_count += 1
+            log.info(
+                "visible sell result sent market=%s symbol=%s event_id=%s raw_exit_id=%s group=%s tf=%s",
+                market, event["symbol"], event["event_id"], raw_exit_id, exit_group, event["timeframe"],
+            )
+        except Exception:
+            _release(delivery_key)
+            log.exception("visible sell result fallback failed key=%s", delivery_key)
+
+    _set_state(key, max_event_id)
+    log.info("visible sell fallback scan after_event_id=%s current_event_id=%s events=%s sent=%s unmatched=%s", baseline, max_event_id, len(events), sent_count, unmatched)
+
+
 def _report_target(
     report_market: str,
 ) -> tuple[str, set[str] | None, set[str] | None, ZoneInfo]:
@@ -1174,6 +1402,8 @@ def run_once() -> None:
 
     # 첫 검사에서 실패/누락된 결과가 영구적으로 사라지지 않도록 주기적으로 재검사.
     _retry_recent_result_deliveries(force=bootstrapped)
+    # v109: 실제 Telegram에 보인 매도 집중이 raw-HIGH 선점 때문에 결과카드에서 빠지는 경우 보강.
+    process_visible_sell_result_fallback()
     process_scheduled_reports()
 
 

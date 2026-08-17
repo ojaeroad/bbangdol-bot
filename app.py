@@ -1,3 +1,4 @@
+# V109_VISIBLE_SELL_RESULT_FALLBACK: 실제 Telegram 매도 집중(stage0) 기준 결과카드 누락 보강 + V108 안정화 유지
 # V107_CADENCE_NAMEERROR_FIX: 알람 분석 _stats 복구 + episodes dict 처리 FIX + V106 결과알람 누락방지 유지
 # V106_PERFORMANCE_RESULT_RETRY: SWING/LONG/LIFE 결과 이미지 누락 방지용 delivery replay + 기존 UI 유지
 # V104_ADMIN_UI_HIERARCHY_NAV: 큰/작은 메뉴 색상 분리 + 접힌 상태에서도 세부메뉴명 노출 + 클릭 세부섹션 자동 펼침/강조 + 중복 관리자분석 메뉴 통합
@@ -89,7 +90,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v108-cadence-nameerror-fix")
+APP_VERSION  = os.getenv("APP_VERSION", "v109-visible-sell-result-fallback")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
