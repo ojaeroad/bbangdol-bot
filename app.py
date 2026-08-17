@@ -89,7 +89,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v107-cadence-nameerror-fix")
+APP_VERSION  = os.getenv("APP_VERSION", "v108-cadence-nameerror-fix")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -2827,32 +2827,57 @@ def performance_public():
 # 화면 HTML뿐 아니라 완료사이클/그룹분석/알람분석 결과 자체를 짧게 재사용한다.
 _PERFORMANCE_CALC_CACHE: dict[tuple, tuple[float, object]] = {}
 _PERFORMANCE_CALC_CACHE_LOCK = threading.Lock()
+# v108: 같은 사용자가 메뉴를 연속 클릭하거나 브라우저가 동일 fragment를 중복 요청할 때
+# 무거운 cadence/group 분석을 동시에 두 번 돌리지 않도록 key별 계산 잠금을 둔다.
+_PERFORMANCE_CALC_KEY_LOCKS: dict[tuple, threading.Lock] = {}
 _PERFORMANCE_CALC_CACHE_TTL = max(30, int(os.getenv("PERFORMANCE_CALC_CACHE_SECONDS", "120") or 120))
 
 
 def _cached_calculation(key: tuple, factory):
+    """무거운 관리자 분석 결과 캐시 + 동일 key single-flight.
+
+    v108: 캐시 미스 순간 동일 fragment 요청이 겹치면 예전에는 같은 대형 계산이 동시에
+    실행되어 Render free worker가 느려지거나 일시 502가 날 수 있었다. 한 요청만 계산하고
+    나머지는 그 결과를 재사용한다.
+    """
     now_ts = time.time()
     with _PERFORMANCE_CALC_CACHE_LOCK:
         cached = _PERFORMANCE_CALC_CACHE.get(key)
         if cached and now_ts - cached[0] < _PERFORMANCE_CALC_CACHE_TTL:
             return cached[1]
-    value = factory()
-    with _PERFORMANCE_CALC_CACHE_LOCK:
-        # V63_MEMORY_FIX: 대형 분석 결과를 시장별로 계속 보관하면
-        # KOREA→US→COIN을 클릭하는 동안 512MB를 빠르게 소모한다.
-        # 같은 종류의 무거운 계산은 가장 최근 1개만 유지한다.
-        family = key[0] if key else None
-        if family in {"visual_cycle_data", "group_analysis_market_data"}:
-            for old_key in list(_PERFORMANCE_CALC_CACHE):
-                if old_key != key and old_key and old_key[0] == family:
-                    _PERFORMANCE_CALC_CACHE.pop(old_key, None)
-        _PERFORMANCE_CALC_CACHE[key] = (now_ts, value)
-        # cadence까지 포함한 전체 캐시도 작게 제한한다.
-        while len(_PERFORMANCE_CALC_CACHE) > 8:
-            oldest_key = min(_PERFORMANCE_CALC_CACHE, key=lambda k: _PERFORMANCE_CALC_CACHE[k][0])
-            _PERFORMANCE_CALC_CACHE.pop(oldest_key, None)
-    gc.collect()
-    return value
+        key_lock = _PERFORMANCE_CALC_KEY_LOCKS.setdefault(key, threading.Lock())
+
+    with key_lock:
+        # 앞 요청이 계산을 끝냈을 수 있으므로 잠금 획득 뒤 캐시를 다시 확인한다.
+        now_ts = time.time()
+        with _PERFORMANCE_CALC_CACHE_LOCK:
+            cached = _PERFORMANCE_CALC_CACHE.get(key)
+            if cached and now_ts - cached[0] < _PERFORMANCE_CALC_CACHE_TTL:
+                return cached[1]
+
+        started = time.monotonic()
+        value = factory()
+        elapsed = time.monotonic() - started
+        if elapsed >= 3:
+            app.logger.info("performance heavy calculation key=%s seconds=%.2f", key, elapsed)
+
+        with _PERFORMANCE_CALC_CACHE_LOCK:
+            # V63_MEMORY_FIX 유지: 대형 분석 결과는 같은 family의 최근 1개만 보관한다.
+            family = key[0] if key else None
+            if family in {"visual_cycle_data", "group_analysis_market_data"}:
+                for old_key in list(_PERFORMANCE_CALC_CACHE):
+                    if old_key != key and old_key and old_key[0] == family:
+                        _PERFORMANCE_CALC_CACHE.pop(old_key, None)
+            _PERFORMANCE_CALC_CACHE[key] = (time.time(), value)
+            while len(_PERFORMANCE_CALC_CACHE) > 8:
+                oldest_key = min(_PERFORMANCE_CALC_CACHE, key=lambda k: _PERFORMANCE_CALC_CACHE[k][0])
+                _PERFORMANCE_CALC_CACHE.pop(oldest_key, None)
+            # 쓰이지 않는 key-lock도 캐시에서 밀려난 키 기준으로 정리한다.
+            for old_key in list(_PERFORMANCE_CALC_KEY_LOCKS):
+                if old_key != key and old_key not in _PERFORMANCE_CALC_CACHE and not _PERFORMANCE_CALC_KEY_LOCKS[old_key].locked():
+                    _PERFORMANCE_CALC_KEY_LOCKS.pop(old_key, None)
+        gc.collect()
+        return value
 
 
 def _cached_visual_cycle_data(limit: int, category_key: str | None = None):

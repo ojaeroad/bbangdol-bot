@@ -42,7 +42,7 @@ KST = ZoneInfo("Asia/Seoul")
 UTC = timezone.utc
 
 POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60")))
-# v106: 결과 이미지 발송은 HIGH watermark 한 번만 보고 끝내면 일시적 Telegram/DB 지연 시
+# v108: 결과 이미지 발송은 HIGH watermark 한 번만 보고 끝내면 일시적 Telegram/DB 지연 시
 # 해당 결과가 영구 누락될 수 있다. 최근 HIGH 구간을 별도 재검사하되 delivery_log로 중복을 막는다.
 RESULT_RETRY_INTERVAL_SECONDS = max(60, int(os.getenv("PERFORMANCE_RESULT_RETRY_INTERVAL_SECONDS", "300")))
 RESULT_RETRY_LOOKBACK_HOURS = max(1, int(os.getenv("PERFORMANCE_RESULT_RETRY_LOOKBACK_HOURS", "24")))
@@ -91,6 +91,13 @@ CREATE TABLE IF NOT EXISTS performance_delivery_log (
 );
 CREATE INDEX IF NOT EXISTS idx_performance_delivery_type_time
 ON performance_delivery_log(delivery_type, delivered_at);
+
+-- v108: claim 직후 프로세스가 재시작되면 기존 구조에서는 이미 발송한 것으로
+-- 영구 고정될 수 있었다. 기존 행은 SENT로 간주하고 신규 행만 CLAIMED→SENT로 관리한다.
+ALTER TABLE performance_delivery_log
+ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(20) NOT NULL DEFAULT 'SENT';
+CREATE INDEX IF NOT EXISTS idx_performance_delivery_status_time
+ON performance_delivery_log(delivery_status, delivered_at);
 
 CREATE TABLE IF NOT EXISTS performance_automation_state (
     state_key VARCHAR(100) PRIMARY KEY,
@@ -146,12 +153,12 @@ def _recent_high_floor_id(hours: int) -> int:
 
 
 def _bootstrap_result_replay_baseline() -> int:
-    """v106 이후 결과만 자동 재검사한다.
+    """v108 이후 결과를 자동 재검사한다.
 
     기본값에서는 배포 순간 이전의 과거 누락 결과를 한꺼번에 재발송하지 않는다.
     PERFORMANCE_RESULT_RETRY_BACKFILL=1인 경우에만 최근 lookback 구간까지 소급한다.
     """
-    key = "result_replay_v106_baseline_high_signal_id"
+    key = "result_replay_v108_baseline_high_signal_id"
     existing = _get_state(key)
     if existing is not None:
         return existing
@@ -213,21 +220,52 @@ def _claim(
     symbol: str | None,
     destination_env: str,
 ) -> bool:
-    """DB 원자적 선점. Gunicorn 프로세스가 여러 개여도 한 번만 발송."""
+    """DB 원자적 선점.
+
+    v108: CLAIMED 상태와 실제 SENT 상태를 분리한다. 발송 직전 프로세스가 재시작되더라도
+    CLAIMED가 10분 이상 오래되면 다음 검사에서 다시 선점할 수 있다. 기존 행은 schema
+    migration 기본값 SENT이므로 과거 정상 발송 결과가 재전송되지는 않는다.
+    """
     ensure_schema()
     with _connect() as conn:
         row = conn.execute(
             """
             INSERT INTO performance_delivery_log(
-                delivery_key, delivery_type, market, symbol, destination_env
+                delivery_key, delivery_type, market, symbol, destination_env,
+                delivery_status, delivered_at
             )
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (delivery_key) DO NOTHING
+            VALUES (%s, %s, %s, %s, %s, 'CLAIMED', NOW())
+            ON CONFLICT (delivery_key) DO UPDATE
+               SET delivery_type = EXCLUDED.delivery_type,
+                   market = EXCLUDED.market,
+                   symbol = EXCLUDED.symbol,
+                   destination_env = EXCLUDED.destination_env,
+                   delivery_status = 'CLAIMED',
+                   delivered_at = NOW()
+             WHERE performance_delivery_log.delivery_status = 'CLAIMED'
+               AND performance_delivery_log.delivered_at < NOW() - INTERVAL '10 minutes'
             RETURNING delivery_key
             """,
             (delivery_key, delivery_type, market, symbol, destination_env),
         ).fetchone()
     return bool(row)
+
+
+def _mark_sent(delivery_key: str) -> None:
+    """Telegram 전송이 실제 성공한 뒤에만 SENT로 확정한다."""
+    try:
+        with _connect() as conn:
+            conn.execute(
+                """
+                UPDATE performance_delivery_log
+                   SET delivery_status='SENT', delivered_at=NOW()
+                 WHERE delivery_key=%s
+                """,
+                (delivery_key,),
+            )
+    except Exception:
+        # Telegram은 이미 성공했을 수 있으므로 여기서 claim을 삭제하면 중복 전송 위험이 있다.
+        log.exception("delivery sent-state update failed key=%s", delivery_key)
 
 
 def _release(delivery_key: str) -> None:
@@ -541,8 +579,16 @@ def _exit_destination(market: str, exit_group: str) -> tuple[str, str]:
 
 
 def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
-    """새 HIGH만 처리하여 종료 그룹별 매도방으로 발송한다."""
+    """새 HIGH만 처리하여 종료 그룹별 매도방으로 발송한다.
+
+    v108에서는 실제 HIGH는 저장됐는데 결과가 만들어지지 않는 경우를 로그에서 즉시
+    구분할 수 있도록 시장별 후보/매칭 수를 남긴다. 결과 규칙 자체는 바꾸지 않는다.
+    """
     observed_max = after_high_signal_id
+    scan_positions = 0
+    scan_results = 0
+    scan_new_results = 0
+    scan_claimed = 0
 
     for market in ("KOREA", "US", "COIN"):
         market_data = group_analysis_market_data(market)
@@ -551,6 +597,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
             for position in symbol_data.get("positions", []):
                 if position.get("entry_group") not in {"SWING", "LONG", "LIFE"}:
                     continue
+                scan_positions += 1
 
                 position_key = _position_key(market, symbol, position)
                 all_results = [
@@ -559,6 +606,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                 ]
 
                 # 새 개별 종료 결과는 종료 그룹에 해당하는 매도방으로 발송한다.
+                scan_results += len(all_results)
                 for result in all_results:
                     try:
                         exit_id = int(result.get("exit_signal_id") or 0)
@@ -568,6 +616,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                     observed_max = max(observed_max, exit_id)
                     if exit_id <= after_high_signal_id:
                         continue
+                    scan_new_results += 1
 
                     exit_group = str(result.get("exit_group") or "")
                     env_name, chat_id = _exit_destination(market, exit_group)
@@ -588,6 +637,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                         delivery_key, "EXIT_IMAGE", market, symbol, env_name
                     ):
                         continue
+                    scan_claimed += 1
 
                     try:
                         png = render_exit_image(market, symbol, position, result)
@@ -602,6 +652,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                             f"보유 {result.get('holding_text') or _duration(result.get('holding_minutes'))}"
                         )
                         _send_photo(chat_id, png, caption)
+                        _mark_sent(delivery_key)
                         log.info(
                             "sell result sent market=%s symbol=%s exit_id=%s "
                             "exit_group=%s exit_tf=%s env=%s",
@@ -684,6 +735,7 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                         )
                         caption = "\n".join(caption_lines)
                         _send_photo(chat_id, png, caption)
+                        _mark_sent(summary_key)
                         completion_time = max(
                             row["exit_time"] for row in group_results
                         )
@@ -776,6 +828,10 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                             symbol, deleted,
                         )
 
+    log.info(
+        "result delivery scan after_id=%s observed_max=%s positions=%s results=%s new_results=%s claimed=%s",
+        after_high_signal_id, observed_max, scan_positions, scan_results, scan_new_results, scan_claimed,
+    )
     return observed_max
 
 
@@ -1175,7 +1231,7 @@ def automation_status() -> dict[str, Any]:
         "result_retry_interval_seconds": RESULT_RETRY_INTERVAL_SECONDS,
         "result_retry_lookback_hours": RESULT_RETRY_LOOKBACK_HOURS,
         "result_retry_backfill": RESULT_RETRY_BACKFILL,
-        "result_replay_baseline_high_signal_id": _get_state("result_replay_v106_baseline_high_signal_id") if DATABASE_URL else None,
+        "result_replay_baseline_high_signal_id": _get_state("result_replay_v108_baseline_high_signal_id") if DATABASE_URL else None,
         "result_destinations": {
             f"{market}_{group}": {
                 "env": env_name,
