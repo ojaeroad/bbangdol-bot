@@ -1,3 +1,4 @@
+# V107_CADENCE_NAMEERROR_FIX: 누락된 _stats 복구 + episode_records dict/value 호환
 # V102_CADENCE_EPISODE_COOLDOWN: 전 단계 5분 + 종료 후 자기봉/60분 재집중
 # V98_HIGHER_TREND_REGIME_RESEARCH: 스윙 이상 D/W Stoch 큰형 + SMA20/60 조합 연구
 # V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 빈칸 표시
@@ -415,6 +416,41 @@ def _simulate_cycles(signals: list[dict[str, Any]], mode: str) -> dict[str, Any]
         "entered_focus_count": entered_focus_count, "no_entry_focus_count": focus_count - entered_focus_count,
         "open_position_count": len(open_positions),
     }
+
+def _stats(
+    raw_count: int,
+    sampled_count: int,
+    simulation: dict[str, Any],
+) -> dict[str, Any]:
+    """알람 주기별 전체 요약 통계.
+
+    v99~v106 통합 과정에서 이 함수 정의가 빠졌지만 simulate_cadence()는
+    계속 호출하고 있어 모든 시장의 알람 분석 fragment가 NameError로 실패했다.
+    완료 사이클의 MAE/MFE는 아래 _cycle_stats()에서 별도로 보강한다.
+    """
+    cycles = simulation.get("cycles") or []
+    values = [float(c["return_pct"]) for c in cycles if c.get("return_pct") is not None]
+    entry_counts = [int(c.get("entries") or 0) for c in cycles]
+    focus_count = int(simulation.get("focus_count") or 0)
+    entered_focus_count = int(simulation.get("entered_focus_count") or 0)
+    return {
+        "alert_count": int(sampled_count),
+        "alert_reduction_pct": ((raw_count - sampled_count) / raw_count * 100.0) if raw_count else 0.0,
+        "focus_count": focus_count,
+        "entered_focus_count": entered_focus_count,
+        "no_entry_focus_count": int(simulation.get("no_entry_focus_count") or 0),
+        "entry_capture_rate_pct": (entered_focus_count / focus_count * 100.0) if focus_count else None,
+        "completed_cycles": len(values),
+        "average_entries": (sum(entry_counts) / len(entry_counts)) if entry_counts else None,
+        "one_entry_cycles": sum(1 for count in entry_counts if count == 1),
+        "two_entry_cycles": sum(1 for count in entry_counts if count == 2),
+        "three_entry_cycles": sum(1 for count in entry_counts if count >= 3),
+        "average_return_pct": (sum(values) / len(values)) if values else None,
+        "win_rate_pct": (sum(1 for value in values if value > 0) / len(values) * 100.0) if values else None,
+        "best_return_pct": max(values) if values else None,
+        "worst_return_pct": min(values) if values else None,
+    }
+
 
 def _cycle_stats(cycles: list[dict[str, Any]]) -> dict[str, Any]:
     values = [float(c["return_pct"]) for c in cycles]
@@ -1089,9 +1125,12 @@ def simulate_cadence(market: str, period_key: str = "all") -> dict[str, Any]:
         for code, short_label in (("ALL", "1분 원본"), ("THREE", "3분 쿨타임"), ("FIVE", "5분 현재운영"), ("CLOCK5", "정시 5분봉"), ("FULL", "자기 시간봉"), ("HALF", "절반 주기")):
             group_sample_count = len([s for s in alert_samples[code] if s["group"] == group])
             group_cycles = [c for c in simulations[code]["cycles"] if c["group"] == group]
+            episode_rows = simulations[code].get("episodes") or {}
+            if isinstance(episode_rows, dict):
+                episode_rows = episode_rows.values()
             group_focus = [
-                episode for episode in simulations[code]["episodes"]
-                if episode["group"] == group
+                episode for episode in episode_rows
+                if episode.get("group") == group
             ]
             # 그룹별 진입 통계는 같은 핵심 시뮬레이션의 완료 사이클을 사용한다.
             values = [c["return_pct"] for c in group_cycles]

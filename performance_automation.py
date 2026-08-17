@@ -42,6 +42,11 @@ KST = ZoneInfo("Asia/Seoul")
 UTC = timezone.utc
 
 POLL_SECONDS = max(30, int(os.getenv("PERFORMANCE_AUTOMATION_POLL_SECONDS", "60")))
+# v106: 결과 이미지 발송은 HIGH watermark 한 번만 보고 끝내면 일시적 Telegram/DB 지연 시
+# 해당 결과가 영구 누락될 수 있다. 최근 HIGH 구간을 별도 재검사하되 delivery_log로 중복을 막는다.
+RESULT_RETRY_INTERVAL_SECONDS = max(60, int(os.getenv("PERFORMANCE_RESULT_RETRY_INTERVAL_SECONDS", "300")))
+RESULT_RETRY_LOOKBACK_HOURS = max(1, int(os.getenv("PERFORMANCE_RESULT_RETRY_LOOKBACK_HOURS", "24")))
+RESULT_RETRY_BACKFILL = os.getenv("PERFORMANCE_RESULT_RETRY_BACKFILL", "0").strip().lower() not in {"0", "false", "off", "no"}
 
 def _automation_enabled() -> bool:
     return os.getenv(
@@ -119,6 +124,49 @@ def _current_max_high_signal_id() -> int:
         ).fetchone()
     return int(row[0] or 0)
 
+
+
+
+def _recent_high_floor_id(hours: int) -> int:
+    """최근 N시간 HIGH 중 가장 작은 id. 없으면 현재 max+1을 반환한다."""
+    ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(id), COALESCE(MAX(id), 0)
+            FROM performance_signals
+            WHERE signal_type='HIGH'
+              AND received_at >= NOW() - (%s * INTERVAL '1 hour')
+            """,
+            (int(hours),),
+        ).fetchone()
+    min_id = int(row[0]) if row and row[0] is not None else None
+    max_id = int(row[1] or 0) if row else 0
+    return min_id if min_id is not None else max_id + 1
+
+
+def _bootstrap_result_replay_baseline() -> int:
+    """v106 이후 결과만 자동 재검사한다.
+
+    기본값에서는 배포 순간 이전의 과거 누락 결과를 한꺼번에 재발송하지 않는다.
+    PERFORMANCE_RESULT_RETRY_BACKFILL=1인 경우에만 최근 lookback 구간까지 소급한다.
+    """
+    key = "result_replay_v106_baseline_high_signal_id"
+    existing = _get_state(key)
+    if existing is not None:
+        return existing
+    current = _current_max_high_signal_id()
+    if RESULT_RETRY_BACKFILL:
+        floor = _recent_high_floor_id(RESULT_RETRY_LOOKBACK_HOURS)
+        baseline = max(0, floor - 1)
+    else:
+        baseline = current
+    _set_state(key, baseline)
+    log.warning(
+        "result replay baseline initialized id=%s backfill=%s lookback_hours=%s",
+        baseline, RESULT_RETRY_BACKFILL, RESULT_RETRY_LOOKBACK_HOURS,
+    )
+    return baseline
 
 def _get_state(key: str) -> int | None:
     ensure_schema()
@@ -1018,6 +1066,37 @@ def process_scheduled_reports() -> None:
         _send_period_report(chat_id, "monthly", "COIN", now_kst)
 
 
+_LAST_RESULT_RETRY_MONOTONIC = 0.0
+
+
+def _retry_recent_result_deliveries(force: bool = False) -> None:
+    """최근 결과를 재검사한다.
+
+    핵심: performance_delivery_log가 성공 전송을 원자적으로 기록하므로 이미 보낸 결과는
+    다시 전송되지 않는다. 반대로 Telegram 일시 실패, 대상 채널 일시 누락, 분석 직후
+    타이밍 문제로 첫 검사에서 놓친 결과는 다음 재검사에서 다시 발송 기회를 얻는다.
+    SCALP은 기존 정책대로 제외되고 SWING/LONG/LIFE만 process_new_cycle_deliveries에서 처리한다.
+    """
+    global _LAST_RESULT_RETRY_MONOTONIC
+    now_mono = time.monotonic()
+    if not force and now_mono - _LAST_RESULT_RETRY_MONOTONIC < RESULT_RETRY_INTERVAL_SECONDS:
+        return
+    _LAST_RESULT_RETRY_MONOTONIC = now_mono
+
+    baseline = _bootstrap_result_replay_baseline()
+    floor = _recent_high_floor_id(RESULT_RETRY_LOOKBACK_HOURS)
+    after_id = max(int(baseline), int(floor) - 1)
+    current_max = _current_max_high_signal_id()
+    if current_max <= after_id:
+        return
+
+    log.info(
+        "result replay scan after_id=%s current_max=%s lookback_hours=%s",
+        after_id, current_max, RESULT_RETRY_LOOKBACK_HOURS,
+    )
+    process_new_cycle_deliveries(after_id)
+
+
 def run_once() -> None:
     if not _automation_enabled():
         return
@@ -1029,13 +1108,16 @@ def run_once() -> None:
         return
 
     watermark, bootstrapped = _bootstrap_or_get_high_watermark()
-    if bootstrapped:
-        return
+    # 기존 watermark는 새 HIGH를 빠르게 감지하는 용도로만 사용한다.
+    # 결과 발송의 신뢰성은 delivery_log + 최근구간 재검사로 보강한다.
+    if not bootstrapped:
+        current_max = _current_max_high_signal_id()
+        if current_max > watermark:
+            process_new_cycle_deliveries(watermark)
+            _set_state("last_processed_high_signal_id", current_max)
 
-    current_max = _current_max_high_signal_id()
-    if current_max > watermark:
-        process_new_cycle_deliveries(watermark)
-        _set_state("last_processed_high_signal_id", current_max)
+    # 첫 검사에서 실패/누락된 결과가 영구적으로 사라지지 않도록 주기적으로 재검사.
+    _retry_recent_result_deliveries(force=bootstrapped)
     process_scheduled_reports()
 
 
@@ -1090,6 +1172,10 @@ def automation_status() -> dict[str, Any]:
         **_font_status(),
         "poll_seconds": POLL_SECONDS,
         "thread_started": _STARTED,
+        "result_retry_interval_seconds": RESULT_RETRY_INTERVAL_SECONDS,
+        "result_retry_lookback_hours": RESULT_RETRY_LOOKBACK_HOURS,
+        "result_retry_backfill": RESULT_RETRY_BACKFILL,
+        "result_replay_baseline_high_signal_id": _get_state("result_replay_v106_baseline_high_signal_id") if DATABASE_URL else None,
         "result_destinations": {
             f"{market}_{group}": {
                 "env": env_name,
