@@ -464,20 +464,18 @@ def _exit_caption(symbol: str, exit_group: str, position: dict[str, Any], result
 
 
 def _send_exit_result_resilient(chat_id: str, market: str, symbol: str, position: dict[str, Any], result: dict[str, Any]) -> str:
-    """v110: 결과 이미지를 우선 보내고, 폰트/이미지 오류면 텍스트로 즉시 대체한다."""
+    """v111: 개별 매수→매도 결과는 이미지 없이 텍스트만 전송한다.
+
+    같은 포지션 그룹끼리의 매칭(SWING→SWING, LONG→LONG, LIFE→LIFE)은
+    회원이 대표 결과를 바로 알아볼 수 있도록 ⭐ 대표 결과로 강조한다.
+    """
     exit_group = str(result.get("exit_group") or "")
+    entry_group = str(position.get("entry_group") or "")
     caption = _exit_caption(symbol, exit_group, position, result)
-    try:
-        png = render_exit_image(market, symbol, position, result)
-        _send_photo(chat_id, png, caption)
-        return "photo"
-    except Exception as exc:
-        log.warning(
-            "exit result image unavailable; text fallback market=%s symbol=%s group=%s tf=%s error=%s",
-            market, symbol, exit_group, result.get("exit_timeframe"), exc,
-        )
-        _send_text(chat_id, caption)
-        return "text"
+    if entry_group == exit_group:
+        caption = "⭐ 대표 결과 · 같은 포지션 매칭\n" + caption
+    _send_text(chat_id, caption)
+    return "text"
 
 
 def _base_canvas(height: int = 1350):
@@ -708,100 +706,76 @@ def process_new_cycle_deliveries(after_high_signal_id: int) -> int:
                             "sell result delivery failed key=%s", delivery_key
                         )
 
-                # 종료 그룹별 필요한 시간봉이 모두 모이면 같은 매도방에 종합 1장.
-                for exit_group in ("SWING", "LONG", "LIFE"):
-                    expected = set(
-                        MARKET_GROUPS.get(market, {}).get(exit_group, [])
-                    )
-                    group_results = [
-                        row for row in all_results
-                        if row.get("exit_group") == exit_group
-                    ]
-                    completed = {
-                        row.get("exit_timeframe") for row in group_results
-                    }
-                    trigger_id = max(
-                        (
-                            int(row.get("exit_signal_id") or 0)
-                            for row in group_results
-                        ),
-                        default=0,
-                    )
+                # v111: 종합 이미지는 포지션(매수 사이클)당 딱 1장만 전송한다.
+                # 교차 매칭 결과는 데이터/개별 텍스트로 모두 유지하되, 종합 이미지는
+                # 해당 매수 포지션과 같은 등급의 매도방(SWING/LONG/LIFE)에만 보낸다.
+                allowed_exit_groups = {
+                    "SWING": {"SWING", "LONG"},
+                    "LONG": {"SWING", "LONG", "LIFE"},
+                    "LIFE": {"LONG", "LIFE"},
+                }.get(str(position.get("entry_group") or ""), set())
+                expected_cycle = {
+                    tf
+                    for group in allowed_exit_groups
+                    for tf in MARKET_GROUPS.get(market, {}).get(group, [])
+                }
+                cycle_results = [
+                    row for row in all_results
+                    if row.get("exit_group") in allowed_exit_groups
+                ]
+                completed_cycle = {row.get("exit_timeframe") for row in cycle_results}
+                trigger_cycle = max(
+                    (int(row.get("exit_signal_id") or 0) for row in cycle_results),
+                    default=0,
+                )
 
-                    if (
-                        not expected
-                        or not expected.issubset(completed)
-                        or trigger_id <= after_high_signal_id
-                    ):
-                        continue
-
-                    env_name, chat_id = _exit_destination(market, exit_group)
-                    if not env_name or not chat_id:
-                        continue
-
-                    summary_key = (
-                        f"exit-group-summary-v4:{position_key}:"
-                        f"{exit_group}:{trigger_id}"
-                    )
-                    if not _claim(
-                        summary_key, "EXIT_GROUP_SUMMARY",
-                        market, symbol, env_name
-                    ):
-                        continue
-
-                    try:
-                        summary_position = dict(position)
-                        summary_position["exit_results"] = group_results
-                        png = render_cycle_summary_image(
-                            market, symbol, summary_position
-                        )
-                        values = [
-                            float(row["return_pct"]) for row in group_results
-                        ]
-                        entry_tf = position.get("entry_timeframe", "-")
-                        entry_price = _price(position.get("entry_price"))
-                        entry_count = position.get("entry_count", 0)
-                        caption_lines = [
-                            f"✅ {symbol} · 매도 {GROUP_LABEL.get(exit_group, exit_group)} 종합",
-                            f"🟠 매수 {entry_tf}  |  평균 진입가 {entry_price}  |  {entry_count}회  |  {_format_kst(position.get('entry_first_time'))}",
-                        ]
-                        for row in sorted(group_results, key=lambda item: item.get("exit_timeframe_minutes", 0)):
-                            caption_lines.append(
-                                f"🟢 매도 {row.get('exit_timeframe','-')}  |  "
-                                f"매도가 {_price(row.get('exit_price'))}  |  "
-                                f"수익률 {float(row.get('return_pct') or 0):+.3f}%  |  "
-                                f"{_format_kst(row.get('exit_time'))}"
-                            )
-                        caption_lines.append(
-                            f"평균 {sum(values)/len(values):+.3f}% · "
-                            f"최고 {max(values):+.3f}% · 최저 {min(values):+.3f}%"
-                        )
-                        caption = "\n".join(caption_lines)
-                        _send_photo(chat_id, png, caption)
-                        _mark_sent(summary_key)
-                        completion_time = max(
-                            row["exit_time"] for row in group_results
-                        )
-                        archive_cycle_chart(
-                            summary_key, market, symbol,
-                            position["entry_first_time"],
-                            completion_time, png,
-                        )
-                        log.info(
-                            "sell group summary sent market=%s symbol=%s "
-                            "group=%s trigger_id=%s env=%s",
-                            market, symbol, exit_group, trigger_id, env_name,
-                        )
-                    except Exception:
-                        _release(summary_key)
-                        log.exception(
-                            "sell group summary failed key=%s", summary_key
-                        )
+                if (
+                    expected_cycle
+                    and expected_cycle.issubset(completed_cycle)
+                    and trigger_cycle > after_high_signal_id
+                ):
+                    representative_group = str(position.get("entry_group") or "")
+                    env_name, chat_id = _exit_destination(market, representative_group)
+                    if env_name and chat_id:
+                        summary_key = f"exit-cycle-summary-v111:{position_key}:{trigger_cycle}"
+                        if _claim(summary_key, "EXIT_CYCLE_SUMMARY", market, symbol, env_name):
+                            try:
+                                summary_position = dict(position)
+                                summary_position["exit_results"] = cycle_results
+                                png = render_cycle_summary_image(market, symbol, summary_position)
+                                values = [float(row.get("return_pct") or 0) for row in cycle_results]
+                                caption_lines = [
+                                    f"✅ {symbol} · {GROUP_LABEL.get(representative_group, representative_group)} 사이클 종합",
+                                    f"⭐ 대표 매칭: 매수 {GROUP_LABEL.get(representative_group, representative_group)} → 매도 {GROUP_LABEL.get(representative_group, representative_group)}",
+                                    f"매수 {position.get('entry_timeframe','-')} · 평균 진입가 {_price(position.get('entry_price'))} · {position.get('entry_count',0)}회",
+                                ]
+                                for row in sorted(cycle_results, key=lambda item: item.get("exit_timeframe_minutes", 0)):
+                                    star = "⭐ " if row.get("exit_group") == representative_group else ""
+                                    caption_lines.append(
+                                        f"{star}매도 {row.get('exit_timeframe','-')} · "
+                                        f"{GROUP_LABEL.get(str(row.get('exit_group') or ''), str(row.get('exit_group') or ''))} · "
+                                        f"{float(row.get('return_pct') or 0):+.3f}%"
+                                    )
+                                caption_lines.append(
+                                    f"전체 평균 {sum(values)/len(values):+.3f}% · 최고 {max(values):+.3f}% · 최저 {min(values):+.3f}%"
+                                )
+                                caption = "\n".join(caption_lines)
+                                _send_photo(chat_id, png, caption)
+                                _mark_sent(summary_key)
+                                completion_time = max(row["exit_time"] for row in cycle_results)
+                                archive_cycle_chart(summary_key, market, symbol, position["entry_first_time"], completion_time, png)
+                                log.info(
+                                    "sell cycle summary sent market=%s symbol=%s entry_group=%s trigger_id=%s env=%s",
+                                    market, symbol, representative_group, trigger_cycle, env_name,
+                                )
+                            except Exception:
+                                _release(summary_key)
+                                log.exception("sell cycle summary failed key=%s", summary_key)
 
                 # 모든 30m 이상 종료 그룹이 완료되면 원본 캔들을 정리한다.
                 expected_all = {
                     tf
-                    for group in ("SWING", "LONG", "LIFE")
+                    for group in allowed_exit_groups
                     for tf in MARKET_GROUPS.get(market, {}).get(group, [])
                 }
                 completed_all = {
