@@ -1197,6 +1197,50 @@ def latest_signals(limit: int = 20) -> list[dict[str, Any]]:
     ]
 
 
+def signals_for_symbol(symbol: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Return recent saved signals for one canonical symbol.
+
+    Mobile-app read API helper only. It does not alter signal storage, Telegram delivery,
+    cadence handling, or performance calculations.
+    """
+    safe_limit = max(1, min(int(limit), 50))
+    canonical = canonical_performance_symbol(symbol)
+    if not canonical or not PERFORMANCE_DATABASE_URL:
+        return []
+    ensure_schema()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, strategy, route, exchange, raw_exchange, symbol,
+                   side, signal_type, timeframe, timeframe_minutes,
+                   signal_price, received_at, raw_message
+            FROM performance_signals
+            WHERE symbol=%s
+            ORDER BY received_at DESC, id DESC
+            LIMIT %s
+            """,
+            (canonical, safe_limit),
+        ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "strategy": row[1],
+            "route": row[2],
+            "exchange": row[3],
+            "raw_exchange": row[4],
+            "symbol": canonical_performance_symbol(row[5]),
+            "side": row[6],
+            "signal_type": row[7],
+            "timeframe": row[8],
+            "timeframe_minutes": row[9],
+            "signal_price": float(row[10]) if row[10] is not None else None,
+            "received_at": row[11].isoformat() if row[11] else None,
+            "raw_message": row[12],
+        }
+        for row in rows
+    ]
+
+
 def _ms_to_datetime(value: Any) -> datetime:
     number = int(float(value))
     return datetime.fromtimestamp(number / 1000.0, tz=timezone.utc)

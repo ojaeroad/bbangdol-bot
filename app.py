@@ -1,3 +1,4 @@
+# V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
 # V112_APP_SYMBOL_API: 타점온 앱 종목 조회를 실제 서버 수신 종목과 연결
 # V109_VISIBLE_SELL_RESULT_FALLBACK: 실제 Telegram 매도 집중(stage0) 기준 결과카드 누락 보강 + V108 안정화 유지
 # V107_CADENCE_NAMEERROR_FIX: 알람 분석 _stats 복구 + episodes dict 처리 FIX + V106 결과알람 누락방지 유지
@@ -28,7 +29,7 @@ import requests
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
     queue_signal_save, queue_candle_save, queue_prediction_snapshot_save, queue_cadence_stage_event_save,
-    health_summary, latest_signals, known_symbols, prediction_research_summary,
+    health_summary, latest_signals, known_symbols, signals_for_symbol, prediction_research_summary,
     record_page_visit, page_visit_summary,
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
@@ -1846,6 +1847,61 @@ def app_symbol_resolve():
 
     item = exact_matches[0]
     return jsonify({"ok": True, **item}), 200
+
+
+@app.get("/app/symbol/detail")
+def app_symbol_detail():
+    raw_query = request.args.get("q", "").strip()
+    if not raw_query:
+        return jsonify({"ok": False, "error": "empty_query"}), 400
+
+    query_key = _app_symbol_query_key(raw_query)
+    catalog = _app_symbol_catalog()
+    matches = []
+    for item in catalog:
+        keys = {
+            _app_symbol_query_key(item.get("symbol", "")),
+            _app_symbol_query_key(item.get("name", "")),
+            _app_symbol_query_key(item.get("display", "")),
+        }
+        if query_key and query_key in keys:
+            matches.append(item)
+
+    if not matches:
+        return jsonify({
+            "ok": False,
+            "error": "symbol_not_found",
+            "query": raw_query,
+        }), 404
+
+    if len(matches) > 1:
+        unique = {(item["market"], item["symbol"]) for item in matches}
+        if len(unique) > 1:
+            return jsonify({
+                "ok": False,
+                "error": "ambiguous_symbol",
+                "query": raw_query,
+                "matches": matches[:10],
+            }), 409
+
+    item = matches[0]
+    try:
+        recent = signals_for_symbol(item["symbol"], 8)
+    except Exception:
+        log.exception("TajumOn symbol detail lookup failed symbol=%s", item["symbol"])
+        return jsonify({
+            "ok": False,
+            "error": "detail_lookup_failed",
+            "symbol": item["symbol"],
+        }), 500
+
+    return jsonify({
+        "ok": True,
+        **item,
+        "latest_signal": recent[0] if recent else None,
+        "recent_signals": recent,
+        "recent_count": len(recent),
+    }), 200
 
 
 # V99: SOL/SUI는 현물 심볼을 공식 표시/저장명으로 사용한다.
