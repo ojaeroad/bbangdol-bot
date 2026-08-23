@@ -121,7 +121,7 @@ def version():
         "telegram_cadence_enabled": TELEGRAM_CADENCE_ENABLED,
         "telegram_cadence_mode": TELEGRAM_CADENCE_MODE,
         "telegram_cadence_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
-        "telegram_focus_reset_minutes": _CADENCE_FOCUS_RESET_MIN,
+        "telegram_focus_reset_minutes": _CADENCE_POST_EPISODE_COOLDOWN_MIN,
     })
 
 @app.get("/whoami")
