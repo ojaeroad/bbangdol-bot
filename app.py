@@ -1,3 +1,4 @@
+# V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
 # V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
 # V112_APP_SYMBOL_API: 타점온 앱 종목 조회를 실제 서버 수신 종목과 연결
 # V109_VISIBLE_SELL_RESULT_FALLBACK: 실제 Telegram 매도 집중(stage0) 기준 결과카드 누락 보강 + V108 안정화 유지
@@ -29,7 +30,7 @@ import requests
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
     queue_signal_save, queue_candle_save, queue_prediction_snapshot_save, queue_cadence_stage_event_save,
-    health_summary, latest_signals, known_symbols, signals_for_symbol, prediction_research_summary,
+    health_summary, latest_signals, known_symbols, signals_for_symbol, recent_cadence_alerts, prediction_research_summary,
     record_page_visit, page_visit_summary,
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
@@ -1901,6 +1902,78 @@ def app_symbol_detail():
         "latest_signal": recent[0] if recent else None,
         "recent_signals": recent,
         "recent_count": len(recent),
+    }), 200
+
+
+@app.get("/app/alerts/recent")
+def app_recent_alerts():
+    """Tajum On alert history using the exact Telegram-visible cadence stages.
+
+    Only focus(stage 0) and valid 1~3 events that were marked telegram_visible are
+    exposed. Raw repeated LOW/HIGH signals and admin-only research stages 4~5 are
+    not returned, so the app history follows the member Telegram cadence.
+    """
+    raw_symbols = request.args.get("symbols", "").strip()
+    if not raw_symbols:
+        single = request.args.get("symbol", "").strip()
+        raw_symbols = single
+    symbols = [_clean_symbol_code(part) for part in raw_symbols.split(",") if part.strip()]
+    symbols = [symbol for symbol in symbols if symbol]
+    if not symbols:
+        return jsonify({"ok": False, "error": "empty_symbols"}), 400
+
+    try:
+        requested_limit = int(request.args.get("limit", "50") or 50)
+    except (TypeError, ValueError):
+        requested_limit = 50
+    safe_limit = max(1, min(requested_limit, 100))
+
+    try:
+        rows = recent_cadence_alerts(symbols, safe_limit)
+    except Exception:
+        log.exception("TajumOn recent cadence alert lookup failed symbols=%s", symbols)
+        return jsonify({"ok": False, "error": "alert_lookup_failed"}), 500
+
+    emoji_by_stage = {1: "❗", 2: "‼️", 3: "❗❗❗"}
+    alerts = []
+    for row in rows:
+        item = dict(row)
+        symbol = _clean_symbol_code(item.get("symbol", ""))
+        direction = str(item.get("direction", "")).upper()
+        stage = int(item.get("stage", 0) or 0)
+        market = _app_symbol_market(symbol)
+        name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else ""
+        display = f"{symbol} · {name}" if name else symbol
+        buy_side = direction == "LOW"
+        side_label = "매수" if buy_side else "매도"
+        if stage <= 0:
+            alert_label = f"✍🏻 {side_label} 집중"
+        else:
+            alert_label = f"{emoji_by_stage.get(stage, '❗')} {side_label} 유효 {stage}/3"
+
+        item.update({
+            "symbol": symbol,
+            "display": display,
+            "market": market,
+            "side": "LONG" if buy_side else "SHORT",
+            "signal_type": "LOW" if buy_side else "HIGH",
+            "alert_label": alert_label,
+            "received_at": item.get("occurred_at"),
+        })
+        alerts.append(item)
+
+    return jsonify({
+        "ok": True,
+        "cadence": {
+            "focus_counter_included": False,
+            "valid_stage_count": 3,
+            "valid_interval_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
+            "focus_reset_minutes": _CADENCE_POST_EPISODE_COOLDOWN_MIN,
+            "source": "telegram_visible_cadence",
+        },
+        "symbols": symbols,
+        "count": len(alerts),
+        "alerts": alerts,
     }), 200
 
 

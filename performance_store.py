@@ -1241,6 +1241,64 @@ def signals_for_symbol(symbol: str, limit: int = 10) -> list[dict[str, Any]]:
     ]
 
 
+
+def recent_cadence_alerts(symbols: list[str], limit: int = 50) -> list[dict[str, Any]]:
+    """Return Telegram-visible cadence stages for the requested symbols.
+
+    This is a read-only mobile-app helper. It exposes only the same stages that are
+    eligible for Telegram delivery: focus(stage 0) and valid stages 1~3. Hidden
+    research stages 4~5 and suppressed raw signals are intentionally excluded.
+    """
+    safe_limit = max(1, min(int(limit), 100))
+    canonical_symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols or []:
+        symbol = canonical_performance_symbol(raw)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            canonical_symbols.append(symbol)
+
+    if not canonical_symbols or not PERFORMANCE_DATABASE_URL:
+        return []
+
+    ensure_schema()
+    placeholders = ",".join(["%s"] * len(canonical_symbols))
+    params: list[Any] = [*canonical_symbols, safe_limit]
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, route_family, route, symbol, direction, timeframe,
+                   stage, stage_label, telegram_visible, signal_price,
+                   episode_started_at, occurred_at, raw_message
+            FROM performance_cadence_stage_events
+            WHERE telegram_visible=TRUE
+              AND stage BETWEEN 0 AND 3
+              AND symbol IN ({placeholders})
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT %s
+            """,
+            params,
+        ).fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "route_family": row[1],
+            "route": row[2],
+            "symbol": canonical_performance_symbol(row[3]),
+            "direction": row[4],
+            "timeframe": row[5],
+            "stage": int(row[6]),
+            "stage_label": row[7],
+            "telegram_visible": bool(row[8]),
+            "signal_price": float(row[9]) if row[9] is not None else None,
+            "episode_started_at": row[10].isoformat() if row[10] else None,
+            "occurred_at": row[11].isoformat() if row[11] else None,
+            "raw_message": row[12],
+        }
+        for row in rows
+    ]
+
 def _ms_to_datetime(value: Any) -> datetime:
     number = int(float(value))
     return datetime.fromtimestamp(number / 1000.0, tz=timezone.utc)
