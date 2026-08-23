@@ -1327,6 +1327,9 @@ def _send_period_report(chat_id: str, kind: str, report_market: str, now_local: 
     try:
         png, caption = render_period_report(kind, report_market, now_local)
         _send_photo(chat_id, png, caption)
+        # Telegram 전송 성공 후 SENT로 확정해야 동일 리포트가 10분 뒤 재선점되어
+        # 반복 발송되지 않는다. (v115)
+        _mark_sent(key)
         log.info("%s report sent market=%s key=%s", kind, report_market, key)
     except Exception:
         _release(key)
