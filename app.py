@@ -1,3 +1,4 @@
+# V112_APP_SYMBOL_API: 타점온 앱 종목 조회를 실제 서버 수신 종목과 연결
 # V109_VISIBLE_SELL_RESULT_FALLBACK: 실제 Telegram 매도 집중(stage0) 기준 결과카드 누락 보강 + V108 안정화 유지
 # V107_CADENCE_NAMEERROR_FIX: 알람 분석 _stats 복구 + episodes dict 처리 FIX + V106 결과알람 누락방지 유지
 # V106_PERFORMANCE_RESULT_RETRY: SWING/LONG/LIFE 결과 이미지 누락 방지용 delivery replay + 기존 UI 유지
@@ -27,7 +28,7 @@ import requests
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
     queue_signal_save, queue_candle_save, queue_prediction_snapshot_save, queue_cadence_stage_event_save,
-    health_summary, latest_signals, prediction_research_summary,
+    health_summary, latest_signals, known_symbols, prediction_research_summary,
     record_page_visit, page_visit_summary,
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
@@ -1725,6 +1726,126 @@ KRX_SYMBOL_NAMES = {
     "302440": "SK바이오사이언스",
     "128940": "한미약품",
 }
+
+
+# === 타점온 앱: 서버 기준 종목 조회 ===
+# 국장은 운영 중인 종목명 매핑을 기준으로 제공하고,
+# 미장/코인은 성과 DB가 실제로 한 번 이상 수신한 종목을 제공한다.
+# 향후 종목 마스터 동기화가 완성되면 이 내부 데이터 원본만 교체할 수 있게
+# Flutter 앱은 이 API만 바라보도록 한다.
+def _app_symbol_market(symbol: str, exchange: str = "", raw_exchange: str = "") -> str:
+    code = _clean_symbol_code(symbol)
+    exchange_text = f"{exchange} {raw_exchange}".upper()
+    if code.isdigit() and len(code) == 6:
+        return "KOREA"
+    if any(token in exchange_text for token in ("KRX", "KOSPI", "KOSDAQ", "KONEX", "KOREA")):
+        return "KOREA"
+    if any(token in exchange_text for token in (
+        "BINANCE", "BYBIT", "OKX", "BITGET", "UPBIT", "BITHUMB", "COINBASE", "KRAKEN"
+    )):
+        return "COIN"
+    upper = code.upper()
+    if upper.endswith(("USDT", "USDC", "BUSD", "FDUSD", "TUSD")) or upper.startswith("KRW-"):
+        return "COIN"
+    return "US"
+
+
+def _app_symbol_catalog() -> list[dict[str, Any]]:
+    catalog: dict[tuple[str, str], dict[str, Any]] = {}
+
+    # 국장: 현재 서버가 관리 중인 공식 코드/한글명 매핑 전체.
+    for code, name in KRX_SYMBOL_NAMES.items():
+        catalog[("KOREA", code)] = {
+            "symbol": code,
+            "name": name,
+            "market": "KOREA",
+            "display": f"{code} · {name}",
+            "source": "krx_map",
+        }
+
+    # 미장/코인: 서버가 실제로 수신한 신호 종목.
+    try:
+        rows = known_symbols(1500)
+    except Exception:
+        log.exception("TajumOn known symbol lookup failed")
+        rows = []
+
+    for row in rows:
+        symbol = _clean_symbol_code(row.get("symbol"))
+        if not symbol:
+            continue
+        market = _app_symbol_market(
+            symbol,
+            row.get("exchange", ""),
+            row.get("raw_exchange", ""),
+        )
+        name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else ""
+        display = f"{symbol} · {name}" if name else symbol
+        catalog[(market, symbol)] = {
+            "symbol": symbol,
+            "name": name,
+            "market": market,
+            "display": display,
+            "source": "received_signal",
+        }
+
+    market_order = {"KOREA": 0, "US": 1, "COIN": 2}
+    return sorted(
+        catalog.values(),
+        key=lambda item: (market_order.get(item["market"], 9), item["symbol"]),
+    )
+
+
+def _app_symbol_query_key(value: str) -> str:
+    text = str(value or "").strip().upper()
+    if ":" in text:
+        text = text.split(":")[-1]
+    if text.endswith(".P"):
+        text = text[:-2]
+    if text.endswith(".KS") or text.endswith(".KQ"):
+        text = text[:-3]
+    return re.sub(r"[\s·()_/]", "", text)
+
+
+@app.get("/app/symbol/resolve")
+def app_symbol_resolve():
+    raw_query = request.args.get("q", "").strip()
+    if not raw_query:
+        return jsonify({"ok": False, "error": "empty_query"}), 400
+
+    query_key = _app_symbol_query_key(raw_query)
+    catalog = _app_symbol_catalog()
+
+    exact_matches = []
+    for item in catalog:
+        keys = {
+            _app_symbol_query_key(item.get("symbol", "")),
+            _app_symbol_query_key(item.get("name", "")),
+            _app_symbol_query_key(item.get("display", "")),
+        }
+        if query_key and query_key in keys:
+            exact_matches.append(item)
+
+    if not exact_matches:
+        return jsonify({
+            "ok": False,
+            "error": "symbol_not_found",
+            "query": raw_query,
+        }), 404
+
+    # 같은 심볼이 여러 시장에 존재할 가능성에 대비해 서버가 임의 선택하지 않는다.
+    if len(exact_matches) > 1:
+        unique = {(item["market"], item["symbol"]) for item in exact_matches}
+        if len(unique) > 1:
+            return jsonify({
+                "ok": False,
+                "error": "ambiguous_symbol",
+                "query": raw_query,
+                "matches": exact_matches[:10],
+            }), 409
+
+    item = exact_matches[0]
+    return jsonify({"ok": True, **item}), 200
 
 
 # V99: SOL/SUI는 현물 심볼을 공식 표시/저장명으로 사용한다.

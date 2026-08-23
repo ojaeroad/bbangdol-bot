@@ -1309,6 +1309,51 @@ def load_candles(
     ]
 
 
+
+def known_symbols(limit: int = 1500) -> list[dict[str, Any]]:
+    """Return symbols that the server has actually received in performance signals.
+
+    This is intentionally a lightweight DISTINCT-style lookup for the mobile app.
+    It does not calculate performance statistics and does not affect Telegram delivery.
+    """
+    safe_limit = max(1, min(int(limit), 2000))
+    if not PERFORMANCE_DATABASE_URL:
+        return []
+    ensure_schema()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT symbol,
+                   MAX(NULLIF(exchange, '')) AS exchange,
+                   MAX(NULLIF(raw_exchange, '')) AS raw_exchange,
+                   MAX(received_at) AS latest_at
+            FROM performance_signals
+            WHERE COALESCE(symbol, '') <> ''
+            GROUP BY symbol
+            ORDER BY MAX(received_at) DESC, symbol ASC
+            LIMIT %s
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    output = []
+    seen = set()
+    for row in rows:
+        symbol = canonical_performance_symbol(row[0])
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        output.append(
+            {
+                "symbol": symbol,
+                "exchange": row[1] or "",
+                "raw_exchange": row[2] or "",
+                "latest_at": row[3].isoformat() if row[3] else None,
+            }
+        )
+    return output
+
+
 def candle_watch_status(symbol: str) -> dict[str, Any] | None:
     ensure_schema()
     with _connect() as conn:
