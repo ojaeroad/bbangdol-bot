@@ -1,4 +1,4 @@
-# V119_TAJUM_SYMBOL_SEARCH_EXCHANGE_LABELS: 자동완성 검색 + 홈 상세 안정화 + 거래소 표기 통일
+# V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
 # V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
 # V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
 # V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from time import time as now
 from typing import Dict, Any, Optional, Tuple
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort, Response
 import requests
@@ -1775,6 +1776,95 @@ def _upbit_tradingview_alias(pair: str) -> str:
     return f"{base}{quote}" if base and quote else code
 
 
+def _upbit_user_pair(pair: str) -> str:
+    """Upbit API KRW-BTC -> user familiar BTC/KRW."""
+    code = _clean_symbol_code(pair).upper()
+    if "-" not in code:
+        return code
+    quote, base = code.split("-", 1)
+    return f"{base}/{quote}" if base and quote else code
+
+
+_APP_COIN_KO_NAMES = {
+    "BTC": "비트코인", "ETH": "이더리움", "XRP": "엑스알피", "SOL": "솔라나",
+    "ADA": "에이다", "DOGE": "도지코인", "AVAX": "아발란체", "LINK": "체인링크",
+    "SUI": "수이", "AAVE": "에이브", "ALGO": "알고랜드", "TRX": "트론",
+    "DOT": "폴카닷", "LTC": "라이트코인", "BCH": "비트코인캐시", "ETC": "이더리움클래식",
+}
+
+
+def _coin_base_symbol(symbol: str, exchange: str = "") -> str:
+    code = _clean_symbol_code(symbol).upper()
+    if str(exchange or "").upper() == "UPBIT" and "-" in code:
+        return code.split("-", 1)[1]
+    for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "KRW", "BTC"):
+        if code.endswith(quote) and len(code) > len(quote):
+            return code[:-len(quote)]
+    return code
+
+
+def _app_display_label(symbol: str, name: str = "", market: str = "", exchange: str = "") -> str:
+    """One-line display used by Tajum On. Internal symbol remains unchanged."""
+    code = _clean_symbol_code(symbol).upper()
+    market_u = str(market or "").upper()
+    exchange_u = str(exchange or "").upper()
+    clean_name = str(name or "").strip()
+    if market_u == "COIN":
+        if not clean_name:
+            clean_name = _APP_COIN_KO_NAMES.get(_coin_base_symbol(code, exchange_u), "")
+        shown = _upbit_user_pair(code) if exchange_u == "UPBIT" else code
+        venue = "업비트" if exchange_u == "UPBIT" else ("바이낸스" if exchange_u == "BINANCE" else exchange_u)
+        return " ".join(part for part in (shown, clean_name, f"({venue})" if venue else "") if part)
+    if market_u == "KOREA":
+        clean_name = clean_name or KRX_SYMBOL_NAMES.get(code, "")
+        return " ".join(part for part in (code, clean_name, "(국장)") if part)
+    if market_u == "US":
+        return " ".join(part for part in (code, clean_name, "(미장)") if part)
+    return " ".join(part for part in (code, clean_name) if part)
+
+
+def _app_market_category(market: str, exchange: str = "", symbol: str = "") -> tuple[str, str]:
+    market_u = str(market or "").upper()
+    exchange_u = str(exchange or "").upper()
+    code = _clean_symbol_code(symbol).upper()
+    if market_u == "KOREA":
+        return "KOREA", "국장"
+    if market_u == "US":
+        return "US", "미장"
+    if market_u == "COIN":
+        if exchange_u == "UPBIT" or code.startswith(("KRW-", "BTC-", "USDT-")):
+            return "COIN_KR", "코인 국내"
+        return "COIN_GLOBAL", "코인 해외"
+    return "OTHER", "기타"
+
+
+def _app_timeframe_group(market: str, timeframe: str) -> tuple[str, str]:
+    market_type = "COIN" if str(market or "").upper() == "COIN" else "STOCK"
+    tf = _canonical_timeframe(str(timeframe or ""))
+    for group_key, timeframes in ENTRY_GROUP_TIMEFRAMES[market_type].items():
+        if tf in timeframes:
+            return group_key, ENTRY_GROUP_LABELS[group_key]
+    return "", ""
+
+
+def _app_timeframe_groups(market: str) -> list[dict[str, Any]]:
+    market_type = "COIN" if str(market or "").upper() == "COIN" else "STOCK"
+    order = {
+        "COIN": {
+            "SCALP": ["5m", "15m"], "SWING": ["30m", "1h"],
+            "LONG": ["4h", "6h"], "LIFE": ["12h", "1d", "1w"],
+        },
+        "STOCK": {
+            "SWING": ["30m", "1h"], "LONG": ["4h", "1d"],
+            "LIFE": ["3d", "1w", "1M"],
+        },
+    }[market_type]
+    return [
+        {"key": key, "label": ENTRY_GROUP_LABELS[key], "timeframes": values}
+        for key, values in order.items()
+    ]
+
+
 def _app_signal_exchange(symbol: str = "", msg: str = "", exchange: str = "", raw_exchange: str = "") -> str:
     raw_symbol = str(symbol or "").upper()
     text = f"{exchange} {raw_exchange} {msg}".upper()
@@ -1828,7 +1918,7 @@ def _load_upbit_market_catalog() -> list[dict[str, Any]]:
                     "english_name": english_name,
                     "market": "COIN",
                     "exchange": "UPBIT",
-                    "display": f"{pair} · {korean_name or english_name}" if (korean_name or english_name) else pair,
+                    "display": _app_display_label(pair, korean_name or english_name, "COIN", "UPBIT"),
                     "source": "upbit_public_api",
                 })
             if items:
@@ -1913,7 +2003,7 @@ def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
             "name": name,
             "market": "KOREA",
             "exchange": "KRX",
-            "display": f"{code} · {name}",
+            "display": _app_display_label(code, name, "KOREA", "KRX"),
             "source": "krx_map",
         }
 
@@ -1948,7 +2038,9 @@ def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
             row.get("raw_exchange", ""),
         )
         name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else (_upbit_name_for_pair(symbol) if exchange == "UPBIT" else "")
-        display = f"{symbol} · {name}" if name else symbol
+        if market == "COIN" and not name:
+            name = _APP_COIN_KO_NAMES.get(_coin_base_symbol(symbol, exchange), "")
+        display = _app_display_label(symbol, name, market, exchange)
         key = (market, symbol)
         if key in catalog and catalog[key].get("source") in {"krx_map", "upbit_public_api"}:
             continue
@@ -1960,6 +2052,17 @@ def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
             "display": display,
             "source": "received_signal",
         }
+
+    for item in catalog.values():
+        category_key, category_label = _app_market_category(
+            item.get("market", ""), item.get("exchange", ""), item.get("symbol", "")
+        )
+        item["category_key"] = category_key
+        item["category_label"] = category_label
+        item["timeframe_groups"] = _app_timeframe_groups(item.get("market", ""))
+        item["display"] = _app_display_label(
+            item.get("symbol", ""), item.get("name", ""), item.get("market", ""), item.get("exchange", "")
+        )
 
     market_order = {"KOREA": 0, "US": 1, "COIN": 2}
     return sorted(
@@ -2090,6 +2193,23 @@ def app_symbol_detail():
         if query_key and query_key in _app_symbol_match_keys(item):
             matches.append(item)
 
+    if not matches and not _app_query_needs_upbit_catalog(raw_query):
+        # 홈/푸시 상세는 catalog 최신성에 의존하지 않도록 안전한 직접 fallback을 둔다.
+        direct_symbol = _clean_symbol_code(raw_query)
+        if direct_symbol and re.fullmatch(r"[A-Z0-9._-]{2,24}", direct_symbol):
+            inferred_market = _app_symbol_market(direct_symbol)
+            inferred_exchange = "KRX" if inferred_market == "KOREA" else ("BINANCE" if inferred_market == "COIN" else "")
+            inferred_name = KRX_SYMBOL_NAMES.get(direct_symbol, "") if inferred_market == "KOREA" else _APP_COIN_KO_NAMES.get(_coin_base_symbol(direct_symbol, inferred_exchange), "")
+            category_key, category_label = _app_market_category(inferred_market, inferred_exchange, direct_symbol)
+            matches = [{
+                "symbol": direct_symbol, "name": inferred_name, "market": inferred_market,
+                "exchange": inferred_exchange,
+                "display": _app_display_label(direct_symbol, inferred_name, inferred_market, inferred_exchange),
+                "source": "direct_detail_fallback",
+                "category_key": category_key, "category_label": category_label,
+                "timeframe_groups": _app_timeframe_groups(inferred_market),
+            }]
+
     if not matches:
         return jsonify({
             "ok": False,
@@ -2127,11 +2247,17 @@ def app_symbol_detail():
         side_label = "매수" if direction == "LOW" else "매도"
         alert_label = f"✍🏻 {side_label} 집중" if stage <= 0 else f"{emoji_by_stage.get(stage, '❗')} {side_label} 유효 {stage}/3"
         enriched = dict(row)
+        market_value = item.get("market") or _app_symbol_market(item["symbol"])
+        group_key, group_label = _app_timeframe_group(market_value, row.get("timeframe", ""))
         enriched.update({
             "symbol": item["symbol"],
             "display": item.get("display") or item["symbol"],
-            "market": item.get("market") or _app_symbol_market(item["symbol"]),
+            "market": market_value,
             "exchange": item.get("exchange") or "",
+            "category_key": item.get("category_key") or _app_market_category(market_value, item.get("exchange", ""), item["symbol"])[0],
+            "category_label": item.get("category_label") or _app_market_category(market_value, item.get("exchange", ""), item["symbol"])[1],
+            "group_key": group_key,
+            "group_label": group_label,
             "side": "LONG" if direction == "LOW" else "SHORT",
             "signal_type": "LOW" if direction == "LOW" else "HIGH",
             "alert_label": alert_label,
@@ -2147,6 +2273,101 @@ def app_symbol_detail():
         "recent_signals": recent,
         "recent_count": len(recent),
     }), 200
+
+
+_APP_MARKET_STATUS_LOCK = threading.Lock()
+_APP_MARKET_STATUS_CACHE: dict[str, Any] = {"loaded_at": 0.0, "data": None}
+_APP_MARKET_STATUS_CACHE_SECONDS = 30
+
+
+def _market_status_yahoo(symbol: str) -> dict[str, Any]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    response = requests.get(
+        url, params={"interval": "1m", "range": "1d"},
+        headers={"User-Agent": "Mozilla/5.0 TajumOn/1.0"}, timeout=5,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = (((payload or {}).get("chart") or {}).get("result") or [None])[0] or {}
+    meta = result.get("meta") or {}
+    price = meta.get("regularMarketPrice")
+    previous = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if price is None:
+        closes = ((((result.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or [])
+        price = next((value for value in reversed(closes) if value is not None), None)
+    if price is None:
+        raise RuntimeError(f"market price missing: {symbol}")
+    change_pct = ((float(price) - float(previous)) / float(previous) * 100.0) if previous not in (None, 0, 0.0) else None
+    return {"price": float(price), "change_pct": change_pct, "source": "yahoo_chart"}
+
+
+def _market_status_upbit_btc() -> dict[str, Any]:
+    response = requests.get(
+        "https://api.upbit.com/v1/ticker", params={"markets": "KRW-BTC"},
+        headers={"Accept": "application/json", "User-Agent": "TajumOn/1.0"}, timeout=5,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    price = row.get("trade_price")
+    if price is None:
+        raise RuntimeError("Upbit BTC price missing")
+    rate = row.get("signed_change_rate")
+    return {
+        "price": float(price),
+        "change_pct": float(rate) * 100.0 if rate is not None else None,
+        "source": "upbit_ticker",
+    }
+
+
+def _load_app_market_status() -> dict[str, Any]:
+    now_ts = time.time()
+    cached = _APP_MARKET_STATUS_CACHE.get("data")
+    loaded_at = float(_APP_MARKET_STATUS_CACHE.get("loaded_at") or 0.0)
+    if cached and now_ts - loaded_at < _APP_MARKET_STATUS_CACHE_SECONDS:
+        return dict(cached)
+    with _APP_MARKET_STATUS_LOCK:
+        cached = _APP_MARKET_STATUS_CACHE.get("data")
+        loaded_at = float(_APP_MARKET_STATUS_CACHE.get("loaded_at") or 0.0)
+        if cached and now_ts - loaded_at < _APP_MARKET_STATUS_CACHE_SECONDS:
+            return dict(cached)
+
+        items = {}
+        errors = {}
+        sources = {
+            "KOSPI": lambda: _market_status_yahoo("%5EKS11"),
+            "NASDAQ": lambda: _market_status_yahoo("%5EIXIC"),
+            "BTC_KRW": _market_status_upbit_btc,
+        }
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_map = {executor.submit(loader): key for key, loader in sources.items()}
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    items[key] = future.result()
+                except Exception as exc:
+                    errors[key] = type(exc).__name__
+                    log.warning("TajumOn market status failed key=%s: %s", key, exc)
+                    if cached and key in (cached.get("items") or {}):
+                        stale = dict(cached["items"][key])
+                        stale["stale"] = True
+                        items[key] = stale
+
+        data = {
+            "items": items,
+            "errors": errors,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        }
+        if items:
+            _APP_MARKET_STATUS_CACHE["loaded_at"] = now_ts
+            _APP_MARKET_STATUS_CACHE["data"] = data
+        return data
+
+
+@app.get("/app/market/status")
+def app_market_status():
+    data = _load_app_market_status()
+    return jsonify({"ok": bool(data.get("items")), **data}), 200
 
 
 @app.post("/app/device/register")
@@ -6649,13 +6870,14 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         name = KRX_SYMBOL_NAMES.get(sym, "")
     elif exchange == "UPBIT":
         name = _upbit_name_for_pair(sym)
+    elif market == "COIN":
+        name = _APP_COIN_KO_NAMES.get(_coin_base_symbol(sym, exchange), "")
     else:
         name = ""
-    if exchange == "UPBIT":
-        display = f"{sym} · {name} (업비트)" if name else f"{sym} · 업비트"
-    else:
-        display = f"{sym} · {name}" if name else sym
-    body_parts = [timeframe]
+    display = _app_display_label(sym, name, market, exchange)
+    category_key, category_label = _app_market_category(market, exchange, sym)
+    group_key, group_label = _app_timeframe_group(market, timeframe)
+    body_parts = [part for part in (group_label, timeframe) if part]
     if price_text:
         body_parts.append(price_text)
 
@@ -6669,6 +6891,10 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "display": display,
         "market": market,
         "exchange": exchange,
+        "category_key": category_key,
+        "category_label": category_label,
+        "group_key": group_key,
+        "group_label": group_label,
         "direction": direction,
         "side": "LONG" if direction == "LOW" else "SHORT",
         "timeframe": timeframe,
@@ -6702,6 +6928,10 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
                 "display": payload["display"],
                 "market": payload["market"],
                 "exchange": payload["exchange"],
+                "category_key": payload.get("category_key", ""),
+                "category_label": payload.get("category_label", ""),
+                "group_key": payload.get("group_key", ""),
+                "group_label": payload.get("group_label", ""),
                 "direction": payload["direction"],
                 "side": payload["side"],
                 "timeframe": payload["timeframe"],
