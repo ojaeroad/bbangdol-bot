@@ -267,6 +267,8 @@ ALTER TABLE tajum_app_devices
     ADD COLUMN IF NOT EXISTS sound_profile VARCHAR(24) NOT NULL DEFAULT 'clear';
 ALTER TABLE tajum_app_devices
     ADD COLUMN IF NOT EXISTS vibration_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE tajum_app_devices
+    ADD COLUMN IF NOT EXISTS enabled_signal_groups JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tajum_app_devices_fcm_token
     ON tajum_app_devices(fcm_token);
@@ -1400,7 +1402,7 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
         if canonical:
             rows = conn.execute(
                 """
-                SELECT device_id, fcm_token, sound_profile, vibration_enabled
+                SELECT device_id, fcm_token, sound_profile, vibration_enabled, enabled_signal_groups
                 FROM tajum_app_devices
                 WHERE notifications_enabled=TRUE
                   AND %s = ANY(enabled_symbols)
@@ -1412,7 +1414,7 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
         else:
             rows = conn.execute(
                 """
-                SELECT device_id, fcm_token, sound_profile, vibration_enabled
+                SELECT device_id, fcm_token, sound_profile, vibration_enabled, enabled_signal_groups
                 FROM tajum_app_devices
                 WHERE notifications_enabled=TRUE
                   AND cardinality(enabled_symbols) > 0
@@ -1427,6 +1429,7 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
             "fcm_token": str(row[1] or "").strip(),
             "sound_profile": str(row[2] or "clear").strip().lower() or "clear",
             "vibration_enabled": bool(row[3]),
+            "enabled_signal_groups": row[4] if isinstance(row[4], dict) else {},
         }
         for row in rows
         if row and str(row[0] or "").strip() and str(row[1] or "").strip()
@@ -1571,6 +1574,7 @@ def upsert_app_device(
     user_uid: Optional[str] = None,
     sound_profile: str = "clear",
     vibration_enabled: bool = True,
+    enabled_signal_groups: Optional[dict[str, list[str]]] = None,
 ) -> dict[str, Any]:
     """Register or refresh one Tajum On installation for push delivery.
 
@@ -1609,10 +1613,33 @@ def upsert_app_device(
     ensure_schema()
     with _connect() as conn:
         previous_row = conn.execute(
-            "SELECT enabled_symbols FROM tajum_app_devices WHERE device_id=%s",
+            "SELECT enabled_symbols, enabled_signal_groups FROM tajum_app_devices WHERE device_id=%s",
             (clean_device_id,),
         ).fetchone()
         previous_symbols = set(previous_row[0] or []) if previous_row else set()
+        previous_group_prefs = (
+            dict(previous_row[1])
+            if previous_row and isinstance(previous_row[1], dict)
+            else {}
+        )
+
+        allowed_groups = {"SCALP", "SWING", "LONG", "LIFE"}
+        if enabled_signal_groups is None:
+            clean_signal_groups: dict[str, list[str]] = previous_group_prefs
+        else:
+            clean_signal_groups = {}
+            for raw_symbol, raw_groups in enabled_signal_groups.items():
+                symbol = canonical_performance_symbol(raw_symbol)
+                if symbol not in canonical_symbols:
+                    continue
+                if not isinstance(raw_groups, list):
+                    continue
+                groups: list[str] = []
+                for raw_group in raw_groups:
+                    group = str(raw_group or "").strip().upper()
+                    if group in allowed_groups and group not in groups:
+                        groups.append(group)
+                clean_signal_groups[symbol] = groups
 
         # FCM tokens can rotate/rebind. Keep one authoritative installation row per token.
         conn.execute(
@@ -1624,8 +1651,8 @@ def upsert_app_device(
             INSERT INTO tajum_app_devices(
                 device_id,user_uid,fcm_token,platform,enabled_symbols,
                 notifications_enabled,sound_profile,vibration_enabled,
-                created_at,updated_at,last_seen_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
+                enabled_signal_groups,created_at,updated_at,last_seen_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
             ON CONFLICT (device_id) DO UPDATE SET
                 user_uid=COALESCE(EXCLUDED.user_uid,tajum_app_devices.user_uid),
                 fcm_token=EXCLUDED.fcm_token,
@@ -1634,6 +1661,7 @@ def upsert_app_device(
                 notifications_enabled=EXCLUDED.notifications_enabled,
                 sound_profile=EXCLUDED.sound_profile,
                 vibration_enabled=EXCLUDED.vibration_enabled,
+                enabled_signal_groups=EXCLUDED.enabled_signal_groups,
                 updated_at=NOW(),
                 last_seen_at=NOW()
             """,
@@ -1646,6 +1674,7 @@ def upsert_app_device(
                 bool(notifications_enabled),
                 clean_sound_profile,
                 clean_vibration_enabled,
+                Jsonb(clean_signal_groups),
             ),
         )
 
@@ -1669,6 +1698,7 @@ def upsert_app_device(
         "notifications_enabled": bool(notifications_enabled),
         "sound_profile": clean_sound_profile,
         "vibration_enabled": clean_vibration_enabled,
+        "enabled_signal_groups": clean_signal_groups,
     }
 
 

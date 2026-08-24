@@ -2449,6 +2449,21 @@ def app_device_register():
         return jsonify({"ok": False, "error": "enabled_symbols_must_be_list"}), 400
     symbols = [_clean_symbol_code(value) for value in raw_symbols]
     symbols = [value for value in symbols if value]
+
+    raw_signal_groups = data.get("enabled_signal_groups")
+    signal_groups = None
+    if raw_signal_groups is not None:
+        if not isinstance(raw_signal_groups, dict):
+            return jsonify({"ok": False, "error": "enabled_signal_groups_must_be_object"}), 400
+        signal_groups = {}
+        for raw_symbol, raw_groups in raw_signal_groups.items():
+            if not isinstance(raw_groups, list):
+                continue
+            signal_groups[_clean_symbol_code(raw_symbol)] = [
+                str(group or "").strip().upper()
+                for group in raw_groups
+                if str(group or "").strip()
+            ]
     try:
         saved = upsert_app_device(
             device_id=device_id,
@@ -2458,6 +2473,7 @@ def app_device_register():
             platform=platform,
             sound_profile=sound_profile,
             vibration_enabled=vibration_enabled,
+            enabled_signal_groups=signal_groups,
         )
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -6970,9 +6986,41 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "route": route_key,
         "occurred_at": occurred_at.isoformat(),
         "delivery_key": delivery_key,
-        "title": f"{display} · {alert_label}",
-        "body": " · ".join(body_parts),
+        "title": " · ".join(
+            part for part in (
+                display,
+                " ".join(part for part in (group_label, timeframe) if part),
+            )
+            if part
+        ),
+        "body": " · ".join(
+            part for part in (alert_label, price_text)
+            if part
+        ),
     }
+
+
+def _device_allows_signal_group(device: dict[str, Any], payload: dict[str, Any]) -> bool:
+    # Honor per-symbol SCALP/SWING/LONG/LIFE switches from the Tajum On app.
+    group_key = str(payload.get("group_key", "") or "").strip().upper()
+    symbol = _clean_symbol_code(payload.get("symbol", ""))
+    if not group_key or not symbol:
+        return True
+    prefs = device.get("enabled_signal_groups")
+    if not isinstance(prefs, dict) or not prefs:
+        # Legacy installations without group preferences continue to receive all groups.
+        return True
+    raw_groups = prefs.get(symbol)
+    if raw_groups is None:
+        return True
+    if not isinstance(raw_groups, list):
+        return True
+    enabled = {
+        str(group or "").strip().upper()
+        for group in raw_groups
+        if str(group or "").strip()
+    }
+    return group_key in enabled
 
 
 def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_reason: str) -> None:
@@ -6981,8 +7029,15 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         if not payload:
             return
         devices = app_devices_for_symbol(payload["symbol"], 500)
+        devices = [
+            device for device in devices
+            if _device_allows_signal_group(device, payload)
+        ]
         if not devices:
-            log.info("FCM no recipients symbol=%s", payload["symbol"])
+            log.info(
+                "FCM no recipients symbol=%s group=%s",
+                payload["symbol"], payload.get("group_key", ""),
+            )
             return
 
         # Android notification channels lock sound/vibration behavior. Group devices
