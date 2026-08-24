@@ -249,6 +249,26 @@ CREATE TABLE IF NOT EXISTS performance_cycle_chart_archive (
     image_png BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- V116: Tajum On push device registration.
+-- user_uid is intentionally nullable until Firebase phone login is connected.
+CREATE TABLE IF NOT EXISTS tajum_app_devices (
+    device_id VARCHAR(128) PRIMARY KEY,
+    user_uid VARCHAR(128),
+    fcm_token TEXT NOT NULL,
+    platform VARCHAR(20) NOT NULL DEFAULT 'android',
+    enabled_symbols TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tajum_app_devices_fcm_token
+    ON tajum_app_devices(fcm_token);
+CREATE INDEX IF NOT EXISTS idx_tajum_app_devices_updated
+    ON tajum_app_devices(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tajum_app_devices_enabled_symbols
+    ON tajum_app_devices USING GIN(enabled_symbols);
 """
 
 
@@ -1298,6 +1318,149 @@ def recent_cadence_alerts(symbols: list[str], limit: int = 50) -> list[dict[str,
         }
         for row in rows
     ]
+
+
+def upsert_app_device(
+    device_id: str,
+    fcm_token: str,
+    enabled_symbols: list[str],
+    notifications_enabled: bool = True,
+    platform: str = "android",
+    user_uid: Optional[str] = None,
+) -> dict[str, Any]:
+    """Register or refresh one Tajum On installation for push delivery.
+
+    The device is anonymous for now. When Firebase phone authentication is added,
+    the same row can be bound to user_uid without changing the push routing model.
+    """
+    if not PERFORMANCE_DATABASE_URL:
+        raise RuntimeError("PERFORMANCE_DATABASE_URL is not configured")
+
+    clean_device_id = str(device_id or "").strip()[:128]
+    clean_token = str(fcm_token or "").strip()
+    clean_platform = str(platform or "android").strip().lower()[:20] or "android"
+    clean_uid = str(user_uid or "").strip()[:128] or None
+    if not clean_device_id:
+        raise ValueError("device_id is required")
+    if not clean_token or len(clean_token) < 20:
+        raise ValueError("valid fcm_token is required")
+    if len(clean_token) > 4096:
+        raise ValueError("fcm_token is too long")
+
+    canonical_symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in enabled_symbols or []:
+        symbol = canonical_performance_symbol(raw)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            canonical_symbols.append(symbol)
+        if len(canonical_symbols) >= 100:
+            break
+
+    ensure_schema()
+    with _connect() as conn:
+        # FCM tokens can rotate/rebind. Keep one authoritative installation row per token.
+        conn.execute(
+            "DELETE FROM tajum_app_devices WHERE fcm_token=%s AND device_id<>%s",
+            (clean_token, clean_device_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO tajum_app_devices(
+                device_id,user_uid,fcm_token,platform,enabled_symbols,
+                notifications_enabled,created_at,updated_at,last_seen_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
+            ON CONFLICT (device_id) DO UPDATE SET
+                user_uid=COALESCE(EXCLUDED.user_uid,tajum_app_devices.user_uid),
+                fcm_token=EXCLUDED.fcm_token,
+                platform=EXCLUDED.platform,
+                enabled_symbols=EXCLUDED.enabled_symbols,
+                notifications_enabled=EXCLUDED.notifications_enabled,
+                updated_at=NOW(),
+                last_seen_at=NOW()
+            """,
+            (
+                clean_device_id,
+                clean_uid,
+                clean_token,
+                clean_platform,
+                canonical_symbols,
+                bool(notifications_enabled),
+            ),
+        )
+    return {
+        "device_id": clean_device_id,
+        "platform": clean_platform,
+        "enabled_symbols": canonical_symbols,
+        "notifications_enabled": bool(notifications_enabled),
+    }
+
+
+def app_device_tokens_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> list[str]:
+    """Return currently enabled FCM registration tokens, optionally filtered by symbol."""
+    if not PERFORMANCE_DATABASE_URL:
+        return []
+    safe_limit = max(1, min(int(limit), 500))
+    canonical = canonical_performance_symbol(symbol) if symbol else ""
+    ensure_schema()
+    with _connect() as conn:
+        if canonical:
+            rows = conn.execute(
+                """
+                SELECT fcm_token
+                FROM tajum_app_devices
+                WHERE notifications_enabled=TRUE
+                  AND %s = ANY(enabled_symbols)
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (canonical, safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT fcm_token
+                FROM tajum_app_devices
+                WHERE notifications_enabled=TRUE
+                  AND cardinality(enabled_symbols) > 0
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            ).fetchall()
+    return [str(row[0]).strip() for row in rows if row and str(row[0] or "").strip()]
+
+
+def remove_app_device_token(fcm_token: str) -> int:
+    """Delete an invalid/expired FCM token after Firebase reports it unusable."""
+    token = str(fcm_token or "").strip()
+    if not token or not PERFORMANCE_DATABASE_URL:
+        return 0
+    ensure_schema()
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM tajum_app_devices WHERE fcm_token=%s", (token,))
+        return int(cur.rowcount or 0)
+
+
+def app_device_summary() -> dict[str, Any]:
+    if not PERFORMANCE_DATABASE_URL:
+        return {"database": "not_configured", "device_count": 0, "push_enabled_count": 0}
+    ensure_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   COUNT(*) FILTER (WHERE notifications_enabled=TRUE AND cardinality(enabled_symbols)>0),
+                   MAX(updated_at)
+            FROM tajum_app_devices
+            """
+        ).fetchone()
+    return {
+        "database": "connected",
+        "device_count": int(row[0] or 0),
+        "push_enabled_count": int(row[1] or 0),
+        "latest_device_update_at": row[2].isoformat() if row[2] else None,
+    }
 
 def _ms_to_datetime(value: Any) -> datetime:
     number = int(float(value))

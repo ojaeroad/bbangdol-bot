@@ -1,3 +1,4 @@
+# V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
 # V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
 # V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
 # V112_APP_SYMBOL_API: 타점온 앱 종목 조회를 실제 서버 수신 종목과 연결
@@ -27,11 +28,14 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort, Response
 import requests
 
+from firebase_push import push_health, send_push_to_tokens
+
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
     queue_signal_save, queue_candle_save, queue_prediction_snapshot_save, queue_cadence_stage_event_save,
     health_summary, latest_signals, known_symbols, signals_for_symbol, recent_cadence_alerts, prediction_research_summary,
     record_page_visit, page_visit_summary,
+    upsert_app_device, app_device_tokens_for_symbol, remove_app_device_token, app_device_summary,
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 from performance_group_analyzer import group_analysis_data, group_analysis_market_data, update_settings as update_group_settings
@@ -1903,6 +1907,74 @@ def app_symbol_detail():
         "recent_signals": recent,
         "recent_count": len(recent),
     }), 200
+
+
+@app.post("/app/device/register")
+def app_device_register():
+    """Register one Tajum On installation and its currently enabled watch symbols."""
+    data = request.get_json(silent=True, force=True) or {}
+    device_id = str(data.get("device_id", "") or "").strip()
+    fcm_token = str(data.get("fcm_token", "") or "").strip()
+    platform = str(data.get("platform", "android") or "android").strip()
+    notifications_enabled = bool(data.get("notifications_enabled", True))
+    raw_symbols = data.get("enabled_symbols", [])
+    if isinstance(raw_symbols, str):
+        raw_symbols = [part for part in raw_symbols.split(",") if part.strip()]
+    if not isinstance(raw_symbols, list):
+        return jsonify({"ok": False, "error": "enabled_symbols_must_be_list"}), 400
+    symbols = [_clean_symbol_code(value) for value in raw_symbols]
+    symbols = [value for value in symbols if value]
+    try:
+        saved = upsert_app_device(
+            device_id=device_id,
+            fcm_token=fcm_token,
+            enabled_symbols=symbols,
+            notifications_enabled=notifications_enabled,
+            platform=platform,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception:
+        log.exception("TajumOn device registration failed device_id=%s", device_id[:16])
+        return jsonify({"ok": False, "error": "device_registration_failed"}), 500
+    return jsonify({"ok": True, **saved}), 200
+
+
+@app.get("/app/push/health")
+def app_push_health():
+    try:
+        devices = app_device_summary()
+    except Exception:
+        log.exception("TajumOn push device summary failed")
+        devices = {"database": "error", "device_count": 0, "push_enabled_count": 0}
+    return jsonify({"ok": True, "firebase": push_health(), "devices": devices}), 200
+
+
+@app.post("/app/push/test")
+def app_push_test():
+    """Protected manual test endpoint. Disabled unless APP_PUSH_TEST_SECRET is configured."""
+    expected = os.getenv("APP_PUSH_TEST_SECRET", "").strip()
+    provided = request.headers.get("X-App-Push-Secret", "").strip()
+    if not expected or not hmac.compare_digest(provided, expected):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True, force=True) or {}
+    symbol = _clean_symbol_code(data.get("symbol", ""))
+    tokens = app_device_tokens_for_symbol(symbol or None, 500)
+    title = str(data.get("title", "타점온 서버 푸시 테스트") or "타점온 서버 푸시 테스트")
+    body = str(data.get("body", "Render → Firebase → 타점온 연결 테스트입니다.") or "")
+    try:
+        result = send_push_to_tokens(
+            tokens,
+            title,
+            body,
+            {"symbol": symbol, "source": "render_test", "route": "alerts"},
+        )
+        for failed in result.get("failed_tokens", []):
+            remove_app_device_token(failed)
+        return jsonify({"ok": True, "symbol": symbol or None, "result": result}), 200
+    except Exception as exc:
+        log.exception("TajumOn manual push test failed")
+        return jsonify({"ok": False, "error": type(exc).__name__}), 500
 
 
 @app.get("/app/alerts/recent")
@@ -6335,6 +6407,91 @@ def performance_cycles_json():
         log.exception("Performance cycles failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) -> Optional[dict[str, Any]]:
+    if not _route_uses_asset_hashtag(route):
+        return None
+    sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
+    if direction not in {"LOW", "HIGH"} or timeframe == "unknown" or not sym:
+        return None
+
+    reason = str(cadence_reason or "")
+    stage = 0
+    if "_valid_" in reason:
+        match = re.search(r"_valid_(\d+)_of_3", reason)
+        if not match:
+            return None
+        stage = max(1, min(int(match.group(1)), 3))
+    elif not reason.endswith("_focus"):
+        return None
+
+    side_label = "매수" if direction == "LOW" else "매도"
+    if stage == 0:
+        alert_label = f"✍🏻 {side_label} 집중"
+    else:
+        emoji = {1: "❗", 2: "‼️", 3: "❗❗❗"}[stage]
+        alert_label = f"{emoji} {side_label} 유효 {stage}/3"
+
+    price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
+    price_text = price_match.group(1) if price_match else ""
+    market = _app_symbol_market(sym)
+    name = KRX_SYMBOL_NAMES.get(sym, "") if market == "KOREA" else ""
+    display = f"{sym} · {name}" if name else sym
+    body_parts = [timeframe]
+    if price_text:
+        body_parts.append(price_text)
+
+    return {
+        "symbol": sym,
+        "display": display,
+        "direction": direction,
+        "side": "LONG" if direction == "LOW" else "SHORT",
+        "timeframe": timeframe,
+        "stage": stage,
+        "alert_label": alert_label,
+        "signal_price": price_text,
+        "route": route_key,
+        "title": f"{display} · {alert_label}",
+        "body": " · ".join(body_parts),
+    }
+
+
+def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_reason: str) -> None:
+    try:
+        payload = _cadence_push_parts(route, msg, symbol, cadence_reason)
+        if not payload:
+            return
+        tokens = app_device_tokens_for_symbol(payload["symbol"], 500)
+        if not tokens:
+            log.info("FCM no recipients symbol=%s", payload["symbol"])
+            return
+        result = send_push_to_tokens(
+            tokens,
+            payload["title"],
+            payload["body"],
+            {
+                "symbol": payload["symbol"],
+                "display": payload["display"],
+                "direction": payload["direction"],
+                "side": payload["side"],
+                "timeframe": payload["timeframe"],
+                "stage": payload["stage"],
+                "alert_label": payload["alert_label"],
+                "signal_price": payload["signal_price"],
+                "route": payload["route"],
+                "source": "telegram_cadence",
+            },
+        )
+        for failed in result.get("failed_tokens", []):
+            remove_app_device_token(failed)
+        log.info(
+            "FCM cadence push symbol=%s stage=%s success=%s failure=%s",
+            payload["symbol"], payload["stage"], result.get("success"), result.get("failure"),
+        )
+    except Exception:
+        # Push must never interrupt Telegram or webhook responses.
+        log.exception("FCM cadence push failed route=%s symbol=%s", route, symbol)
+
+
 # --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
@@ -6377,6 +6534,12 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
             log.exception(f"Telegram send exception route={route} symbol={symbol}")
 
     threading.Thread(target=_send_telegram_background, daemon=True).start()
+    threading.Thread(
+        target=_send_cadence_push_background,
+        args=(route, msg, symbol, cadence_reason),
+        daemon=True,
+        name="tajum-fcm-push",
+    ).start()
 
     return jsonify({"ok": True, "queued": True}), 200
 

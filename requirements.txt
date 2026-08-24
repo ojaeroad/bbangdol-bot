@@ -4,3 +4,4 @@ gunicorn==23.0.0
 python-telegram-bot==20.6
 psycopg[binary]==3.2.9
 Pillow>=11.0.0,<13
+firebase-admin==7.4.0
