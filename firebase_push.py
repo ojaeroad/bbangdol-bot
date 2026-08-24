@@ -22,6 +22,32 @@ _FIREBASE_LOCK = threading.Lock()
 _FIREBASE_APP = None
 
 
+_SOUND_RESOURCE_BY_PROFILE = {
+    "system": "default",
+    "clear": "tajum_clear",
+    "soft": "tajum_soft",
+    "bright": "tajum_bright",
+    "deep": "tajum_deep",
+    "pulse": "tajum_pulse",
+    "silent": None,
+}
+
+
+def notification_delivery_profile(sound_profile: str, vibration_enabled: bool) -> dict[str, Any]:
+    """Return Android channel/sound settings shared by app and server."""
+    profile = str(sound_profile or "clear").strip().lower()
+    if profile not in _SOUND_RESOURCE_BY_PROFILE:
+        profile = "clear"
+    vibration = bool(vibration_enabled)
+    vibration_key = "vib" if vibration else "novib"
+    return {
+        "sound_profile": profile,
+        "vibration_enabled": vibration,
+        "channel_id": f"tajum_{profile}_{vibration_key}_v1",
+        "sound": _SOUND_RESOURCE_BY_PROFILE[profile],
+    }
+
+
 def _service_account_info() -> dict[str, Any] | None:
     raw_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON_B64", "").strip()
     if raw_b64:
@@ -45,7 +71,6 @@ def _get_firebase_app():
             cred = credentials.Certificate(info)
             _FIREBASE_APP = firebase_admin.initialize_app(cred)
         else:
-            # Optional fallback for environments configured with GOOGLE_APPLICATION_CREDENTIALS.
             _FIREBASE_APP = firebase_admin.initialize_app()
         return _FIREBASE_APP
 
@@ -67,7 +92,16 @@ def push_health() -> dict[str, Any]:
         return {"configured": True, "ready": False, "error": type(exc).__name__}
 
 
-def send_push_to_tokens(tokens: list[str], title: str, body: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+def send_push_to_tokens(
+    tokens: list[str],
+    title: str,
+    body: str,
+    data: dict[str, Any] | None = None,
+    *,
+    channel_id: str | None = None,
+    sound: str | None = "default",
+    vibration_enabled: bool | None = None,
+) -> dict[str, Any]:
     clean_tokens: list[str] = []
     seen: set[str] = set()
     for token in tokens or []:
@@ -82,12 +116,23 @@ def send_push_to_tokens(tokens: list[str], title: str, body: str, data: dict[str
 
     app = _get_firebase_app()
     clean_data = {str(k): str(v) for k, v in (data or {}).items() if v is not None}
+
+    notification_kwargs: dict[str, Any] = {}
+    if channel_id:
+        notification_kwargs["channel_id"] = str(channel_id)
+    if sound == "default":
+        notification_kwargs["default_sound"] = True
+    elif sound:
+        notification_kwargs["sound"] = str(sound)
+    if vibration_enabled is True:
+        notification_kwargs["default_vibrate_timings"] = True
+
     message = messaging.MulticastMessage(
         notification=messaging.Notification(title=str(title), body=str(body)),
         data=clean_data,
         android=messaging.AndroidConfig(
             priority="high",
-            notification=messaging.AndroidNotification(sound="default"),
+            notification=messaging.AndroidNotification(**notification_kwargs),
         ),
         tokens=clean_tokens,
     )

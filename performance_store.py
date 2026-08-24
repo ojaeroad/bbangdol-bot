@@ -263,6 +263,11 @@ CREATE TABLE IF NOT EXISTS tajum_app_devices (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE tajum_app_devices
+    ADD COLUMN IF NOT EXISTS sound_profile VARCHAR(24) NOT NULL DEFAULT 'clear';
+ALTER TABLE tajum_app_devices
+    ADD COLUMN IF NOT EXISTS vibration_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tajum_app_devices_fcm_token
     ON tajum_app_devices(fcm_token);
 CREATE INDEX IF NOT EXISTS idx_tajum_app_devices_updated
@@ -1384,7 +1389,7 @@ def _prune_app_push_history(conn: psycopg.Connection, device_id: str) -> None:
     _prune_app_push_histories(conn, [device_id])
 
 
-def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> list[dict[str, str]]:
+def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> list[dict[str, Any]]:
     """Return enabled device ids with their FCM tokens for accurate delivery logging."""
     if not PERFORMANCE_DATABASE_URL:
         return []
@@ -1395,7 +1400,7 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
         if canonical:
             rows = conn.execute(
                 """
-                SELECT device_id, fcm_token
+                SELECT device_id, fcm_token, sound_profile, vibration_enabled
                 FROM tajum_app_devices
                 WHERE notifications_enabled=TRUE
                   AND %s = ANY(enabled_symbols)
@@ -1407,7 +1412,7 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
         else:
             rows = conn.execute(
                 """
-                SELECT device_id, fcm_token
+                SELECT device_id, fcm_token, sound_profile, vibration_enabled
                 FROM tajum_app_devices
                 WHERE notifications_enabled=TRUE
                   AND cardinality(enabled_symbols) > 0
@@ -1417,7 +1422,12 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
                 (safe_limit,),
             ).fetchall()
     return [
-        {"device_id": str(row[0] or "").strip(), "fcm_token": str(row[1] or "").strip()}
+        {
+            "device_id": str(row[0] or "").strip(),
+            "fcm_token": str(row[1] or "").strip(),
+            "sound_profile": str(row[2] or "clear").strip().lower() or "clear",
+            "vibration_enabled": bool(row[3]),
+        }
         for row in rows
         if row and str(row[0] or "").strip() and str(row[1] or "").strip()
     ]
@@ -1559,6 +1569,8 @@ def upsert_app_device(
     notifications_enabled: bool = True,
     platform: str = "android",
     user_uid: Optional[str] = None,
+    sound_profile: str = "clear",
+    vibration_enabled: bool = True,
 ) -> dict[str, Any]:
     """Register or refresh one Tajum On installation for push delivery.
 
@@ -1572,6 +1584,11 @@ def upsert_app_device(
     clean_token = str(fcm_token or "").strip()
     clean_platform = str(platform or "android").strip().lower()[:20] or "android"
     clean_uid = str(user_uid or "").strip()[:128] or None
+    allowed_sound_profiles = {"system", "clear", "soft", "bright", "deep", "pulse", "silent"}
+    clean_sound_profile = str(sound_profile or "clear").strip().lower()
+    if clean_sound_profile not in allowed_sound_profiles:
+        clean_sound_profile = "clear"
+    clean_vibration_enabled = bool(vibration_enabled)
     if not clean_device_id:
         raise ValueError("device_id is required")
     if not clean_token or len(clean_token) < 20:
@@ -1606,14 +1623,17 @@ def upsert_app_device(
             """
             INSERT INTO tajum_app_devices(
                 device_id,user_uid,fcm_token,platform,enabled_symbols,
-                notifications_enabled,created_at,updated_at,last_seen_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
+                notifications_enabled,sound_profile,vibration_enabled,
+                created_at,updated_at,last_seen_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
             ON CONFLICT (device_id) DO UPDATE SET
                 user_uid=COALESCE(EXCLUDED.user_uid,tajum_app_devices.user_uid),
                 fcm_token=EXCLUDED.fcm_token,
                 platform=EXCLUDED.platform,
                 enabled_symbols=EXCLUDED.enabled_symbols,
                 notifications_enabled=EXCLUDED.notifications_enabled,
+                sound_profile=EXCLUDED.sound_profile,
+                vibration_enabled=EXCLUDED.vibration_enabled,
                 updated_at=NOW(),
                 last_seen_at=NOW()
             """,
@@ -1624,6 +1644,8 @@ def upsert_app_device(
                 clean_platform,
                 canonical_symbols,
                 bool(notifications_enabled),
+                clean_sound_profile,
+                clean_vibration_enabled,
             ),
         )
 
@@ -1645,6 +1667,8 @@ def upsert_app_device(
         "platform": clean_platform,
         "enabled_symbols": canonical_symbols,
         "notifications_enabled": bool(notifications_enabled),
+        "sound_profile": clean_sound_profile,
+        "vibration_enabled": clean_vibration_enabled,
     }
 
 

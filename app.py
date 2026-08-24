@@ -30,7 +30,7 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, abort, Response
 import requests
 
-from firebase_push import push_health, send_push_to_tokens
+from firebase_push import push_health, send_push_to_tokens, notification_delivery_profile
 
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
@@ -2440,6 +2440,8 @@ def app_device_register():
     fcm_token = str(data.get("fcm_token", "") or "").strip()
     platform = str(data.get("platform", "android") or "android").strip()
     notifications_enabled = bool(data.get("notifications_enabled", True))
+    sound_profile = str(data.get("sound_profile", "clear") or "clear").strip().lower()
+    vibration_enabled = bool(data.get("vibration_enabled", True))
     raw_symbols = data.get("enabled_symbols", [])
     if isinstance(raw_symbols, str):
         raw_symbols = [part for part in raw_symbols.split(",") if part.strip()]
@@ -2454,6 +2456,8 @@ def app_device_register():
             enabled_symbols=symbols,
             notifications_enabled=notifications_enabled,
             platform=platform,
+            sound_profile=sound_profile,
+            vibration_enabled=vibration_enabled,
         )
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -6980,32 +6984,56 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         if not devices:
             log.info("FCM no recipients symbol=%s", payload["symbol"])
             return
-        tokens = [item["fcm_token"] for item in devices]
-        result = send_push_to_tokens(
-            tokens,
-            payload["title"],
-            payload["body"],
-            {
-                "symbol": payload["symbol"],
-                "display": payload["display"],
-                "market": payload["market"],
-                "exchange": payload["exchange"],
-                "category_key": payload.get("category_key", ""),
-                "category_label": payload.get("category_label", ""),
-                "group_key": payload.get("group_key", ""),
-                "group_label": payload.get("group_label", ""),
-                "direction": payload["direction"],
-                "side": payload["side"],
-                "timeframe": payload["timeframe"],
-                "stage": payload["stage"],
-                "alert_label": payload["alert_label"],
-                "signal_price": payload["signal_price"],
-                "route": payload["route"],
-                "source": "telegram_cadence",
-            },
-        )
-        failed_tokens = set(result.get("failed_tokens", []))
-        successful_tokens = set(result.get("successful_tokens", []))
+
+        # Android notification channels lock sound/vibration behavior. Group devices
+        # by their saved preference so each installation receives its own channel.
+        grouped_devices: dict[tuple[str, bool], list[dict]] = {}
+        for device in devices:
+            profile = str(device.get("sound_profile", "clear") or "clear").strip().lower()
+            vibration = bool(device.get("vibration_enabled", True))
+            grouped_devices.setdefault((profile, vibration), []).append(device)
+
+        successful_tokens: set[str] = set()
+        failed_tokens: set[str] = set()
+        total_success = 0
+        total_failure = 0
+
+        push_data = {
+            "symbol": payload["symbol"],
+            "display": payload["display"],
+            "market": payload["market"],
+            "exchange": payload["exchange"],
+            "category_key": payload.get("category_key", ""),
+            "category_label": payload.get("category_label", ""),
+            "group_key": payload.get("group_key", ""),
+            "group_label": payload.get("group_label", ""),
+            "direction": payload["direction"],
+            "side": payload["side"],
+            "timeframe": payload["timeframe"],
+            "stage": payload["stage"],
+            "alert_label": payload["alert_label"],
+            "signal_price": payload["signal_price"],
+            "route": payload["route"],
+            "source": "telegram_cadence",
+        }
+
+        for (profile, vibration), group in grouped_devices.items():
+            delivery_profile = notification_delivery_profile(profile, vibration)
+            tokens = [item["fcm_token"] for item in group]
+            result = send_push_to_tokens(
+                tokens,
+                payload["title"],
+                payload["body"],
+                push_data,
+                channel_id=delivery_profile["channel_id"],
+                sound=delivery_profile["sound"],
+                vibration_enabled=delivery_profile["vibration_enabled"],
+            )
+            total_success += int(result.get("success", 0) or 0)
+            total_failure += int(result.get("failure", 0) or 0)
+            successful_tokens.update(result.get("successful_tokens", []))
+            failed_tokens.update(result.get("failed_tokens", []))
+
         for failed in failed_tokens:
             remove_app_device_token(failed)
 
@@ -7032,16 +7060,14 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         if deliveries:
             save_app_push_history(deliveries)
         log.info(
-            "FCM cadence push symbol=%s stage=%s success=%s failure=%s history=%s",
-            payload["symbol"], payload["stage"], result.get("success"),
-            result.get("failure"), len(deliveries),
+            "FCM cadence push symbol=%s stage=%s success=%s failure=%s history=%s profiles=%s",
+            payload["symbol"], payload["stage"], total_success,
+            total_failure, len(deliveries), len(grouped_devices),
         )
     except Exception:
-        # Push must never interrupt Telegram or webhook responses.
         log.exception("FCM cadence push failed route=%s symbol=%s", route, symbol)
 
 
-# --- core handler (불꽃타점 등 /bot, /webhook에서 사용) ---
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
         return jsonify({"ok": False, "error": "missing route or msg"}), 400
