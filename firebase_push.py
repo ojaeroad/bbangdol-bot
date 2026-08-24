@@ -78,7 +78,7 @@ def send_push_to_tokens(tokens: list[str], title: str, body: str, data: dict[str
         if len(clean_tokens) >= 500:
             break
     if not clean_tokens:
-        return {"ok": True, "requested": 0, "success": 0, "failure": 0, "failed_tokens": []}
+        return {"ok": True, "requested": 0, "success": 0, "failure": 0, "failed_tokens": [], "successful_tokens": []}
 
     app = _get_firebase_app()
     clean_data = {str(k): str(v) for k, v in (data or {}).items() if v is not None}
@@ -93,8 +93,11 @@ def send_push_to_tokens(tokens: list[str], title: str, body: str, data: dict[str
     )
     response = messaging.send_each_for_multicast(message, app=app)
     failed_tokens: list[str] = []
+    successful_tokens: list[str] = []
     for idx, item in enumerate(response.responses):
-        if not item.success:
+        if item.success:
+            successful_tokens.append(clean_tokens[idx])
+        else:
             failed_tokens.append(clean_tokens[idx])
     return {
         "ok": response.failure_count == 0,
@@ -102,4 +105,5 @@ def send_push_to_tokens(tokens: list[str], title: str, body: str, data: dict[str
         "success": int(response.success_count),
         "failure": int(response.failure_count),
         "failed_tokens": failed_tokens,
+        "successful_tokens": successful_tokens,
     }

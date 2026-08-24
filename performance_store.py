@@ -269,6 +269,32 @@ CREATE INDEX IF NOT EXISTS idx_tajum_app_devices_updated
     ON tajum_app_devices(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tajum_app_devices_enabled_symbols
     ON tajum_app_devices USING GIN(enabled_symbols);
+
+-- V118: per-device Tajum On push inbox.
+-- Only successfully delivered FCM cadence notifications are stored here.
+CREATE TABLE IF NOT EXISTS tajum_app_push_history (
+    id BIGSERIAL PRIMARY KEY,
+    device_id VARCHAR(128) NOT NULL,
+    delivery_key VARCHAR(64) NOT NULL,
+    symbol VARCHAR(100) NOT NULL,
+    display VARCHAR(220),
+    market VARCHAR(20),
+    exchange VARCHAR(30),
+    direction VARCHAR(10),
+    side VARCHAR(10),
+    timeframe VARCHAR(10),
+    stage SMALLINT NOT NULL DEFAULT 0,
+    alert_label VARCHAR(120),
+    signal_price NUMERIC(30, 10),
+    route VARCHAR(50),
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_tajum_push_delivery UNIQUE(device_id, delivery_key)
+);
+CREATE INDEX IF NOT EXISTS idx_tajum_push_history_device_time
+    ON tajum_app_push_history(device_id, occurred_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tajum_push_history_device_symbol
+    ON tajum_app_push_history(device_id, symbol, occurred_at DESC);
 """
 
 
@@ -1320,6 +1346,212 @@ def recent_cadence_alerts(symbols: list[str], limit: int = 50) -> list[dict[str,
     ]
 
 
+def _prune_app_push_histories(conn: psycopg.Connection, device_ids: list[str]) -> None:
+    """Batch retention cleanup: max 300 rows and max 30 days per device."""
+    clean_ids = list({str(value or "").strip()[:128] for value in device_ids if str(value or "").strip()})
+    if not clean_ids:
+        return
+    conn.execute(
+        """
+        DELETE FROM tajum_app_push_history
+        WHERE device_id = ANY(%s)
+          AND occurred_at < NOW() - INTERVAL '30 days'
+        """,
+        (clean_ids,),
+    )
+    conn.execute(
+        """
+        DELETE FROM tajum_app_push_history
+        WHERE id IN (
+            SELECT id
+            FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY device_id
+                           ORDER BY occurred_at DESC, id DESC
+                       ) AS rn
+                FROM tajum_app_push_history
+                WHERE device_id = ANY(%s)
+            ) ranked
+            WHERE rn > 300
+        )
+        """,
+        (clean_ids,),
+    )
+
+
+def _prune_app_push_history(conn: psycopg.Connection, device_id: str) -> None:
+    _prune_app_push_histories(conn, [device_id])
+
+
+def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> list[dict[str, str]]:
+    """Return enabled device ids with their FCM tokens for accurate delivery logging."""
+    if not PERFORMANCE_DATABASE_URL:
+        return []
+    safe_limit = max(1, min(int(limit), 500))
+    canonical = canonical_performance_symbol(symbol) if symbol else ""
+    ensure_schema()
+    with _connect() as conn:
+        if canonical:
+            rows = conn.execute(
+                """
+                SELECT device_id, fcm_token
+                FROM tajum_app_devices
+                WHERE notifications_enabled=TRUE
+                  AND %s = ANY(enabled_symbols)
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (canonical, safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT device_id, fcm_token
+                FROM tajum_app_devices
+                WHERE notifications_enabled=TRUE
+                  AND cardinality(enabled_symbols) > 0
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            ).fetchall()
+    return [
+        {"device_id": str(row[0] or "").strip(), "fcm_token": str(row[1] or "").strip()}
+        for row in rows
+        if row and str(row[0] or "").strip() and str(row[1] or "").strip()
+    ]
+
+
+def save_app_push_history(deliveries: list[dict[str, Any]]) -> int:
+    """Persist only FCM deliveries that Firebase reported as successful."""
+    if not PERFORMANCE_DATABASE_URL or not deliveries:
+        return 0
+    ensure_schema()
+    saved = 0
+    touched_devices: set[str] = set()
+    with _connect() as conn:
+        for raw in deliveries:
+            item = dict(raw or {})
+            device_id = str(item.get("device_id", "") or "").strip()[:128]
+            delivery_key = str(item.get("delivery_key", "") or "").strip()[:64]
+            symbol = canonical_performance_symbol(item.get("symbol", ""))[:100]
+            if not device_id or not delivery_key or not symbol:
+                continue
+            try:
+                stage = max(0, min(int(item.get("stage", 0) or 0), 3))
+            except (TypeError, ValueError):
+                stage = 0
+            price = item.get("signal_price")
+            try:
+                if isinstance(price, str):
+                    price = price.replace(",", "").strip() or None
+                price = Decimal(str(price)) if price is not None else None
+            except (InvalidOperation, ValueError, TypeError):
+                price = None
+            occurred_at = item.get("occurred_at")
+            if isinstance(occurred_at, str):
+                try:
+                    occurred_at = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+                except ValueError:
+                    occurred_at = None
+            if not isinstance(occurred_at, datetime):
+                occurred_at = datetime.now(timezone.utc)
+            cur = conn.execute(
+                """
+                INSERT INTO tajum_app_push_history(
+                    device_id, delivery_key, symbol, display, market, exchange,
+                    direction, side, timeframe, stage, alert_label, signal_price,
+                    route, occurred_at, created_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT (device_id, delivery_key) DO NOTHING
+                """,
+                (
+                    device_id, delivery_key, symbol,
+                    str(item.get("display", "") or "")[:220] or symbol,
+                    str(item.get("market", "") or "")[:20] or None,
+                    str(item.get("exchange", "") or "")[:30] or None,
+                    str(item.get("direction", "") or "")[:10] or None,
+                    str(item.get("side", "") or "")[:10] or None,
+                    str(item.get("timeframe", "") or "")[:10] or None,
+                    stage,
+                    str(item.get("alert_label", "") or "")[:120] or None,
+                    price,
+                    str(item.get("route", "") or "")[:50] or None,
+                    occurred_at,
+                ),
+            )
+            saved += int(cur.rowcount or 0)
+            touched_devices.add(device_id)
+        _prune_app_push_histories(conn, list(touched_devices))
+    return saved
+
+
+def recent_app_push_history(
+    device_id: str,
+    symbols: Optional[list[str]] = None,
+    limit: int = 300,
+    max_days: int = 30,
+) -> list[dict[str, Any]]:
+    """Return this device's real delivered push inbox (max 300 / 30 days)."""
+    clean_device_id = str(device_id or "").strip()[:128]
+    if not clean_device_id or not PERFORMANCE_DATABASE_URL:
+        return []
+    safe_limit = max(1, min(int(limit), 300))
+    safe_days = max(1, min(int(max_days), 30))
+    canonical_symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols or []:
+        symbol = canonical_performance_symbol(raw)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            canonical_symbols.append(symbol)
+
+    ensure_schema()
+    with _connect() as conn:
+        _prune_app_push_history(conn, clean_device_id)
+        if canonical_symbols:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, display, market, exchange, direction, side,
+                       timeframe, stage, alert_label, signal_price, route, occurred_at
+                FROM tajum_app_push_history
+                WHERE device_id=%s
+                  AND symbol = ANY(%s)
+                  AND occurred_at >= NOW() - (%s * INTERVAL '1 day')
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT %s
+                """,
+                (clean_device_id, canonical_symbols, safe_days, safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, symbol, display, market, exchange, direction, side,
+                       timeframe, stage, alert_label, signal_price, route, occurred_at
+                FROM tajum_app_push_history
+                WHERE device_id=%s
+                  AND occurred_at >= NOW() - (%s * INTERVAL '1 day')
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT %s
+                """,
+                (clean_device_id, safe_days, safe_limit),
+            ).fetchall()
+    return [
+        {
+            "id": row[0], "symbol": canonical_performance_symbol(row[1]),
+            "display": row[2], "market": row[3], "exchange": row[4],
+            "direction": row[5], "side": row[6], "timeframe": row[7],
+            "stage": int(row[8] or 0), "alert_label": row[9],
+            "signal_price": float(row[10]) if row[10] is not None else None,
+            "route": row[11],
+            "occurred_at": row[12].isoformat() if row[12] else None,
+            "received_at": row[12].isoformat() if row[12] else None,
+        }
+        for row in rows
+    ]
+
+
 def upsert_app_device(
     device_id: str,
     fcm_token: str,
@@ -1359,6 +1591,12 @@ def upsert_app_device(
 
     ensure_schema()
     with _connect() as conn:
+        previous_row = conn.execute(
+            "SELECT enabled_symbols FROM tajum_app_devices WHERE device_id=%s",
+            (clean_device_id,),
+        ).fetchone()
+        previous_symbols = set(previous_row[0] or []) if previous_row else set()
+
         # FCM tokens can rotate/rebind. Keep one authoritative installation row per token.
         conn.execute(
             "DELETE FROM tajum_app_devices WHERE fcm_token=%s AND device_id<>%s",
@@ -1388,6 +1626,20 @@ def upsert_app_device(
                 bool(notifications_enabled),
             ),
         )
+
+        # Disabled/removed symbols must disappear from this device inbox permanently.
+        removed_symbols = previous_symbols.difference(canonical_symbols)
+        if removed_symbols:
+            conn.execute(
+                "DELETE FROM tajum_app_push_history WHERE device_id=%s AND symbol = ANY(%s)",
+                (clean_device_id, list(removed_symbols)),
+            )
+        if not canonical_symbols:
+            conn.execute(
+                "DELETE FROM tajum_app_push_history WHERE device_id=%s",
+                (clean_device_id,),
+            )
+        _prune_app_push_history(conn, clean_device_id)
     return {
         "device_id": clean_device_id,
         "platform": clean_platform,

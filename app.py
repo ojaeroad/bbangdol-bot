@@ -1,3 +1,4 @@
+# V118_TAJUM_PUSH_INBOX_UPBIT: 실제 기기별 푸시 이력(300건/30일) + 상세 cadence 통일 + 업비트 종목 마스터
 # V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
 # V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
 # V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
@@ -35,7 +36,8 @@ from performance_store import (
     queue_signal_save, queue_candle_save, queue_prediction_snapshot_save, queue_cadence_stage_event_save,
     health_summary, latest_signals, known_symbols, signals_for_symbol, recent_cadence_alerts, prediction_research_summary,
     record_page_visit, page_visit_summary,
-    upsert_app_device, app_device_tokens_for_symbol, remove_app_device_token, app_device_summary,
+    upsert_app_device, app_device_tokens_for_symbol, app_devices_for_symbol,
+    save_app_push_history, recent_app_push_history, remove_app_device_token, app_device_summary,
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
 from performance_group_analyzer import group_analysis_data, group_analysis_market_data, update_settings as update_group_settings
@@ -442,11 +444,15 @@ def _telegram_hashtag_token(symbol: str, msg: str = "") -> str:
         ))
         label = upper
         if is_coin:
-            # XRPUSDT / XRPUSDT.P -> XRP. 긴 suffix부터 제거한다.
-            for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "KRW", "USD"):
-                if label.endswith(quote) and len(label) > len(quote):
-                    label = label[:-len(quote)]
-                    break
+            # Upbit API/app code KRW-BTC -> BTC. TradingView BTCKRW -> BTC.
+            if label.startswith(("KRW-", "BTC-", "USDT-")) and "-" in label:
+                label = label.split("-", 1)[1]
+            else:
+                # XRPUSDT / XRPUSDT.P -> XRP. 긴 suffix부터 제거한다.
+                for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "KRW", "USD"):
+                    if label.endswith(quote) and len(label) > len(quote):
+                        label = label[:-len(quote)]
+                        break
 
     # Telegram hashtag에서 보기 좋고 검색 가능한 문자만 남긴다.
     label = re.sub(r"[^0-9A-Za-z_가-힣]", "", str(label))
@@ -520,6 +526,9 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
         return True, msg, "non_trade_route"
 
     sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
+    # Upbit TradingView tickers are commonly BTCKRW while the app uses KRW-BTC.
+    # Normalize only when the incoming signal itself identifies Upbit.
+    sym = _canonical_app_signal_symbol(sym, msg)
     if direction == "UNKNOWN" or timeframe == "unknown":
         return True, msg, "unsupported"
 
@@ -1739,6 +1748,144 @@ KRX_SYMBOL_NAMES = {
 # 미장/코인은 성과 DB가 실제로 한 번 이상 수신한 종목을 제공한다.
 # 향후 종목 마스터 동기화가 완성되면 이 내부 데이터 원본만 교체할 수 있게
 # Flutter 앱은 이 API만 바라보도록 한다.
+_UPBIT_MARKET_CACHE_LOCK = threading.Lock()
+_UPBIT_MARKET_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
+_UPBIT_MARKET_CACHE_SECONDS = 6 * 60 * 60
+_UPBIT_MARKET_URL = "https://api.upbit.com/v1/market/all"
+
+
+def _upbit_pair_from_tradingview(symbol: str) -> str:
+    """Convert Upbit TradingView ticker BTCKRW to Upbit API pair KRW-BTC."""
+    code = _clean_symbol_code(symbol).upper()
+    if code.startswith(("KRW-", "BTC-", "USDT-")):
+        return code
+    for quote in ("USDT", "KRW", "BTC"):
+        if code.endswith(quote) and len(code) > len(quote):
+            base = code[:-len(quote)]
+            if base:
+                return f"{quote}-{base}"
+    return code
+
+
+def _upbit_tradingview_alias(pair: str) -> str:
+    code = _clean_symbol_code(pair).upper()
+    if "-" not in code:
+        return code
+    quote, base = code.split("-", 1)
+    return f"{base}{quote}" if base and quote else code
+
+
+def _app_signal_exchange(symbol: str = "", msg: str = "", exchange: str = "", raw_exchange: str = "") -> str:
+    raw_symbol = str(symbol or "").upper()
+    text = f"{exchange} {raw_exchange} {msg}".upper()
+    if "UPBIT:" in raw_symbol or "[UPBIT]" in text or re.search(r"\bUPBIT\b", text):
+        return "UPBIT"
+    for name in ("BINANCE", "BYBIT", "OKX", "BITGET", "BITHUMB", "COINBASE", "KRAKEN"):
+        if f"{name}:" in raw_symbol or f"[{name}]" in text or re.search(rf"\b{name}\b", text):
+            return name
+    return str(exchange or raw_exchange or "").strip().upper()
+
+
+def _canonical_app_signal_symbol(symbol: str, msg: str = "", exchange: str = "", raw_exchange: str = "") -> str:
+    code = _clean_symbol_code(symbol)
+    venue = _app_signal_exchange(symbol, msg, exchange, raw_exchange)
+    if venue == "UPBIT":
+        return _upbit_pair_from_tradingview(code)
+    return code
+
+
+def _load_upbit_market_catalog() -> list[dict[str, Any]]:
+    """Public Upbit pair master, cached for 6h. No API key is required."""
+    now_ts = time.time()
+    cached = _UPBIT_MARKET_CACHE.get("items") or []
+    loaded_at = float(_UPBIT_MARKET_CACHE.get("loaded_at") or 0.0)
+    if cached and now_ts - loaded_at < _UPBIT_MARKET_CACHE_SECONDS:
+        return list(cached)
+    with _UPBIT_MARKET_CACHE_LOCK:
+        cached = _UPBIT_MARKET_CACHE.get("items") or []
+        loaded_at = float(_UPBIT_MARKET_CACHE.get("loaded_at") or 0.0)
+        if cached and now_ts - loaded_at < _UPBIT_MARKET_CACHE_SECONDS:
+            return list(cached)
+        try:
+            response = requests.get(
+                _UPBIT_MARKET_URL,
+                headers={"Accept": "application/json", "User-Agent": "TajumOn/1.0"},
+                timeout=5,
+            )
+            response.raise_for_status()
+            raw_items = response.json()
+            items: list[dict[str, Any]] = []
+            for raw in raw_items if isinstance(raw_items, list) else []:
+                pair = _clean_symbol_code((raw or {}).get("market", ""))
+                if not pair or "-" not in pair:
+                    continue
+                korean_name = str((raw or {}).get("korean_name", "") or "").strip()
+                english_name = str((raw or {}).get("english_name", "") or "").strip()
+                items.append({
+                    "symbol": pair,
+                    "name": korean_name or english_name,
+                    "korean_name": korean_name,
+                    "english_name": english_name,
+                    "market": "COIN",
+                    "exchange": "UPBIT",
+                    "display": f"{pair} · {korean_name or english_name} (업비트)" if (korean_name or english_name) else f"{pair} · 업비트",
+                    "source": "upbit_public_api",
+                })
+            if items:
+                _UPBIT_MARKET_CACHE["loaded_at"] = now_ts
+                _UPBIT_MARKET_CACHE["items"] = items
+                return list(items)
+        except Exception:
+            log.warning("TajumOn Upbit market catalog refresh failed", exc_info=True)
+        return list(cached)
+
+
+def _upbit_name_for_pair(pair: str) -> str:
+    target = _clean_symbol_code(pair)
+    for item in _load_upbit_market_catalog():
+        if item.get("symbol") == target:
+            return str(item.get("name") or "")
+    return ""
+
+
+def _app_symbol_match_keys(item: dict[str, Any]) -> set[str]:
+    keys = {
+        _app_symbol_query_key(item.get("symbol", "")),
+        _app_symbol_query_key(item.get("name", "")),
+        _app_symbol_query_key(item.get("display", "")),
+    }
+    if str(item.get("exchange", "")).upper() == "UPBIT":
+        pair = str(item.get("symbol", "") or "").upper()
+        alias = _upbit_tradingview_alias(pair)
+        base = pair.split("-", 1)[1] if "-" in pair else pair
+        keys.update({
+            _app_symbol_query_key(alias),
+            _app_symbol_query_key(base),
+            _app_symbol_query_key(f"UPBIT:{alias}"),
+            _app_symbol_query_key(f"업비트{base}"),
+        })
+    return {key for key in keys if key}
+
+
+def _choose_app_symbol_match(matches: list[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], bool]:
+    if not matches:
+        return None, False
+    unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in matches:
+        key = (str(item.get("market", "")), str(item.get("exchange", "")), str(item.get("symbol", "")))
+        unique[key] = item
+    values = list(unique.values())
+    if len(values) == 1:
+        return values[0], False
+    # For a plain Upbit asset/name, prefer the KRW pair when the same asset has multiple quote markets.
+    upbit_values = [item for item in values if str(item.get("exchange", "")).upper() == "UPBIT"]
+    if len(upbit_values) == len(values):
+        krw_values = [item for item in upbit_values if str(item.get("symbol", "")).upper().startswith("KRW-")]
+        if len(krw_values) == 1:
+            return krw_values[0], False
+    return None, True
+
+
 def _app_symbol_market(symbol: str, exchange: str = "", raw_exchange: str = "") -> str:
     code = _clean_symbol_code(symbol)
     exchange_text = f"{exchange} {raw_exchange}".upper()
@@ -1769,6 +1916,13 @@ def _app_symbol_catalog() -> list[dict[str, Any]]:
             "source": "krx_map",
         }
 
+    # 업비트: 공개 마켓 API에서 현재 거래 가능한 페어를 동적으로 제공한다.
+    # 앱에는 KRW-BTC 형식으로 저장해 Binance BTCUSDT와 명확히 구분한다.
+    for item in _load_upbit_market_catalog():
+        symbol = _clean_symbol_code(item.get("symbol", ""))
+        if symbol:
+            catalog[("COIN", symbol)] = dict(item)
+
     # 미장/코인: 서버가 실제로 수신한 신호 종목.
     try:
         rows = known_symbols(1500)
@@ -1777,20 +1931,33 @@ def _app_symbol_catalog() -> list[dict[str, Any]]:
         rows = []
 
     for row in rows:
-        symbol = _clean_symbol_code(row.get("symbol"))
-        if not symbol:
+        raw_symbol = _clean_symbol_code(row.get("symbol"))
+        if not raw_symbol:
             continue
+        exchange = _app_signal_exchange(
+            raw_symbol, "", row.get("exchange", ""), row.get("raw_exchange", "")
+        )
+        symbol = _canonical_app_signal_symbol(
+            raw_symbol, "", row.get("exchange", ""), row.get("raw_exchange", "")
+        )
         market = _app_symbol_market(
             symbol,
-            row.get("exchange", ""),
+            exchange or row.get("exchange", ""),
             row.get("raw_exchange", ""),
         )
-        name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else ""
-        display = f"{symbol} · {name}" if name else symbol
-        catalog[(market, symbol)] = {
+        name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else (_upbit_name_for_pair(symbol) if exchange == "UPBIT" else "")
+        if exchange == "UPBIT":
+            display = f"{symbol} · {name} (업비트)" if name else f"{symbol} · 업비트"
+        else:
+            display = f"{symbol} · {name}" if name else symbol
+        key = (market, symbol)
+        if key in catalog and catalog[key].get("source") in {"krx_map", "upbit_public_api"}:
+            continue
+        catalog[key] = {
             "symbol": symbol,
             "name": name,
             "market": market,
+            "exchange": exchange,
             "display": display,
             "source": "received_signal",
         }
@@ -1824,12 +1991,7 @@ def app_symbol_resolve():
 
     exact_matches = []
     for item in catalog:
-        keys = {
-            _app_symbol_query_key(item.get("symbol", "")),
-            _app_symbol_query_key(item.get("name", "")),
-            _app_symbol_query_key(item.get("display", "")),
-        }
-        if query_key and query_key in keys:
+        if query_key and query_key in _app_symbol_match_keys(item):
             exact_matches.append(item)
 
     if not exact_matches:
@@ -1839,18 +2001,14 @@ def app_symbol_resolve():
             "query": raw_query,
         }), 404
 
-    # 같은 심볼이 여러 시장에 존재할 가능성에 대비해 서버가 임의 선택하지 않는다.
-    if len(exact_matches) > 1:
-        unique = {(item["market"], item["symbol"]) for item in exact_matches}
-        if len(unique) > 1:
-            return jsonify({
-                "ok": False,
-                "error": "ambiguous_symbol",
-                "query": raw_query,
-                "matches": exact_matches[:10],
-            }), 409
-
-    item = exact_matches[0]
+    item, ambiguous = _choose_app_symbol_match(exact_matches)
+    if ambiguous or item is None:
+        return jsonify({
+            "ok": False,
+            "error": "ambiguous_symbol",
+            "query": raw_query,
+            "matches": exact_matches[:10],
+        }), 409
     return jsonify({"ok": True, **item}), 200
 
 
@@ -1864,12 +2022,7 @@ def app_symbol_detail():
     catalog = _app_symbol_catalog()
     matches = []
     for item in catalog:
-        keys = {
-            _app_symbol_query_key(item.get("symbol", "")),
-            _app_symbol_query_key(item.get("name", "")),
-            _app_symbol_query_key(item.get("display", "")),
-        }
-        if query_key and query_key in keys:
+        if query_key and query_key in _app_symbol_match_keys(item):
             matches.append(item)
 
     if not matches:
@@ -1879,30 +2032,52 @@ def app_symbol_detail():
             "query": raw_query,
         }), 404
 
-    if len(matches) > 1:
-        unique = {(item["market"], item["symbol"]) for item in matches}
-        if len(unique) > 1:
-            return jsonify({
-                "ok": False,
-                "error": "ambiguous_symbol",
-                "query": raw_query,
-                "matches": matches[:10],
-            }), 409
+    item, ambiguous = _choose_app_symbol_match(matches)
+    if ambiguous or item is None:
+        return jsonify({
+            "ok": False,
+            "error": "ambiguous_symbol",
+            "query": raw_query,
+            "matches": matches[:10],
+        }), 409
 
-    item = matches[0]
     try:
-        recent = signals_for_symbol(item["symbol"], 8)
+        aliases = [item["symbol"]]
+        if str(item.get("exchange", "")).upper() == "UPBIT":
+            aliases.append(_upbit_tradingview_alias(item["symbol"]))
+        raw_recent = recent_cadence_alerts(aliases, 30)
     except Exception:
-        log.exception("TajumOn symbol detail lookup failed symbol=%s", item["symbol"])
+        log.exception("TajumOn symbol cadence detail lookup failed symbol=%s", item["symbol"])
         return jsonify({
             "ok": False,
             "error": "detail_lookup_failed",
             "symbol": item["symbol"],
         }), 500
 
+    emoji_by_stage = {1: "❗", 2: "‼️", 3: "❗❗❗"}
+    recent = []
+    for row in raw_recent:
+        direction = str(row.get("direction", "")).upper()
+        stage = int(row.get("stage", 0) or 0)
+        side_label = "매수" if direction == "LOW" else "매도"
+        alert_label = f"✍🏻 {side_label} 집중" if stage <= 0 else f"{emoji_by_stage.get(stage, '❗')} {side_label} 유효 {stage}/3"
+        enriched = dict(row)
+        enriched.update({
+            "symbol": item["symbol"],
+            "display": item.get("display") or item["symbol"],
+            "market": item.get("market") or _app_symbol_market(item["symbol"]),
+            "exchange": item.get("exchange") or "",
+            "side": "LONG" if direction == "LOW" else "SHORT",
+            "signal_type": "LOW" if direction == "LOW" else "HIGH",
+            "alert_label": alert_label,
+            "received_at": row.get("occurred_at"),
+        })
+        recent.append(enriched)
+
     return jsonify({
         "ok": True,
         **item,
+        "history_source": "telegram_visible_cadence",
         "latest_signal": recent[0] if recent else None,
         "recent_signals": recent,
         "recent_count": len(recent),
@@ -1971,7 +2146,11 @@ def app_push_test():
         )
         for failed in result.get("failed_tokens", []):
             remove_app_device_token(failed)
-        return jsonify({"ok": True, "symbol": symbol or None, "result": result}), 200
+        public_result = {
+            key: value for key, value in result.items()
+            if key not in {"failed_tokens", "successful_tokens"}
+        }
+        return jsonify({"ok": True, "symbol": symbol or None, "result": public_result}), 200
     except Exception as exc:
         log.exception("TajumOn manual push test failed")
         return jsonify({"ok": False, "error": type(exc).__name__}), 500
@@ -1979,70 +2158,35 @@ def app_push_test():
 
 @app.get("/app/alerts/recent")
 def app_recent_alerts():
-    """Tajum On alert history using the exact Telegram-visible cadence stages.
+    """Real per-device Tajum On push inbox.
 
-    Only focus(stage 0) and valid 1~3 events that were marked telegram_visible are
-    exposed. Raw repeated LOW/HIGH signals and admin-only research stages 4~5 are
-    not returned, so the app history follows the member Telegram cadence.
+    Only cadence pushes that Firebase reported as successfully delivered to this
+    installation are returned. Retention is hard-limited to 300 items and 30 days.
     """
+    device_id = request.args.get("device_id", "").strip()
+    if not device_id:
+        return jsonify({"ok": False, "error": "empty_device_id"}), 400
+
     raw_symbols = request.args.get("symbols", "").strip()
-    if not raw_symbols:
-        single = request.args.get("symbol", "").strip()
-        raw_symbols = single
     symbols = [_clean_symbol_code(part) for part in raw_symbols.split(",") if part.strip()]
     symbols = [symbol for symbol in symbols if symbol]
-    if not symbols:
-        return jsonify({"ok": False, "error": "empty_symbols"}), 400
 
     try:
-        requested_limit = int(request.args.get("limit", "50") or 50)
+        requested_limit = int(request.args.get("limit", "300") or 300)
     except (TypeError, ValueError):
-        requested_limit = 50
-    safe_limit = max(1, min(requested_limit, 100))
+        requested_limit = 300
+    safe_limit = max(1, min(requested_limit, 300))
 
     try:
-        rows = recent_cadence_alerts(symbols, safe_limit)
+        alerts = recent_app_push_history(device_id, symbols or None, safe_limit, 30)
     except Exception:
-        log.exception("TajumOn recent cadence alert lookup failed symbols=%s", symbols)
+        log.exception("TajumOn delivered push history lookup failed device=%s", device_id[:16])
         return jsonify({"ok": False, "error": "alert_lookup_failed"}), 500
-
-    emoji_by_stage = {1: "❗", 2: "‼️", 3: "❗❗❗"}
-    alerts = []
-    for row in rows:
-        item = dict(row)
-        symbol = _clean_symbol_code(item.get("symbol", ""))
-        direction = str(item.get("direction", "")).upper()
-        stage = int(item.get("stage", 0) or 0)
-        market = _app_symbol_market(symbol)
-        name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else ""
-        display = f"{symbol} · {name}" if name else symbol
-        buy_side = direction == "LOW"
-        side_label = "매수" if buy_side else "매도"
-        if stage <= 0:
-            alert_label = f"✍🏻 {side_label} 집중"
-        else:
-            alert_label = f"{emoji_by_stage.get(stage, '❗')} {side_label} 유효 {stage}/3"
-
-        item.update({
-            "symbol": symbol,
-            "display": display,
-            "market": market,
-            "side": "LONG" if buy_side else "SHORT",
-            "signal_type": "LOW" if buy_side else "HIGH",
-            "alert_label": alert_label,
-            "received_at": item.get("occurred_at"),
-        })
-        alerts.append(item)
 
     return jsonify({
         "ok": True,
-        "cadence": {
-            "focus_counter_included": False,
-            "valid_stage_count": 3,
-            "valid_interval_minutes": TELEGRAM_VALID_COOLDOWN_MINUTES,
-            "focus_reset_minutes": _CADENCE_POST_EPISODE_COOLDOWN_MIN,
-            "source": "telegram_visible_cadence",
-        },
+        "source": "delivered_fcm_history",
+        "retention": {"max_count": 300, "max_days": 30},
         "symbols": symbols,
         "count": len(alerts),
         "alerts": alerts,
@@ -6410,10 +6554,12 @@ def performance_cycles_json():
 def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) -> Optional[dict[str, Any]]:
     if not _route_uses_asset_hashtag(route):
         return None
-    sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
-    if direction not in {"LOW", "HIGH"} or timeframe == "unknown" or not sym:
+    raw_sym, direction, timeframe, route_key = _telegram_signal_parts(route, msg, symbol)
+    if direction not in {"LOW", "HIGH"} or timeframe == "unknown" or not raw_sym:
         return None
 
+    exchange = _app_signal_exchange(symbol, msg)
+    sym = _canonical_app_signal_symbol(raw_sym, msg)
     reason = str(cadence_reason or "")
     stage = 0
     if "_valid_" in reason:
@@ -6433,16 +6579,31 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
 
     price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
     price_text = price_match.group(1) if price_match else ""
-    market = _app_symbol_market(sym)
-    name = KRX_SYMBOL_NAMES.get(sym, "") if market == "KOREA" else ""
-    display = f"{sym} · {name}" if name else sym
+    market = _app_symbol_market(sym, exchange, exchange)
+    if market == "KOREA":
+        name = KRX_SYMBOL_NAMES.get(sym, "")
+    elif exchange == "UPBIT":
+        name = _upbit_name_for_pair(sym)
+    else:
+        name = ""
+    if exchange == "UPBIT":
+        display = f"{sym} · {name} (업비트)" if name else f"{sym} · 업비트"
+    else:
+        display = f"{sym} · {name}" if name else sym
     body_parts = [timeframe]
     if price_text:
         body_parts.append(price_text)
 
+    occurred_at = datetime.now(timezone.utc)
+    delivery_key = hashlib.sha256(
+        f"{route_key}|{sym}|{direction}|{timeframe}|{stage}|{reason}|{msg}|{occurred_at.isoformat()}".encode("utf-8")
+    ).hexdigest()
+
     return {
         "symbol": sym,
         "display": display,
+        "market": market,
+        "exchange": exchange,
         "direction": direction,
         "side": "LONG" if direction == "LOW" else "SHORT",
         "timeframe": timeframe,
@@ -6450,6 +6611,8 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "alert_label": alert_label,
         "signal_price": price_text,
         "route": route_key,
+        "occurred_at": occurred_at.isoformat(),
+        "delivery_key": delivery_key,
         "title": f"{display} · {alert_label}",
         "body": " · ".join(body_parts),
     }
@@ -6460,10 +6623,11 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         payload = _cadence_push_parts(route, msg, symbol, cadence_reason)
         if not payload:
             return
-        tokens = app_device_tokens_for_symbol(payload["symbol"], 500)
-        if not tokens:
+        devices = app_devices_for_symbol(payload["symbol"], 500)
+        if not devices:
             log.info("FCM no recipients symbol=%s", payload["symbol"])
             return
+        tokens = [item["fcm_token"] for item in devices]
         result = send_push_to_tokens(
             tokens,
             payload["title"],
@@ -6471,6 +6635,8 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
             {
                 "symbol": payload["symbol"],
                 "display": payload["display"],
+                "market": payload["market"],
+                "exchange": payload["exchange"],
                 "direction": payload["direction"],
                 "side": payload["side"],
                 "timeframe": payload["timeframe"],
@@ -6481,11 +6647,37 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
                 "source": "telegram_cadence",
             },
         )
-        for failed in result.get("failed_tokens", []):
+        failed_tokens = set(result.get("failed_tokens", []))
+        successful_tokens = set(result.get("successful_tokens", []))
+        for failed in failed_tokens:
             remove_app_device_token(failed)
+
+        deliveries = []
+        for device in devices:
+            if device["fcm_token"] not in successful_tokens:
+                continue
+            deliveries.append({
+                "device_id": device["device_id"],
+                "delivery_key": payload["delivery_key"],
+                "symbol": payload["symbol"],
+                "display": payload["display"],
+                "market": payload["market"],
+                "exchange": payload["exchange"],
+                "direction": payload["direction"],
+                "side": payload["side"],
+                "timeframe": payload["timeframe"],
+                "stage": payload["stage"],
+                "alert_label": payload["alert_label"],
+                "signal_price": payload["signal_price"],
+                "route": payload["route"],
+                "occurred_at": payload["occurred_at"],
+            })
+        if deliveries:
+            save_app_push_history(deliveries)
         log.info(
-            "FCM cadence push symbol=%s stage=%s success=%s failure=%s",
-            payload["symbol"], payload["stage"], result.get("success"), result.get("failure"),
+            "FCM cadence push symbol=%s stage=%s success=%s failure=%s history=%s",
+            payload["symbol"], payload["stage"], result.get("success"),
+            result.get("failure"), len(deliveries),
         )
     except Exception:
         # Push must never interrupt Telegram or webhook responses.
