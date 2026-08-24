@@ -1,4 +1,4 @@
-# V118_TAJUM_PUSH_INBOX_UPBIT: 실제 기기별 푸시 이력(300건/30일) + 상세 cadence 통일 + 업비트 종목 마스터
+# V119_TAJUM_SYMBOL_SEARCH_EXCHANGE_LABELS: 자동완성 검색 + 홈 상세 안정화 + 거래소 표기 통일
 # V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
 # V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
 # V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
@@ -1828,7 +1828,7 @@ def _load_upbit_market_catalog() -> list[dict[str, Any]]:
                     "english_name": english_name,
                     "market": "COIN",
                     "exchange": "UPBIT",
-                    "display": f"{pair} · {korean_name or english_name} (업비트)" if (korean_name or english_name) else f"{pair} · 업비트",
+                    "display": f"{pair} · {korean_name or english_name}" if (korean_name or english_name) else pair,
                     "source": "upbit_public_api",
                 })
             if items:
@@ -1903,7 +1903,7 @@ def _app_symbol_market(symbol: str, exchange: str = "", raw_exchange: str = "") 
     return "US"
 
 
-def _app_symbol_catalog() -> list[dict[str, Any]]:
+def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
     catalog: dict[tuple[str, str], dict[str, Any]] = {}
 
     # 국장: 현재 서버가 관리 중인 공식 코드/한글명 매핑 전체.
@@ -1912,16 +1912,18 @@ def _app_symbol_catalog() -> list[dict[str, Any]]:
             "symbol": code,
             "name": name,
             "market": "KOREA",
+            "exchange": "KRX",
             "display": f"{code} · {name}",
             "source": "krx_map",
         }
 
-    # 업비트: 공개 마켓 API에서 현재 거래 가능한 페어를 동적으로 제공한다.
-    # 앱에는 KRW-BTC 형식으로 저장해 Binance BTCUSDT와 명확히 구분한다.
-    for item in _load_upbit_market_catalog():
-        symbol = _clean_symbol_code(item.get("symbol", ""))
-        if symbol:
-            catalog[("COIN", symbol)] = dict(item)
+    # 업비트: 종목 검색/업비트 상세 조회에서만 공개 마켓 API를 사용한다.
+    # 홈의 BTCUSDT/NVDA/국장 상세 조회가 업비트 외부 API 상태에 영향을 받지 않도록 분리한다.
+    if include_upbit:
+        for item in _load_upbit_market_catalog():
+            symbol = _clean_symbol_code(item.get("symbol", ""))
+            if symbol:
+                catalog[("COIN", symbol)] = dict(item)
 
     # 미장/코인: 서버가 실제로 수신한 신호 종목.
     try:
@@ -1946,10 +1948,7 @@ def _app_symbol_catalog() -> list[dict[str, Any]]:
             row.get("raw_exchange", ""),
         )
         name = KRX_SYMBOL_NAMES.get(symbol, "") if market == "KOREA" else (_upbit_name_for_pair(symbol) if exchange == "UPBIT" else "")
-        if exchange == "UPBIT":
-            display = f"{symbol} · {name} (업비트)" if name else f"{symbol} · 업비트"
-        else:
-            display = f"{symbol} · {name}" if name else symbol
+        display = f"{symbol} · {name}" if name else symbol
         key = (market, symbol)
         if key in catalog and catalog[key].get("source") in {"krx_map", "upbit_public_api"}:
             continue
@@ -1980,6 +1979,70 @@ def _app_symbol_query_key(value: str) -> str:
     return re.sub(r"[\s·()_/]", "", text)
 
 
+def _app_query_needs_upbit_catalog(raw_query: str) -> bool:
+    text = str(raw_query or "").strip().upper()
+    if not text:
+        return False
+    if "UPBIT" in text or "업비트" in str(raw_query or ""):
+        return True
+    compact = re.sub(r"\s+", "", text)
+    if compact.startswith(("KRW-", "BTC-", "USDT-")):
+        return True
+    if compact.endswith("KRW") and len(compact) > 3:
+        return True
+    # 한글 코인명으로 상세/검색하는 경우 업비트 카탈로그가 필요하다.
+    if re.search(r"[가-힣]", str(raw_query or "")):
+        return True
+    return False
+
+
+@app.get("/app/symbol/search")
+def app_symbol_search():
+    raw_query = request.args.get("q", "").strip()
+    if not raw_query:
+        return jsonify({"ok": True, "query": raw_query, "results": []}), 200
+    try:
+        safe_limit = max(1, min(int(request.args.get("limit", "8") or 8), 20))
+    except (TypeError, ValueError):
+        safe_limit = 8
+
+    query_key = _app_symbol_query_key(raw_query)
+    if not query_key:
+        return jsonify({"ok": True, "query": raw_query, "results": []}), 200
+
+    catalog = _app_symbol_catalog(include_upbit=True)
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+    for item in catalog:
+        symbol_key = _app_symbol_query_key(item.get("symbol", ""))
+        name_key = _app_symbol_query_key(item.get("name", ""))
+        display_key = _app_symbol_query_key(item.get("display", ""))
+        keys = _app_symbol_match_keys(item)
+
+        score: Optional[int] = None
+        if query_key in keys:
+            score = 0
+        elif symbol_key.startswith(query_key):
+            score = 1
+        elif name_key.startswith(query_key):
+            score = 2
+        elif query_key in symbol_key:
+            score = 3
+        elif query_key in name_key or query_key in display_key:
+            score = 4
+        else:
+            # BTCKRW / UPBIT:BTCKRW 같은 별칭의 부분 입력도 자동완성한다.
+            alias_keys = [key for key in keys if key.startswith(query_key)]
+            if alias_keys:
+                score = 2
+
+        if score is not None:
+            ranked.append((score, str(item.get("symbol", "")), item))
+
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    results = [dict(row[2]) for row in ranked[:safe_limit]]
+    return jsonify({"ok": True, "query": raw_query, "results": results}), 200
+
+
 @app.get("/app/symbol/resolve")
 def app_symbol_resolve():
     raw_query = request.args.get("q", "").strip()
@@ -1987,7 +2050,7 @@ def app_symbol_resolve():
         return jsonify({"ok": False, "error": "empty_query"}), 400
 
     query_key = _app_symbol_query_key(raw_query)
-    catalog = _app_symbol_catalog()
+    catalog = _app_symbol_catalog(include_upbit=True)
 
     exact_matches = []
     for item in catalog:
@@ -2019,7 +2082,9 @@ def app_symbol_detail():
         return jsonify({"ok": False, "error": "empty_query"}), 400
 
     query_key = _app_symbol_query_key(raw_query)
-    catalog = _app_symbol_catalog()
+    catalog = _app_symbol_catalog(
+        include_upbit=_app_query_needs_upbit_catalog(raw_query)
+    )
     matches = []
     for item in catalog:
         if query_key and query_key in _app_symbol_match_keys(item):
