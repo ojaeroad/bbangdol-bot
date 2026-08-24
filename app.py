@@ -2277,10 +2277,12 @@ def app_symbol_detail():
 
 _APP_MARKET_STATUS_LOCK = threading.Lock()
 _APP_MARKET_STATUS_CACHE: dict[str, Any] = {"loaded_at": 0.0, "data": None}
-_APP_MARKET_STATUS_CACHE_SECONDS = 30
+# 홈 시장현황은 앱에서 30초마다 갱신한다. 서버는 외부 호출을 줄이기 위해 20초 캐시한다.
+_APP_MARKET_STATUS_CACHE_SECONDS = 20
 
 
 def _market_status_yahoo(symbol: str) -> dict[str, Any]:
+    """Fallback quote source when TradingView scanner is temporarily unavailable."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     response = requests.get(
         url, params={"interval": "1m", "range": "1d"},
@@ -2298,7 +2300,65 @@ def _market_status_yahoo(symbol: str) -> dict[str, Any]:
     if price is None:
         raise RuntimeError(f"market price missing: {symbol}")
     change_pct = ((float(price) - float(previous)) / float(previous) * 100.0) if previous not in (None, 0, 0.0) else None
-    return {"price": float(price), "change_pct": change_pct, "source": "yahoo_chart"}
+    return {"price": float(price), "change_pct": change_pct, "source": "yahoo_chart_fallback"}
+
+
+def _market_status_tradingview_index(ticker: str) -> dict[str, Any]:
+    """Fetch an index quote from TradingView's scanner endpoint.
+
+    This keeps the app's index cards aligned with the same TradingView symbols used
+    by the alert system: KRX:KOSPI, KRX:KOSDAQ and NASDAQ:NDX.
+    """
+    payload = {
+        "symbols": {"tickers": [ticker], "query": {"types": []}},
+        "columns": ["close", "change"],
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.tradingview.com",
+        "Referer": "https://www.tradingview.com/",
+        "User-Agent": "Mozilla/5.0 TajumOn/1.0",
+    }
+
+    # global scanner normally resolves explicit exchange:ticker symbols.
+    # If TradingView changes routing, try the market-specific scanner as a fallback.
+    market_path = "korea" if ticker.startswith("KRX:") else "america"
+    last_error: Optional[Exception] = None
+    for endpoint in ("global", market_path):
+        try:
+            response = requests.post(
+                f"https://scanner.tradingview.com/{endpoint}/scan",
+                json=payload, headers=headers, timeout=5,
+            )
+            response.raise_for_status()
+            body = response.json()
+            rows = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(rows, list) or not rows:
+                raise RuntimeError(f"TradingView row missing: {ticker}")
+            values = rows[0].get("d") if isinstance(rows[0], dict) else None
+            if not isinstance(values, list) or not values or values[0] is None:
+                raise RuntimeError(f"TradingView close missing: {ticker}")
+            change = values[1] if len(values) > 1 else None
+            return {
+                "price": float(values[0]),
+                "change_pct": float(change) if change is not None else None,
+                "source": "tradingview_scanner",
+                "tradingview_symbol": ticker,
+            }
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"TradingView quote failed {ticker}: {last_error}")
+
+
+def _market_status_index_with_fallback(ticker: str, yahoo_symbol: str) -> dict[str, Any]:
+    try:
+        return _market_status_tradingview_index(ticker)
+    except Exception as exc:
+        log.warning("TradingView market status fallback ticker=%s: %s", ticker, exc)
+        data = _market_status_yahoo(yahoo_symbol)
+        data["tradingview_symbol"] = ticker
+        return data
 
 
 def _market_status_upbit_btc() -> dict[str, Any]:
@@ -2317,6 +2377,7 @@ def _market_status_upbit_btc() -> dict[str, Any]:
         "price": float(price),
         "change_pct": float(rate) * 100.0 if rate is not None else None,
         "source": "upbit_ticker",
+        "tradingview_symbol": "UPBIT:BTCKRW",
     }
 
 
@@ -2335,11 +2396,12 @@ def _load_app_market_status() -> dict[str, Any]:
         items = {}
         errors = {}
         sources = {
-            "KOSPI": lambda: _market_status_yahoo("%5EKS11"),
-            "NASDAQ": lambda: _market_status_yahoo("%5EIXIC"),
+            "KOSPI": lambda: _market_status_index_with_fallback("KRX:KOSPI", "^KS11"),
+            "KOSDAQ": lambda: _market_status_index_with_fallback("KRX:KOSDAQ", "^KQ11"),
+            "NASDAQ": lambda: _market_status_index_with_fallback("NASDAQ:NDX", "^NDX"),
             "BTC_KRW": _market_status_upbit_btc,
         }
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             future_map = {executor.submit(loader): key for key, loader in sources.items()}
             for future in as_completed(future_map):
                 key = future_map[future]
