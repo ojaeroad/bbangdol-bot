@@ -1,4 +1,4 @@
-# V128_SERVER_SIGNAL_ENGINE_TV_AUTO_COMPARE: TradingView 1분 기준시각 ↔ Binance 1m 재조립 자동 비교기 (전송/성과DB 영향 없음)
+# V129_BTC_ALL_TF_TV_AUTO_COMPARE: BTCUSDT 별꽃 전체 체인 TF 자동 비교 (전송/성과DB 영향 없음)
 # V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
 # V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
 # V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
@@ -142,28 +142,32 @@ def version():
 def whoami():
     return jsonify({"service": SERVICE_NAME})
 
-# === V128 서버형 타점 계산기: TradingView ↔ Binance 자동 비교 ===
+# === V129 서버형 타점 계산기: BTC 전체 TF TradingView ↔ Binance 자동 비교 ===
 # 중요: 기존 TradingView 회원알림 / Telegram / FCM / 성과DB 흐름과 분리되어 있다.
 # 비교 결과는 메모리에만 보관하며, 검증 완료 전 회원용 알림으로 절대 전송하지 않는다.
 @app.get("/server-engine/health")
 def server_engine_health():
     try:
-        from server_signal_engine import compare_key_configured
+        from server_signal_engine import compare_key_configured, comparison_retention_limit
         key_configured = compare_key_configured()
+        retention_limit = comparison_retention_limit()
     except Exception:
         key_configured = False
+        retention_limit = 2000
     return jsonify({
         "ok": True,
-        "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
+        "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
         "symbol": "BTCUSDT",
-        "signal_timeframes": ["5m", "15m"],
-        "comparison_basis": "TradingView minute_close + Binance finalized 1m reconstruction",
+        "signal_timeframes": ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"],
+        "comparison_basis": "TradingView minute_close + Binance finalized lower-TF reconstruction for all 별꽃 chain TFs",
         "delivery_enabled": False,
         "telegram_enabled": False,
         "fcm_enabled": False,
         "database_write_enabled": False,
         "compare_key_configured": key_configured,
+        "comparison_retention_limit": retention_limit,
         "full_engine_internal_chain_timeframe": "2h",
+        "delivery_mode": "COMPARE_ONLY_NO_TELEGRAM_NO_FCM_NO_DB",
     })
 
 @app.get("/server-engine/phase1/btc")
@@ -177,7 +181,7 @@ def server_engine_phase1_btc():
         log.exception("Server signal engine BTC phase1 failed")
         return jsonify({
             "ok": False,
-            "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
+            "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
             "delivery_enabled": False,
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
@@ -205,14 +209,14 @@ def server_engine_compare_tradingview():
     except ValueError as exc:
         return jsonify({
             "ok": False,
-            "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
+            "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
             "error": str(exc),
         }), 400
     except Exception as exc:
         log.exception("Server signal engine TradingView compare failed")
         return jsonify({
             "ok": False,
-            "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
+            "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
 
