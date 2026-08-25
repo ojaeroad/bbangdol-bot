@@ -367,11 +367,11 @@ def _normalize_signal_line(line: str) -> str:
 
 def _buy_valid_stage_emoji(ordinal: int) -> str:
     stage=max(1,min(int(ordinal or 1),3))
-    return {1:"❗", 2:"‼️", 3:"❗❗❗"}[stage]
+    return {1:"❗", 2:"‼️", 3:"🚨"}[stage]
 
 def _sell_valid_stage_emoji(ordinal: int) -> str:
     # v84 고정 규칙: 매도도 매수와 동일한 유효 단계 이모지를 사용한다.
-    # 집중은 ✍🏻 단독(카운터 제외), 이후 ❗ 1/3 → ‼️ 2/3 → ❗❗❗ 3/3.
+    # 집중은 ✍🏻 단독(카운터 제외), 이후 ❗ 1/3 → ‼️ 2/3 → 🚨 3/3.
     return _buy_valid_stage_emoji(ordinal)
 
 def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
@@ -1788,7 +1788,7 @@ def _upbit_user_pair(pair: str) -> str:
 _APP_COIN_KO_NAMES = {
     "BTC": "비트코인", "ETH": "이더리움", "XRP": "엑스알피", "SOL": "솔라나",
     "ADA": "에이다", "DOGE": "도지코인", "AVAX": "아발란체", "LINK": "체인링크",
-    "SUI": "수이", "AAVE": "에이브", "ALGO": "알고랜드", "TRX": "트론",
+    "SUI": "수이", "ONDO": "온도 파이낸스", "AAVE": "에이브", "ALGO": "알고랜드", "TRX": "트론",
     "DOT": "폴카닷", "LTC": "라이트코인", "BCH": "비트코인캐시", "ETC": "이더리움클래식",
 }
 
@@ -2239,7 +2239,7 @@ def app_symbol_detail():
             "symbol": item["symbol"],
         }), 500
 
-    emoji_by_stage = {1: "❗", 2: "‼️", 3: "❗❗❗"}
+    emoji_by_stage = {1: "❗", 2: "‼️", 3: "🚨"}
     recent = []
     for row in raw_recent:
         direction = str(row.get("direction", "")).upper()
@@ -2278,7 +2278,7 @@ def app_symbol_detail():
 _APP_MARKET_STATUS_LOCK = threading.Lock()
 _APP_MARKET_STATUS_CACHE: dict[str, Any] = {"loaded_at": 0.0, "data": None}
 # 홈 시장현황은 앱에서 30초마다 갱신한다. 서버는 외부 호출을 줄이기 위해 20초 캐시한다.
-_APP_MARKET_STATUS_CACHE_SECONDS = 20
+_APP_MARKET_STATUS_CACHE_SECONDS = 30
 
 
 def _market_status_yahoo(symbol: str) -> dict[str, Any]:
@@ -2396,12 +2396,22 @@ def _load_app_market_status() -> dict[str, Any]:
         items = {}
         errors = {}
         sources = {
+            # Home primary cards: keep the same TradingView-first policy already in use.
             "KOSPI": lambda: _market_status_index_with_fallback("KRX:KOSPI", "^KS11"),
             "KOSDAQ": lambda: _market_status_index_with_fallback("KRX:KOSDAQ", "^KQ11"),
             "NASDAQ": lambda: _market_status_index_with_fallback("NASDAQ:NDX", "^NDX"),
             "BTC_KRW": _market_status_upbit_btc,
+            # Compact global indicators. TradingView is primary and Yahoo chart is fallback.
+            "SP500": lambda: _market_status_index_with_fallback("SP:SPX", "^GSPC"),
+            "SOX": lambda: _market_status_index_with_fallback("NASDAQ:SOX", "^SOX"),
+            "VIX": lambda: _market_status_index_with_fallback("CBOE:VIX", "^VIX"),
+            "DXY": lambda: _market_status_index_with_fallback("TVC:DXY", "DX-Y.NYB"),
+            "GOLD": lambda: _market_status_index_with_fallback("TVC:GOLD", "GC=F"),
+            "WTI": lambda: _market_status_index_with_fallback("TVC:USOIL", "CL=F"),
+            "USDKRW": lambda: _market_status_index_with_fallback("FX_IDC:USDKRW", "KRW=X"),
+            "US10Y": lambda: _market_status_index_with_fallback("TVC:US10Y", "^TNX"),
         }
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             future_map = {executor.submit(loader): key for key, loader in sources.items()}
             for future in as_completed(future_map):
                 key = future_map[future]
@@ -6942,7 +6952,7 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
     if stage == 0:
         alert_label = f"✍🏻 {side_label} 집중"
     else:
-        emoji = {1: "❗", 2: "‼️", 3: "❗❗❗"}[stage]
+        emoji = {1: "❗", 2: "‼️", 3: "🚨"}[stage]
         alert_label = f"{emoji} {side_label} 유효 {stage}/3"
 
     price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")

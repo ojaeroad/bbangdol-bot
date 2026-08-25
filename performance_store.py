@@ -1588,9 +1588,12 @@ def upsert_app_device(
     clean_token = str(fcm_token or "").strip()
     clean_platform = str(platform or "android").strip().lower()[:20] or "android"
     clean_uid = str(user_uid or "").strip()[:128] or None
-    allowed_sound_profiles = {"system", "clear", "soft", "bright", "deep", "pulse", "silent"}
-    clean_sound_profile = str(sound_profile or "clear").strip().lower()
-    if clean_sound_profile not in allowed_sound_profiles:
+    allowed_sound_profiles = {
+        "system", "spark", "cash", "siren", "clear", "soft", "bright", "deep", "pulse", "silent"
+    }
+    clean_sound_profile = str(sound_profile or "clear").strip().lower()[:24]
+    is_custom_sound = bool(re.fullmatch(r"custom_[0-9a-f]{12}", clean_sound_profile))
+    if clean_sound_profile not in allowed_sound_profiles and not is_custom_sound:
         clean_sound_profile = "clear"
     clean_vibration_enabled = bool(vibration_enabled)
     if not clean_device_id:
