@@ -6986,15 +6986,19 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "route": route_key,
         "occurred_at": occurred_at.isoformat(),
         "delivery_key": delivery_key,
+        # Put the actionable signal information first so Android notification
+        # truncation never hides buy/sell direction or timeframe.
+        # Example title: "✍🏻 매수 집중 · 단타 5m"
+        # Example body : "ETHUSDT 이더리움 (바이낸스) · 2,480.26"
         "title": " · ".join(
             part for part in (
-                display,
+                alert_label,
                 " ".join(part for part in (group_label, timeframe) if part),
             )
             if part
         ),
         "body": " · ".join(
-            part for part in (alert_label, price_text)
+            part for part in (display, price_text)
             if part
         ),
     }
