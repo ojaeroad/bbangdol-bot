@@ -1,3 +1,4 @@
+# V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine V22B 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
 # V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
 # V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
 # V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
@@ -139,6 +140,37 @@ def version():
 @app.get("/whoami")
 def whoami():
     return jsonify({"service": SERVICE_NAME})
+
+# === V127 서버형 타점 계산기 1차 검증 ===
+# 기존 TradingView / Telegram / FCM / 성과DB와 완전히 분리된 읽기 전용 엔드포인트다.
+# 검증 완료 전에는 계산 결과를 회원 알림으로 절대 전송하지 않는다.
+@app.get("/server-engine/health")
+def server_engine_health():
+    return jsonify({
+        "ok": True,
+        "phase": "BTC_PHASE1_COMPARE_ONLY",
+        "symbol": "BTCUSDT",
+        "signal_timeframes": ["5m", "15m"],
+        "delivery_enabled": False,
+        "database_write_enabled": False,
+        "full_engine_internal_chain_timeframe": "2h",
+    })
+
+@app.get("/server-engine/phase1/btc")
+def server_engine_phase1_btc():
+    try:
+        # lazy import: 엔진 파일에 문제가 생겨도 기존 서버 시작/알람 흐름은 보호한다.
+        from server_signal_engine import evaluate_phase1_btc
+        result = evaluate_phase1_btc()
+        return jsonify(result), (200 if result.get("ok") else 502)
+    except Exception as exc:
+        log.exception("Server signal engine BTC phase1 failed")
+        return jsonify({
+            "ok": False,
+            "phase": "BTC_PHASE1_COMPARE_ONLY",
+            "delivery_enabled": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }), 500
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60
