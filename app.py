@@ -1,4 +1,5 @@
-# V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine V22B 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
+# V128_SERVER_SIGNAL_ENGINE_TV_AUTO_COMPARE: TradingView 1분 기준시각 ↔ Binance 1m 재조립 자동 비교기 (전송/성과DB 영향 없음)
+# V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
 # V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
 # V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
 # V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
@@ -141,18 +142,27 @@ def version():
 def whoami():
     return jsonify({"service": SERVICE_NAME})
 
-# === V127 서버형 타점 계산기 1차 검증 ===
-# 기존 TradingView / Telegram / FCM / 성과DB와 완전히 분리된 읽기 전용 엔드포인트다.
-# 검증 완료 전에는 계산 결과를 회원 알림으로 절대 전송하지 않는다.
+# === V128 서버형 타점 계산기: TradingView ↔ Binance 자동 비교 ===
+# 중요: 기존 TradingView 회원알림 / Telegram / FCM / 성과DB 흐름과 분리되어 있다.
+# 비교 결과는 메모리에만 보관하며, 검증 완료 전 회원용 알림으로 절대 전송하지 않는다.
 @app.get("/server-engine/health")
 def server_engine_health():
+    try:
+        from server_signal_engine import compare_key_configured
+        key_configured = compare_key_configured()
+    except Exception:
+        key_configured = False
     return jsonify({
         "ok": True,
-        "phase": "BTC_PHASE1_COMPARE_ONLY",
+        "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
         "symbol": "BTCUSDT",
         "signal_timeframes": ["5m", "15m"],
+        "comparison_basis": "TradingView minute_close + Binance finalized 1m reconstruction",
         "delivery_enabled": False,
+        "telegram_enabled": False,
+        "fcm_enabled": False,
         "database_write_enabled": False,
+        "compare_key_configured": key_configured,
         "full_engine_internal_chain_timeframe": "2h",
     })
 
@@ -167,10 +177,62 @@ def server_engine_phase1_btc():
         log.exception("Server signal engine BTC phase1 failed")
         return jsonify({
             "ok": False,
-            "phase": "BTC_PHASE1_COMPARE_ONLY",
+            "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
             "delivery_enabled": False,
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
+
+@app.post("/server-engine/compare/tradingview")
+def server_engine_compare_tradingview():
+    try:
+        from server_signal_engine import compare_key_matches, enqueue_tradingview_snapshot
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            # TradingView normally sends application/json when alert() emits valid JSON.
+            # Keep a small fallback for proxies that pass it as text/plain.
+            raw = (request.get_data(as_text=True) or "").strip()
+            payload = json.loads(raw) if raw else None
+        if not isinstance(payload, dict):
+            return jsonify({"ok": False, "error": "valid JSON body required"}), 400
+
+        provided_key = request.headers.get("X-Server-Engine-Key") or payload.get("compare_key")
+        if not compare_key_matches(provided_key):
+            return jsonify({"ok": False, "error": "invalid compare key"}), 403
+
+        result = enqueue_tradingview_snapshot(payload)
+        return jsonify(result), 202
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
+            "error": str(exc),
+        }), 400
+    except Exception as exc:
+        log.exception("Server signal engine TradingView compare failed")
+        return jsonify({
+            "ok": False,
+            "phase": "BTC_PHASE1_TV_AUTO_COMPARE",
+            "error": f"{type(exc).__name__}: {exc}",
+        }), 500
+
+@app.get("/server-engine/compare/latest")
+def server_engine_compare_latest():
+    try:
+        from server_signal_engine import comparison_latest
+        return jsonify(comparison_latest())
+    except Exception as exc:
+        log.exception("Server signal engine latest compare failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+@app.get("/server-engine/compare/summary")
+def server_engine_compare_summary():
+    try:
+        from server_signal_engine import comparison_summary
+        return jsonify(comparison_summary())
+    except Exception as exc:
+        log.exception("Server signal engine compare summary failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60
