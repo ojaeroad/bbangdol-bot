@@ -1,3 +1,4 @@
+# V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
 # V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
 # V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
 # V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
@@ -38,6 +39,7 @@ from performance_store import (
     health_summary, latest_signals, known_symbols, signals_for_symbol, recent_cadence_alerts, prediction_research_summary,
     record_page_visit, page_visit_summary,
     upsert_app_device, app_device_tokens_for_symbol, app_devices_for_symbol,
+    filter_app_devices_by_push_cooldown,
     save_app_push_history, recent_app_push_history, remove_app_device_token, app_device_summary,
 )
 from performance_analyzer import rebuild_individual_pairs, analysis_summary, latest_analysis_pairs, visual_cycle_data
@@ -7052,6 +7054,32 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
                 "FCM no recipients symbol=%s group=%s",
                 payload["symbol"], payload.get("group_key", ""),
             )
+            return
+
+        # App-only duplicate guard. Telegram cadence is still evaluated per timeframe,
+        # but the phone should not receive 5m and 15m (or 30m and 1h) from the same
+        # symbol/side/group inside the same 5-minute window.
+        market_type = "COIN" if str(payload.get("market", "")).upper() == "COIN" else "STOCK"
+        group_key = str(payload.get("group_key", "") or "").strip().upper()
+        group_timeframes = list(
+            ENTRY_GROUP_TIMEFRAMES.get(market_type, {}).get(
+                group_key, [str(payload.get("timeframe", "") or "")]
+            )
+        )
+        devices, blocked_by_push_cooldown = filter_app_devices_by_push_cooldown(
+            devices,
+            payload["symbol"],
+            payload["side"],
+            group_timeframes,
+            TELEGRAM_VALID_COOLDOWN_MINUTES,
+        )
+        if blocked_by_push_cooldown:
+            log.info(
+                "FCM app cooldown skipped symbol=%s side=%s group=%s blocked=%s window=%sm",
+                payload["symbol"], payload["side"], group_key,
+                blocked_by_push_cooldown, TELEGRAM_VALID_COOLDOWN_MINUTES,
+            )
+        if not devices:
             return
 
         # Android notification channels lock sound/vibration behavior. Group devices

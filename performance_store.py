@@ -1436,6 +1436,71 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
     ]
 
 
+def filter_app_devices_by_push_cooldown(
+    devices: list[dict[str, Any]],
+    symbol: str,
+    side: str,
+    timeframes: list[str],
+    cooldown_minutes: int = 5,
+) -> tuple[list[dict[str, Any]], int]:
+    """Block duplicate app pushes for the same device/symbol/side/timeframe-group.
+
+    Telegram cadence remains untouched. This is an app-delivery guard so that,
+    for example, 5m and 15m signals in the same SCALP group do not produce two
+    phone pushes one minute apart. The database is the source of truth, which
+    keeps the guard shared across Render workers.
+    """
+    if not devices or not PERFORMANCE_DATABASE_URL:
+        return list(devices or []), 0
+
+    device_ids = []
+    seen_ids: set[str] = set()
+    for device in devices:
+        device_id = str((device or {}).get("device_id", "") or "").strip()[:128]
+        if device_id and device_id not in seen_ids:
+            seen_ids.add(device_id)
+            device_ids.append(device_id)
+    canonical = canonical_performance_symbol(symbol)[:100]
+    clean_side = str(side or "").strip().upper()[:10]
+    clean_timeframes = []
+    seen_tf: set[str] = set()
+    for raw in timeframes or []:
+        tf = str(raw or "").strip()[:10]
+        if tf and tf not in seen_tf:
+            seen_tf.add(tf)
+            clean_timeframes.append(tf)
+    try:
+        safe_minutes = max(1, min(int(cooldown_minutes), 120))
+    except (TypeError, ValueError):
+        safe_minutes = 5
+
+    if not device_ids or not canonical or not clean_side or not clean_timeframes:
+        return list(devices), 0
+
+    ensure_schema()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT device_id
+            FROM tajum_app_push_history
+            WHERE device_id = ANY(%s)
+              AND symbol=%s
+              AND COALESCE(side, '')=%s
+              AND timeframe = ANY(%s)
+              AND occurred_at > NOW() - (%s * INTERVAL '1 minute')
+            """,
+            (device_ids, canonical, clean_side, clean_timeframes, safe_minutes),
+        ).fetchall()
+    blocked = {str(row[0] or "").strip() for row in rows if row and row[0]}
+    if not blocked:
+        return list(devices), 0
+    allowed = [
+        device for device in devices
+        if str((device or {}).get("device_id", "") or "").strip() not in blocked
+    ]
+    return allowed, len(blocked)
+
+
 def save_app_push_history(deliveries: list[dict[str, Any]]) -> int:
     """Persist only FCM deliveries that Firebase reported as successful."""
     if not PERFORMANCE_DATABASE_URL or not deliveries:
