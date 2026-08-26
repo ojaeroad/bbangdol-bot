@@ -1,4 +1,4 @@
-"""Tajum On server signal engine - V130 COIN9 all-timeframe TV/Binance comparator.
+"""Tajum On server signal engine - V132 COIN9 diagnostic comparator/export support.
 
 Safety / scope:
 - comparison-only: no Telegram, no FCM, no performance DB writes
@@ -41,7 +41,7 @@ COMPARE_WORKERS = max(1, min(int(os.getenv("SERVER_ENGINE_COMPARE_WORKERS", "3")
 EVENT_HISTORY_LIMIT = max(100, min(int(os.getenv("SERVER_ENGINE_EVENT_HISTORY_LIMIT", "1000") or 1000), 5000))
 BORDERLINE_EPSILON = max(0.01, min(float(os.getenv("SERVER_ENGINE_BORDERLINE_EPSILON", "0.25") or 0.25), 2.0))
 
-PHASE_NAME = "COIN9_ALL_TF_TV_AUTO_COMPARE_V130"
+PHASE_NAME = "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT"
 EVENT_TYPE = "SERVER_ENGINE_TV_COMPARE_V130"
 
 SUPPORTED_SYMBOLS: dict[str, str] = {
@@ -778,17 +778,34 @@ def _update_stats_with_record(record: dict[str, Any], tv: dict[str, Any]) -> Non
     _LAST_CHAIN_STATE[symbol] = state
 
     if not record.get("signal_match"):
+        mismatch_timeframes: dict[str, Any] = {}
+        for tf in TF_ORDER:
+            tf_result = best["timeframes"][tf]
+            conds = tf_result.get("condition_matches") or {}
+            tf_match = bool(conds) and all(bool(value) for value in conds.values())
+            if not tf_match:
+                mismatch_timeframes[tf] = {
+                    "tradingview": tf_result.get("tradingview"),
+                    "server": tf_result.get("server"),
+                    "server_minus_tv": tf_result.get("server_minus_tv"),
+                    "condition_matches": conds,
+                    "borderline": bool(tf_result.get("borderline")),
+                }
         _record_event({
             "event": "MISMATCH",
             "received_at_utc": received,
             "pine_minute_close_utc": record["pine_minute_close_utc"],
             "symbol": symbol,
             "display_name": SUPPORTED_SYMBOLS[symbol],
+            "tradingview_price": record.get("tradingview_price"),
+            "server_price_1m": record.get("server_price_1m"),
+            "server_minus_tv_price_bps": record.get("server_minus_tv_price_bps"),
             "tv_buy": tv_buy,
             "server_buy": best["server_buy"],
             "tv_sell": tv_sell,
             "server_sell": best["server_sell"],
             "mean_abs_indicator_diff": record.get("mean_abs_indicator_diff"),
+            "mismatch_timeframes": mismatch_timeframes,
         })
 
 
@@ -1020,7 +1037,7 @@ def comparison_latest(symbol: str | None = None) -> dict[str, Any]:
 
 def comparison_events(symbol: str | None = None, limit: int = 100) -> dict[str, Any]:
     normalized = _normalize_symbol(symbol) if symbol else None
-    limit = max(1, min(int(limit), 500))
+    limit = max(1, min(int(limit), 1000))
     with _COMPARE_LOCK:
         events = list(_RECENT_EVENTS)
     if normalized:

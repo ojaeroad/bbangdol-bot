@@ -1,3 +1,4 @@
+# V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
 # V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
@@ -180,7 +181,7 @@ def server_engine_health():
         workers = 3
     return jsonify({
         "ok": True,
-        "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
+        "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
         "symbol_count": len(symbols),
         "symbols": symbols,
         "signal_timeframes": timeframes,
@@ -208,7 +209,7 @@ def server_engine_phase1_btc():
         log.exception("Server signal engine BTC manual evaluate failed")
         return jsonify({
             "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
             "delivery_enabled": False,
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
@@ -246,14 +247,14 @@ def server_engine_compare_tradingview():
     except ValueError as exc:
         return jsonify({
             "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
             "error": str(exc),
         }), 400
     except Exception as exc:
         log.exception("Server signal engine TradingView compare failed")
         return jsonify({
             "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
 
@@ -293,6 +294,73 @@ def server_engine_compare_events():
     except Exception as exc:
         log.exception("Server signal engine compare events failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+@app.get("/server-engine/compare/export.json")
+def server_engine_compare_export_json():
+    """Download a diagnostic bundle that can be attached directly to ChatGPT."""
+    try:
+        from server_signal_engine import comparison_summary, comparison_latest, comparison_events, supported_symbols
+        symbols = supported_symbols()
+        latest_by_symbol = {}
+        for symbol in symbols:
+            latest_by_symbol[symbol] = comparison_latest(symbol)
+        payload = {
+            "export_version": "V132_DIAGNOSTIC_EXPORT",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "summary": comparison_summary(),
+            "latest_by_symbol": latest_by_symbol,
+            "events": comparison_events(limit=500),
+            "note": "MISMATCH events include mismatching timeframe indicator/condition details from V132 onward.",
+        }
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return Response(
+            text,
+            mimetype="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="tajum_coin9_compare_{stamp}.json"'},
+        )
+    except Exception as exc:
+        log.exception("Server signal engine JSON export failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+@app.get("/server-engine/compare/events.csv")
+def server_engine_compare_events_csv():
+    """Download recent state-change/mismatch/error events as a spreadsheet-friendly CSV."""
+    try:
+        from server_signal_engine import comparison_events
+        rows = comparison_events(limit=500).get("events") or []
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "event", "symbol", "display_name", "pine_minute_close_utc", "received_at_utc",
+            "tv_buy_tf", "server_buy_tf", "tv_sell_tf", "server_sell_tf",
+            "signal_match", "mean_abs_indicator_diff", "mismatch_timeframes", "error",
+        ])
+        for row in rows:
+            tv_buy = row.get("tv_buy") or {}
+            sv_buy = row.get("server_buy") or {}
+            tv_sell = row.get("tv_sell") or {}
+            sv_sell = row.get("server_sell") or {}
+            mismatch_tfs = row.get("mismatch_timeframes") or {}
+            writer.writerow([
+                row.get("event", ""), row.get("symbol", ""), row.get("display_name", ""),
+                row.get("pine_minute_close_utc", ""), row.get("received_at_utc", ""),
+                tv_buy.get("max_timeframe") or "", sv_buy.get("max_timeframe") or "",
+                tv_sell.get("max_timeframe") or "", sv_sell.get("max_timeframe") or "",
+                row.get("signal_match", ""), row.get("mean_abs_indicator_diff", ""),
+                ";".join(sorted(mismatch_tfs.keys())), row.get("error", ""),
+            ])
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv; charset=utf-8-sig",
+            headers={"Content-Disposition": f'attachment; filename="tajum_coin9_events_{stamp}.csv"'},
+        )
+    except Exception as exc:
+        log.exception("Server signal engine CSV export failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
 
 @app.get("/server-engine/compare/dashboard")
 def server_engine_compare_dashboard():
@@ -347,7 +415,7 @@ h1{font-size:24px;margin:0 0 6px}.sub{color:#9aa3b2;margin-bottom:18px}.cards{di
 table{width:100%;border-collapse:collapse;background:#171b22;margin:0 0 18px}th,td{padding:9px 10px;border-bottom:1px solid #29303b;text-align:right;font-size:13px}th{color:#aeb7c6;background:#1d222b;position:sticky;top:0}th:first-child,td:first-child{text-align:left}.ok{color:#5fe08b}.warn{color:#ffd166}.bad{color:#ff6b6b}.muted{color:#8f98a8}.section{font-size:18px;margin:20px 0 8px}.event{background:#171b22;border:1px solid #29303b;border-radius:10px;padding:10px 12px;margin:6px 0;font-size:13px}.event b{margin-right:8px}a{color:#8ab4ff}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}table{display:block;overflow:auto}}
 </style></head><body><div class="wrap">
-<h1>🧪 타점온 COIN9 서버엔진 검증 V130</h1>
+<h1>🧪 타점온 COIN9 서버엔진 검증 V132</h1>
 <div class="sub">1분마다 TradingView ↔ Binance 재구성 비교 · 자동 60초 새로고침 · 2h* = 내부 체인 전용</div>
 <div class="cards">
 <div class="card"><div class="k">활성 종목</div><div class="v">{{s.active_symbol_count}} / {{s.configured_symbol_count}}</div></div>
@@ -367,7 +435,7 @@ table{width:100%;border-collapse:collapse;background:#171b22;margin:0 0 18px}th,
 </tbody></table>
 <div class="section">최근 신호 변화 / 불일치 / 오류</div>
 {% if events %}{% for e in events %}<div class="event"><b>{{e.event}}</b> {{e.symbol}} [{{e.display_name}}] · {{e.pine_minute_close_utc or e.received_at_utc}}{% if e.error %} · <span class="bad">{{e.error}}</span>{% endif %}{% if e.tv_buy %} · BUY TV={{e.tv_buy.max_timeframe or '-'}} / SV={{(e.server_buy or {}).get('max_timeframe') or '-'}} · SELL TV={{e.tv_sell.max_timeframe or '-'}} / SV={{(e.server_sell or {}).get('max_timeframe') or '-' }}{% endif %}</div>{% endfor %}{% else %}<div class="event muted">아직 기록할 신호 상태변화·불일치·오류가 없습니다.</div>{% endif %}
-<div class="sub">JSON: <a href="/server-engine/compare/summary">summary</a> · <a href="/server-engine/compare/latest">latest</a> · <a href="/server-engine/compare/events">events</a></div>
+<div class="sub">다운로드: <a href="/server-engine/compare/export.json">전체 진단 JSON</a> · <a href="/server-engine/compare/events.csv">이벤트 CSV</a> &nbsp; | &nbsp; JSON 보기: <a href="/server-engine/compare/summary">summary</a> · <a href="/server-engine/compare/latest">latest</a> · <a href="/server-engine/compare/events">events</a></div>
 </div></body></html>''', s=summary, symbol_rows=symbol_rows, tf_rows=tf_rows, events=events, pct=pct)
     except Exception as exc:
         log.exception("Server signal engine compare dashboard failed")
@@ -2030,6 +2098,33 @@ _APP_COIN_KO_NAMES = {
 }
 
 
+# Tajum On 미장 사용자 표기용 영문 종목명.
+# 내부 심볼/TradingView 라우팅은 변경하지 않고 회원 노출(display/FCM body)에만 사용한다.
+_APP_US_EN_NAMES = {
+    "NVDA": "NVIDIA",
+    "AAPL": "APPLE",
+    "GOOG": "GOOGLE",
+    "GOOGL": "GOOGLE",
+    "MSFT": "MICROSOFT",
+    "AMZN": "AMAZON",
+    "AVGO": "BROADCOM",
+    "META": "META",
+    "TSLA": "TESLA",
+    "AMD": "AMD",
+    "COST": "COSTCO",
+    "NFLX": "NETFLIX",
+    "PLTR": "PALANTIR",
+    "ADBE": "ADOBE",
+    "CSCO": "CISCO",
+    "PEP": "PEPSICO",
+    "INTC": "INTEL",
+    "MU": "MICRON",
+    "QCOM": "QUALCOMM",
+    "AMAT": "APPLIED MATERIALS",
+    "LRCX": "LAM RESEARCH",
+}
+
+
 def _coin_base_symbol(symbol: str, exchange: str = "") -> str:
     code = _clean_symbol_code(symbol).upper()
     if str(exchange or "").upper() == "UPBIT" and "-" in code:
@@ -2056,6 +2151,7 @@ def _app_display_label(symbol: str, name: str = "", market: str = "", exchange: 
         clean_name = clean_name or KRX_SYMBOL_NAMES.get(code, "")
         return " ".join(part for part in (code, clean_name, "(국장)") if part)
     if market_u == "US":
+        clean_name = clean_name or _APP_US_EN_NAMES.get(code, "")
         return " ".join(part for part in (code, clean_name, "(미장)") if part)
     return " ".join(part for part in (code, clean_name) if part)
 
@@ -2070,8 +2166,8 @@ def _app_market_category(market: str, exchange: str = "", symbol: str = "") -> t
         return "US", "미장"
     if market_u == "COIN":
         if exchange_u == "UPBIT" or code.startswith(("KRW-", "BTC-", "USDT-")):
-            return "COIN_KR", "코인 국내"
-        return "COIN_GLOBAL", "코인 해외"
+            return "COIN_KR", "코인 KRW"
+        return "COIN_GLOBAL", "코인 USDT"
     return "OTHER", "기타"
 
 
@@ -2816,6 +2912,29 @@ def app_recent_alerts():
         else:
             split_side_label = "분할매수" if direction == "LOW" else "분할매도"
             row["alert_label"] = f"{emoji_by_stage[stage]} {split_side_label} {stage}차 타점"
+
+        # v132: 과거 저장 이력도 현재 사용자 표기 규칙으로 다시 정규화한다.
+        # 예: MSFT (미장) -> MSFT MICROSOFT (미장)
+        hist_symbol = _clean_symbol_code(row.get("symbol", ""))
+        hist_exchange = str(row.get("exchange", "") or "").upper()
+        hist_market = str(row.get("market", "") or "").upper() or _app_symbol_market(
+            hist_symbol, hist_exchange, hist_exchange
+        )
+        if hist_market == "KOREA":
+            hist_name = KRX_SYMBOL_NAMES.get(hist_symbol, "")
+        elif hist_exchange == "UPBIT":
+            hist_name = _upbit_name_for_pair(hist_symbol)
+        elif hist_market == "COIN":
+            hist_name = _APP_COIN_KO_NAMES.get(_coin_base_symbol(hist_symbol, hist_exchange), "")
+        elif hist_market == "US":
+            hist_name = _APP_US_EN_NAMES.get(hist_symbol, "")
+        else:
+            hist_name = ""
+        if hist_symbol:
+            row["display"] = _app_display_label(hist_symbol, hist_name, hist_market, hist_exchange)
+            category_key, category_label = _app_market_category(hist_market, hist_exchange, hist_symbol)
+            row["category_key"] = category_key
+            row["category_label"] = category_label
         normalized_alerts.append(row)
     alerts = normalized_alerts
 
