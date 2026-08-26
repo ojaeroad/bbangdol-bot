@@ -1,4 +1,4 @@
-# V129_BTC_ALL_TF_TV_AUTO_COMPARE: BTCUSDT 별꽃 전체 체인 TF 자동 비교 (전송/성과DB 영향 없음)
+# V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
 # V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
 # V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
 # V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
@@ -142,49 +142,87 @@ def version():
 def whoami():
     return jsonify({"service": SERVICE_NAME})
 
-# === V129 서버형 타점 계산기: BTC 전체 TF TradingView ↔ Binance 자동 비교 ===
-# 중요: 기존 TradingView 회원알림 / Telegram / FCM / 성과DB 흐름과 분리되어 있다.
-# 비교 결과는 메모리에만 보관하며, 검증 완료 전 회원용 알림으로 절대 전송하지 않는다.
+# === V130 서버형 타점 계산기: 코인 9종목 전체 TF TradingView ↔ Binance 자동 비교 ===
+# 중요: 기존 TradingView 회원알림 / Telegram / FCM / 성과DB 흐름과 완전히 분리되어 있다.
+# V130은 종목별 누적 통계 + 최신 상세 + 신호변화/불일치 이벤트만 메모리에 보관한다.
+# 검증 완료 전 회원용 알림으로 절대 전송하지 않는다.
 @app.get("/server-engine/health")
 def server_engine_health():
     try:
-        from server_signal_engine import compare_key_configured, comparison_retention_limit
+        from server_signal_engine import (
+            compare_key_configured,
+            comparison_retention_limit,
+            comparison_storage_mode,
+            supported_symbols,
+            TF_ORDER,
+            INTERNAL_ONLY_TFS,
+            COMPARE_WORKERS,
+        )
         key_configured = compare_key_configured()
         retention_limit = comparison_retention_limit()
+        storage_mode = comparison_storage_mode()
+        symbols = supported_symbols()
+        timeframes = list(TF_ORDER)
+        internal_tfs = list(INTERNAL_ONLY_TFS)
+        workers = COMPARE_WORKERS
     except Exception:
         key_configured = False
-        retention_limit = 2000
+        retention_limit = 1000
+        storage_mode = "unknown"
+        symbols = {
+            "BTCUSDT": "Bitcoin", "ETHUSDT": "Ethereum", "SOLUSDT": "SOL",
+            "SUIUSDT": "SUI", "LINKUSDT": "ChainLink", "XRPUSDT": "XRP",
+            "DOGEUSDT": "Dogecoin", "ADAUSDT": "Cardano", "ONDOUSDT": "ONDO",
+        }
+        timeframes = ["1w", "1d", "12h", "6h", "4h", "2h", "1h", "30m", "15m", "5m"]
+        internal_tfs = ["2h"]
+        workers = 3
     return jsonify({
         "ok": True,
-        "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
-        "symbol": "BTCUSDT",
-        "signal_timeframes": ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"],
+        "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
+        "symbol_count": len(symbols),
+        "symbols": symbols,
+        "signal_timeframes": timeframes,
         "comparison_basis": "TradingView minute_close + Binance finalized lower-TF reconstruction for all 별꽃 chain TFs",
         "delivery_enabled": False,
         "telegram_enabled": False,
         "fcm_enabled": False,
         "database_write_enabled": False,
         "compare_key_configured": key_configured,
-        "comparison_retention_limit": retention_limit,
-        "full_engine_internal_chain_timeframe": "2h",
+        "event_retention_limit": retention_limit,
+        "storage_mode": storage_mode,
+        "compare_workers": workers,
+        "internal_chain_timeframes": internal_tfs,
         "delivery_mode": "COMPARE_ONLY_NO_TELEGRAM_NO_FCM_NO_DB",
     })
 
+# V129 주소 호환 유지: BTC 수동 계산 확인용.
 @app.get("/server-engine/phase1/btc")
 def server_engine_phase1_btc():
     try:
-        # lazy import: 엔진 파일에 문제가 생겨도 기존 서버 시작/알람 흐름은 보호한다.
         from server_signal_engine import evaluate_phase1_btc
         result = evaluate_phase1_btc()
         return jsonify(result), (200 if result.get("ok") else 502)
     except Exception as exc:
-        log.exception("Server signal engine BTC phase1 failed")
+        log.exception("Server signal engine BTC manual evaluate failed")
         return jsonify({
             "ok": False,
-            "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
             "delivery_enabled": False,
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
+
+@app.get("/server-engine/evaluate/<symbol>")
+def server_engine_evaluate_symbol(symbol):
+    try:
+        from server_signal_engine import evaluate_symbol
+        result = evaluate_symbol(symbol)
+        return jsonify(result), (200 if result.get("ok") else 502)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        log.exception("Server signal engine symbol evaluate failed: %s", symbol)
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 @app.post("/server-engine/compare/tradingview")
 def server_engine_compare_tradingview():
@@ -193,8 +231,6 @@ def server_engine_compare_tradingview():
 
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
-            # TradingView normally sends application/json when alert() emits valid JSON.
-            # Keep a small fallback for proxies that pass it as text/plain.
             raw = (request.get_data(as_text=True) or "").strip()
             payload = json.loads(raw) if raw else None
         if not isinstance(payload, dict):
@@ -209,14 +245,14 @@ def server_engine_compare_tradingview():
     except ValueError as exc:
         return jsonify({
             "ok": False,
-            "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
             "error": str(exc),
         }), 400
     except Exception as exc:
         log.exception("Server signal engine TradingView compare failed")
         return jsonify({
             "ok": False,
-            "phase": "BTC_ALL_TF_TV_AUTO_COMPARE_V129",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V130",
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
 
@@ -224,7 +260,10 @@ def server_engine_compare_tradingview():
 def server_engine_compare_latest():
     try:
         from server_signal_engine import comparison_latest
-        return jsonify(comparison_latest())
+        symbol = (request.args.get("symbol") or "").strip() or None
+        return jsonify(comparison_latest(symbol))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
         log.exception("Server signal engine latest compare failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
@@ -237,6 +276,101 @@ def server_engine_compare_summary():
     except Exception as exc:
         log.exception("Server signal engine compare summary failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+@app.get("/server-engine/compare/events")
+def server_engine_compare_events():
+    try:
+        from server_signal_engine import comparison_events
+        symbol = (request.args.get("symbol") or "").strip() or None
+        try:
+            limit = int(request.args.get("limit") or 100)
+        except Exception:
+            limit = 100
+        return jsonify(comparison_events(symbol=symbol, limit=limit))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        log.exception("Server signal engine compare events failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+@app.get("/server-engine/compare/dashboard")
+def server_engine_compare_dashboard():
+    try:
+        from server_signal_engine import comparison_summary, comparison_events
+        summary = comparison_summary()
+        events = comparison_events(limit=80).get("events") or []
+
+        def pct(v):
+            return "-" if v is None else f"{float(v):.3f}%"
+
+        def num(v, digits=5):
+            return "-" if v is None else f"{float(v):.{digits}f}"
+
+        symbol_rows = []
+        for symbol, row in (summary.get("per_symbol") or {}).items():
+            buy = row.get("latest_buy") or {}
+            sell = row.get("latest_sell") or {}
+            buy_txt = buy.get("max_timeframe") if buy.get("chain_ok") else "-"
+            sell_txt = sell.get("max_timeframe") if sell.get("chain_ok") else "-"
+            status = "✅" if row.get("sample_count", 0) > 0 and row.get("error_count", 0) == 0 else ("⚠" if row.get("error_count", 0) else "대기")
+            symbol_rows.append({
+                **row,
+                "status": status,
+                "buy_txt": buy_txt,
+                "sell_txt": sell_txt,
+                "signal_match_text": pct(row.get("signal_match_rate_pct")),
+                "condition_match_text": pct(row.get("condition_match_rate_pct")),
+                "diff_text": num(row.get("mean_abs_indicator_diff_avg"), 5),
+            })
+
+        tf_rows = []
+        for tf, row in (summary.get("per_timeframe") or {}).items():
+            tf_rows.append({
+                "tf": tf + ("*" if row.get("internal_chain_only") else ""),
+                "samples": row.get("samples", 0),
+                "condition_match_text": pct(row.get("condition_match_rate_pct")),
+                "condition_match_rate_pct": row.get("condition_match_rate_pct"),
+                "diff_text": num(row.get("mean_abs_indicator_diff_avg"), 5),
+                "borderline_hits": row.get("borderline_hits", 0),
+                "borderline_mismatch_hits": row.get("borderline_mismatch_hits", 0),
+            })
+
+        return render_template_string(r'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>타점온 서버엔진 COIN9 검증</title>
+<style>
+body{margin:0;background:#0f1115;color:#e8eaf0;font-family:Arial,"Noto Sans KR",sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px}
+h1{font-size:24px;margin:0 0 6px}.sub{color:#9aa3b2;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:18px}
+.card{background:#171b22;border:1px solid #29303b;border-radius:12px;padding:14px}.k{color:#9aa3b2;font-size:12px}.v{font-size:23px;font-weight:700;margin-top:5px}
+table{width:100%;border-collapse:collapse;background:#171b22;margin:0 0 18px}th,td{padding:9px 10px;border-bottom:1px solid #29303b;text-align:right;font-size:13px}th{color:#aeb7c6;background:#1d222b;position:sticky;top:0}th:first-child,td:first-child{text-align:left}.ok{color:#5fe08b}.warn{color:#ffd166}.bad{color:#ff6b6b}.muted{color:#8f98a8}.section{font-size:18px;margin:20px 0 8px}.event{background:#171b22;border:1px solid #29303b;border-radius:10px;padding:10px 12px;margin:6px 0;font-size:13px}.event b{margin-right:8px}a{color:#8ab4ff}
+@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}table{display:block;overflow:auto}}
+</style></head><body><div class="wrap">
+<h1>🧪 타점온 COIN9 서버엔진 검증 V130</h1>
+<div class="sub">1분마다 TradingView ↔ Binance 재구성 비교 · 자동 60초 새로고침 · 2h* = 내부 체인 전용</div>
+<div class="cards">
+<div class="card"><div class="k">활성 종목</div><div class="v">{{s.active_symbol_count}} / {{s.configured_symbol_count}}</div></div>
+<div class="card"><div class="k">전체 비교</div><div class="v">{{s.sample_count}}</div></div>
+<div class="card"><div class="k">최종 신호 일치</div><div class="v ok">{{pct(s.signal_match_rate_pct)}}</div></div>
+<div class="card"><div class="k">조건 일치</div><div class="v ok">{{pct(s.condition_match_rate_pct)}}</div></div>
+<div class="card"><div class="k">오류</div><div class="v {{'bad' if s.error_count else 'ok'}}">{{s.error_count}}</div></div>
+<div class="card"><div class="k">불일치</div><div class="v {{'bad' if s.mismatch_count else 'ok'}}">{{s.mismatch_count}}</div></div>
+</div>
+<div class="section">종목별 검증</div>
+<table><thead><tr><th>종목</th><th>상태</th><th>샘플</th><th>신호일치</th><th>조건일치</th><th>평균 지표오차</th><th>BUY 현재</th><th>SELL 현재</th><th>BUY 신호샘플</th><th>SELL 신호샘플</th><th>상태변화</th><th>오류</th></tr></thead><tbody>
+{% for r in symbol_rows %}<tr><td>🪙 {{r.symbol}} [{{r.display_name}}]</td><td>{{r.status}}</td><td>{{r.sample_count}}</td><td class="{{'ok' if r.signal_match_rate_pct == 100 else ('bad' if r.signal_match_rate_pct is not none else '')}}">{{r.signal_match_text}}</td><td>{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.buy_txt}}</td><td>{{r.sell_txt}}</td><td>{{r.buy_signal_sample_count}}</td><td>{{r.sell_signal_sample_count}}</td><td>{{r.signal_transition_count}}</td><td class="{{'bad' if r.error_count else 'ok'}}">{{r.error_count}}</td></tr>{% endfor %}
+</tbody></table>
+<div class="section">전체 시간봉별 검증</div>
+<table><thead><tr><th>TF</th><th>샘플</th><th>조건일치</th><th>평균 지표오차</th><th>임계값 근접</th><th>근접 불일치</th></tr></thead><tbody>
+{% for r in tf_rows %}<tr><td>{{r.tf}}</td><td>{{r.samples}}</td><td class="{{'ok' if r.condition_match_rate_pct == 100 else ('bad' if r.condition_match_rate_pct is not none else '')}}">{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.borderline_hits}}</td><td class="{{'bad' if r.borderline_mismatch_hits else 'ok'}}">{{r.borderline_mismatch_hits}}</td></tr>{% endfor %}
+</tbody></table>
+<div class="section">최근 신호 변화 / 불일치 / 오류</div>
+{% if events %}{% for e in events %}<div class="event"><b>{{e.event}}</b> {{e.symbol}} [{{e.display_name}}] · {{e.pine_minute_close_utc or e.received_at_utc}}{% if e.error %} · <span class="bad">{{e.error}}</span>{% endif %}{% if e.tv_buy %} · BUY TV={{e.tv_buy.max_timeframe or '-'}} / SV={{(e.server_buy or {}).get('max_timeframe') or '-'}} · SELL TV={{e.tv_sell.max_timeframe or '-'}} / SV={{(e.server_sell or {}).get('max_timeframe') or '-' }}{% endif %}</div>{% endfor %}{% else %}<div class="event muted">아직 기록할 신호 상태변화·불일치·오류가 없습니다.</div>{% endif %}
+<div class="sub">JSON: <a href="/server-engine/compare/summary">summary</a> · <a href="/server-engine/compare/latest">latest</a> · <a href="/server-engine/compare/events">events</a></div>
+</div></body></html>''', s=summary, symbol_rows=symbol_rows, tf_rows=tf_rows, events=events, pct=pct)
+    except Exception as exc:
+        log.exception("Server signal engine compare dashboard failed")
+        return f"dashboard error: {type(exc).__name__}: {exc}", 500
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60

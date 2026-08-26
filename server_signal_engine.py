@@ -1,11 +1,13 @@
-"""Tajum On server signal engine - V129 BTC all-timeframe TV/Binance comparator.
+"""Tajum On server signal engine - V130 COIN9 all-timeframe TV/Binance comparator.
 
 Safety / scope:
-- BTCUSDT only
 - comparison-only: no Telegram, no FCM, no performance DB writes
+- supported Binance spot symbols: BTC/ETH/SOL/SUI/LINK/XRP/DOGE/ADA/ONDO USDT
 - TradingView Pine parity test for 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w
 - 2h is an internal chain gate only; it is NOT a user-facing maximum alert timeframe
-- comparisons are aligned to Pine's exact 1-minute evaluation boundary
+- comparisons align to Pine's exact 1-minute evaluation boundary
+- V130 stores aggregate counters + latest full record per symbol + recent state-change/mismatch events.
+  It does NOT retain every full 1-minute JSON record, keeping 9-symbol memory use bounded.
 
 Pine reference: PINE_CODE_별꽃_v26_V98_상위추세태그
 Signal math:
@@ -25,6 +27,7 @@ import math
 import os
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -33,12 +36,25 @@ import requests
 BINANCE_SPOT_BASE_URL = os.getenv("BINANCE_SPOT_BASE_URL", "https://api.binance.com").rstrip("/")
 REQUEST_TIMEOUT_SEC = max(3, min(int(os.getenv("SERVER_ENGINE_HTTP_TIMEOUT_SEC", "10") or 10), 30))
 KLINE_LIMIT = max(100, min(int(os.getenv("SERVER_ENGINE_KLINE_LIMIT", "300") or 300), 1000))
-# 1 alert/minute -> 1440/day. 2000 keeps roughly 33 hours in memory.
-COMPARE_HISTORY_LIMIT = max(100, min(int(os.getenv("SERVER_ENGINE_COMPARE_HISTORY_LIMIT", "2000") or 2000), 5000))
 COMPARE_KEY = os.getenv("SERVER_ENGINE_COMPARE_KEY", "").strip()
+COMPARE_WORKERS = max(1, min(int(os.getenv("SERVER_ENGINE_COMPARE_WORKERS", "3") or 3), 6))
+EVENT_HISTORY_LIMIT = max(100, min(int(os.getenv("SERVER_ENGINE_EVENT_HISTORY_LIMIT", "1000") or 1000), 5000))
+BORDERLINE_EPSILON = max(0.01, min(float(os.getenv("SERVER_ENGINE_BORDERLINE_EPSILON", "0.25") or 0.25), 2.0))
 
-PHASE_SYMBOL = "BTCUSDT"
-PHASE_NAME = "BTC_ALL_TF_TV_AUTO_COMPARE_V129"
+PHASE_NAME = "COIN9_ALL_TF_TV_AUTO_COMPARE_V130"
+EVENT_TYPE = "SERVER_ENGINE_TV_COMPARE_V130"
+
+SUPPORTED_SYMBOLS: dict[str, str] = {
+    "BTCUSDT": "Bitcoin",
+    "ETHUSDT": "Ethereum",
+    "SOLUSDT": "SOL",
+    "SUIUSDT": "SUI",
+    "LINKUSDT": "ChainLink",
+    "XRPUSDT": "XRP",
+    "DOGEUSDT": "Dogecoin",
+    "ADAUSDT": "Cardano",
+    "ONDOUSDT": "ONDO",
+}
 
 # Same descending order as the operating 별꽃 Pine.
 TF_ORDER = ("1w", "1d", "12h", "6h", "4h", "2h", "1h", "30m", "15m", "5m")
@@ -76,7 +92,51 @@ K_OS = 20.0
 K_OB = 80.0
 
 _COMPARE_LOCK = threading.Lock()
-_COMPARE_RESULTS: deque[dict[str, Any]] = deque(maxlen=COMPARE_HISTORY_LIMIT)
+_COMPARE_EXECUTOR = ThreadPoolExecutor(max_workers=COMPARE_WORKERS, thread_name_prefix="coin9-tv-compare")
+_LATEST_BY_SYMBOL: dict[str, dict[str, Any]] = {}
+_LATEST_OVERALL: dict[str, Any] | None = None
+_RECENT_EVENTS: deque[dict[str, Any]] = deque(maxlen=EVENT_HISTORY_LIMIT)
+_LAST_CHAIN_STATE: dict[str, tuple[Any, ...]] = {}
+_PENDING_OR_SEEN: set[tuple[str, int]] = set()
+_SEEN_ORDER: deque[tuple[str, int]] = deque()
+_SEEN_LIMIT = 9 * 180  # ~3 hours of duplicate protection at 1/min for 9 symbols.
+
+
+def _new_tf_stats() -> dict[str, Any]:
+    return {
+        "samples": 0,
+        "condition_match_count": 0,
+        "indicator_abs_sum": 0.0,
+        "indicator_abs_count": 0,
+        "borderline_hits": 0,
+        "borderline_mismatch_hits": 0,
+    }
+
+
+def _new_symbol_stats() -> dict[str, Any]:
+    return {
+        "sample_count": 0,
+        "error_count": 0,
+        "signal_match_count": 0,
+        "condition_match_count": 0,
+        "buy_chain_match_count": 0,
+        "sell_chain_match_count": 0,
+        "indicator_abs_sum": 0.0,
+        "indicator_abs_count": 0,
+        "price_bps_abs_sum": 0.0,
+        "price_bps_count": 0,
+        "buy_signal_sample_count": 0,
+        "sell_signal_sample_count": 0,
+        "signal_transition_count": 0,
+        "mismatch_count": 0,
+        "first_received_at_utc": None,
+        "last_received_at_utc": None,
+        "latest_error": None,
+        "per_timeframe": {tf: _new_tf_stats() for tf in reversed(TF_ORDER)},
+    }
+
+
+_STATS_BY_SYMBOL: dict[str, dict[str, Any]] = {symbol: _new_symbol_stats() for symbol in SUPPORTED_SYMBOLS}
 
 
 def compare_key_configured() -> bool:
@@ -90,7 +150,23 @@ def compare_key_matches(value: str | None) -> bool:
 
 
 def comparison_retention_limit() -> int:
-    return COMPARE_HISTORY_LIMIT
+    # Kept for app.py backward compatibility. V130 retains events, not every minute's full record.
+    return EVENT_HISTORY_LIMIT
+
+
+def comparison_storage_mode() -> str:
+    return "aggregate_stats + latest_full_per_symbol + recent_signal/mismatch_events"
+
+
+def supported_symbols() -> dict[str, str]:
+    return dict(SUPPORTED_SYMBOLS)
+
+
+def _normalize_symbol(value: Any) -> str:
+    symbol = str(value or "").upper().replace("BINANCE:", "").strip()
+    if symbol not in SUPPORTED_SYMBOLS:
+        raise ValueError(f"unsupported symbol {symbol!r}; allowed={','.join(SUPPORTED_SYMBOLS)}")
+    return symbol
 
 
 def _safe_float(value: Any) -> float:
@@ -316,8 +392,6 @@ def _target_partial(
             evaluation_time_ms=evaluation_time_ms,
         )
 
-    # Build 1h exactly at the Pine boundary from finalized 1m bars, then use
-    # finalized prior 1h candles to aggregate 2h/4h/6h/12h/1d/1w cheaply.
     hour_open = _bucket_open_ms(evaluation_time_ms, 60)
     closed_prior_hours = [row for row in one_hour_rows if int(row["open_time"]) < hour_open]
     hour_partial = _current_hour_partial(one_minute_rows, evaluation_time_ms=evaluation_time_ms)
@@ -339,15 +413,19 @@ def _rows_at_evaluation(
 ) -> list[dict[str, float | int]]:
     tf_min = TF_MINUTES[timeframe]
     bucket_open = _bucket_open_ms(evaluation_time_ms, tf_min)
-    rows = _fetch_klines(
-        symbol,
-        timeframe,
-        limit=KLINE_LIMIT,
-        end_time_ms=int(evaluation_time_ms) - 1,
-    )
 
-    # Remove Binance's now-known version of the target bucket and replace it
-    # with the exact developing candle state that Pine saw at minute_close.
+    # 1h base was already fetched for partial reconstruction, so reuse it and
+    # avoid one duplicate Binance request per symbol/minute.
+    if timeframe == "1h":
+        rows = list(one_hour_rows)
+    else:
+        rows = _fetch_klines(
+            symbol,
+            timeframe,
+            limit=KLINE_LIMIT,
+            end_time_ms=int(evaluation_time_ms) - 1,
+        )
+
     rows = [row for row in rows if int(row["open_time"]) < bucket_open]
     partial = _target_partial(
         timeframe,
@@ -388,7 +466,13 @@ def _route_for_tf(timeframe: str, *, is_ob: bool) -> str:
     return ""
 
 
-def _chain_signal(metrics_by_tf: dict[str, dict[str, Any]], *, is_ob: bool, price: float) -> dict[str, Any]:
+def _chain_signal(
+    symbol: str,
+    metrics_by_tf: dict[str, dict[str, Any]],
+    *,
+    is_ob: bool,
+    price: float,
+) -> dict[str, Any]:
     key = "ob_basic" if is_ob else "os_basic"
     max_tf: str | None = None
 
@@ -403,7 +487,7 @@ def _chain_signal(metrics_by_tf: dict[str, dict[str, Any]], *, is_ob: bool, pric
         return {"chain_ok": False, "max_timeframe": None, "route": "", "message_preview": None}
 
     route = _route_for_tf(max_tf, is_ob=is_ob)
-    first_line = f"🪙 [BINANCE] {PHASE_SYMBOL} : {_pine_price_fmt(price)}"
+    first_line = f"🪙 [BINANCE] {symbol} : {_pine_price_fmt(price)}"
     msg = first_line + "\n\n" + _token(max_tf, metrics_by_tf[max_tf], is_ob)
     return {"chain_ok": True, "max_timeframe": max_tf, "route": route, "message_preview": msg}
 
@@ -413,30 +497,30 @@ def _latest_closed_minute_boundary_ms() -> int:
     return (now_ms // 60_000) * 60_000
 
 
-def _evaluate_btc_at(evaluation_time_ms: int) -> dict[str, Any]:
+def _evaluate_symbol_at(symbol: str, evaluation_time_ms: int) -> dict[str, Any]:
+    symbol = _normalize_symbol(symbol)
     if evaluation_time_ms <= 0:
         raise ValueError("evaluation_time_ms must be positive")
 
-    # 70 finalized 1m bars are enough to rebuild the developing current hour.
+    # 70 finalized 1m bars rebuild the developing current hour exactly.
     one_minute_rows = _fetch_klines(
-        PHASE_SYMBOL,
+        symbol,
         "1m",
         limit=70,
         end_time_ms=int(evaluation_time_ms) - 1,
     )
-    # Up to one week needs only 168 hourly bars.  200 gives margin.
+    # 300 1h candles give ample history for building developing HTF partials.
     one_hour_rows = _fetch_klines(
-        PHASE_SYMBOL,
+        symbol,
         "1h",
-        limit=200,
+        limit=KLINE_LIMIT,
         end_time_ms=int(evaluation_time_ms) - 1,
     )
 
     metrics_by_tf: dict[str, dict[str, Any]] = {}
-    # calculate every Pine chain TF; order here is only for readable output
     for tf in reversed(TF_ORDER):  # 5m -> ... -> 1w
         rows = _rows_at_evaluation(
-            PHASE_SYMBOL,
+            symbol,
             tf,
             evaluation_time_ms=evaluation_time_ms,
             one_minute_rows=one_minute_rows,
@@ -450,14 +534,15 @@ def _evaluate_btc_at(evaluation_time_ms: int) -> dict[str, Any]:
         "evaluation_time_utc": datetime.fromtimestamp(evaluation_time_ms / 1000, tz=timezone.utc).isoformat(),
         "comparison_price_1m": price_1m,
         "timeframes": metrics_by_tf,
-        "buy": _chain_signal(metrics_by_tf, is_ob=False, price=price_1m),
-        "sell": _chain_signal(metrics_by_tf, is_ob=True, price=price_1m),
+        "buy": _chain_signal(symbol, metrics_by_tf, is_ob=False, price=price_1m),
+        "sell": _chain_signal(symbol, metrics_by_tf, is_ob=True, price=price_1m),
     }
 
 
-def evaluate_phase1_btc() -> dict[str, Any]:
+def evaluate_symbol(symbol: str) -> dict[str, Any]:
+    symbol = _normalize_symbol(symbol)
     evaluation_time_ms = _latest_closed_minute_boundary_ms()
-    core = _evaluate_btc_at(evaluation_time_ms)
+    core = _evaluate_symbol_at(symbol, evaluation_time_ms)
     return {
         "ok": True,
         "phase": PHASE_NAME,
@@ -465,7 +550,8 @@ def evaluate_phase1_btc() -> dict[str, Any]:
         "telegram_enabled": False,
         "fcm_enabled": False,
         "database_write_enabled": False,
-        "symbol": PHASE_SYMBOL,
+        "symbol": symbol,
+        "display_name": SUPPORTED_SYMBOLS[symbol],
         "market_source": "BINANCE_SPOT_REST_RECONSTRUCTED_AT_TV_1M_BOUNDARY",
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
         **core,
@@ -488,6 +574,11 @@ def evaluate_phase1_btc() -> dict[str, Any]:
     }
 
 
+def evaluate_phase1_btc() -> dict[str, Any]:
+    """Backward-compatible endpoint helper retained from V129."""
+    return evaluate_symbol("BTCUSDT")
+
+
 def _normalize_tv_tf(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("timeframe payload must be an object")
@@ -508,8 +599,21 @@ def _numeric_diff(tv: float | None, server: float | None) -> float | None:
     return float(server) - float(tv)
 
 
-def _compare_candidate(tv: dict[str, Any], *, evaluation_time_ms: int) -> dict[str, Any]:
-    server = _evaluate_btc_at(evaluation_time_ms)
+def _is_borderline(tv_tf: dict[str, Any]) -> bool:
+    values_and_thresholds = (
+        (tv_tf.get("rsi14"), RSI_OS),
+        (tv_tf.get("rsi14"), RSI_OB),
+        (tv_tf.get("stoch_5_3_k"), K_OS),
+        (tv_tf.get("stoch_5_3_k"), K_OB),
+    )
+    for value, threshold in values_and_thresholds:
+        if value is not None and abs(float(value) - threshold) <= BORDERLINE_EPSILON:
+            return True
+    return False
+
+
+def _compare_candidate(symbol: str, tv: dict[str, Any], *, evaluation_time_ms: int) -> dict[str, Any]:
+    server = _evaluate_symbol_at(symbol, evaluation_time_ms)
     tf_result: dict[str, Any] = {}
     error_score = 0.0
     numeric_count = 0
@@ -550,6 +654,7 @@ def _compare_candidate(tv: dict[str, Any], *, evaluation_time_ms: int) -> dict[s
             },
             "server_minus_tv": diffs,
             "condition_matches": condition_matches,
+            "borderline": _is_borderline(tv_tf),
         }
 
     buy_match = (
@@ -576,28 +681,132 @@ def _compare_candidate(tv: dict[str, Any], *, evaluation_time_ms: int) -> dict[s
     }
 
 
-def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-    """Compare one V129 TradingView snapshot at the exact Pine minute_close.
+def _normalize_signal(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    max_tf = raw.get("max_timeframe")
+    allowed = set(MAX_CANDIDATES) | {None, ""}
+    if max_tf not in allowed or max_tf == "":
+        max_tf = None
+    return {"chain_ok": bool(raw.get("chain_ok")), "max_timeframe": max_tf}
 
-    V128 proved 0ms alignment on every initial sample, so V129 removes the
-    diagnostic -60s duplicate calculation. This keeps all 10 TF tests practical.
-    """
+
+def _remember_seen(key: tuple[str, int]) -> None:
+    _PENDING_OR_SEEN.add(key)
+    _SEEN_ORDER.append(key)
+    while len(_SEEN_ORDER) > _SEEN_LIMIT:
+        old = _SEEN_ORDER.popleft()
+        _PENDING_OR_SEEN.discard(old)
+
+
+def _record_event(event: dict[str, Any]) -> None:
+    _RECENT_EVENTS.append(event)
+
+
+def _update_stats_with_record(record: dict[str, Any], tv: dict[str, Any]) -> None:
+    global _LATEST_OVERALL
+    symbol = record["symbol"]
+    stats = _STATS_BY_SYMBOL[symbol]
+    received = record["received_at_utc"]
+
+    stats["sample_count"] += 1
+    stats["signal_match_count"] += int(bool(record.get("signal_match")))
+    stats["condition_match_count"] += int(bool(record.get("condition_match")))
+    stats["buy_chain_match_count"] += int(bool(record.get("buy_chain_match")))
+    stats["sell_chain_match_count"] += int(bool(record.get("sell_chain_match")))
+    stats["mismatch_count"] += int(not bool(record.get("signal_match")))
+    stats["first_received_at_utc"] = stats["first_received_at_utc"] or received
+    stats["last_received_at_utc"] = received
+    stats["latest_error"] = None
+
+    mean_diff = record.get("mean_abs_indicator_diff")
+    if mean_diff is not None:
+        # Keep the true underlying indicator sum/count via per-timeframe diffs below.
+        pass
+    price_bps = record.get("server_minus_tv_price_bps")
+    if price_bps is not None:
+        stats["price_bps_abs_sum"] += abs(float(price_bps))
+        stats["price_bps_count"] += 1
+
+    tv_buy = tv["buy"]
+    tv_sell = tv["sell"]
+    stats["buy_signal_sample_count"] += int(bool(tv_buy["chain_ok"]))
+    stats["sell_signal_sample_count"] += int(bool(tv_sell["chain_ok"]))
+
+    best = record["best"]
+    for tf in reversed(TF_ORDER):
+        tf_result = best["timeframes"][tf]
+        tf_stats = stats["per_timeframe"][tf]
+        tf_stats["samples"] += 1
+        conds = tf_result["condition_matches"]
+        tf_match = bool(conds) and all(bool(v) for v in conds.values())
+        tf_stats["condition_match_count"] += int(tf_match)
+        if tf_result.get("borderline"):
+            tf_stats["borderline_hits"] += 1
+            if not tf_match:
+                tf_stats["borderline_mismatch_hits"] += 1
+        for diff in tf_result["server_minus_tv"].values():
+            if diff is not None:
+                val = abs(float(diff))
+                tf_stats["indicator_abs_sum"] += val
+                tf_stats["indicator_abs_count"] += 1
+                stats["indicator_abs_sum"] += val
+                stats["indicator_abs_count"] += 1
+
+    _LATEST_BY_SYMBOL[symbol] = record
+    _LATEST_OVERALL = record
+
+    state = (
+        bool(tv_buy["chain_ok"]), tv_buy.get("max_timeframe"),
+        bool(tv_sell["chain_ok"]), tv_sell.get("max_timeframe"),
+    )
+    previous = _LAST_CHAIN_STATE.get(symbol)
+    if previous is not None and state != previous:
+        stats["signal_transition_count"] += 1
+        _record_event({
+            "event": "SIGNAL_STATE_CHANGE",
+            "received_at_utc": received,
+            "pine_minute_close_utc": record["pine_minute_close_utc"],
+            "symbol": symbol,
+            "display_name": SUPPORTED_SYMBOLS[symbol],
+            "tv_buy": tv_buy,
+            "server_buy": best["server_buy"],
+            "tv_sell": tv_sell,
+            "server_sell": best["server_sell"],
+            "signal_match": record["signal_match"],
+        })
+    _LAST_CHAIN_STATE[symbol] = state
+
+    if not record.get("signal_match"):
+        _record_event({
+            "event": "MISMATCH",
+            "received_at_utc": received,
+            "pine_minute_close_utc": record["pine_minute_close_utc"],
+            "symbol": symbol,
+            "display_name": SUPPORTED_SYMBOLS[symbol],
+            "tv_buy": tv_buy,
+            "server_buy": best["server_buy"],
+            "tv_sell": tv_sell,
+            "server_sell": best["server_sell"],
+            "mean_abs_indicator_diff": record.get("mean_abs_indicator_diff"),
+        })
+
+
+def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("JSON object required")
-    if str(payload.get("event_type") or "") != "SERVER_ENGINE_TV_COMPARE_V129":
+    if str(payload.get("event_type") or "") != EVENT_TYPE:
         raise ValueError("unexpected event_type")
 
-    symbol = str(payload.get("symbol") or "").upper().replace("BINANCE:", "")
-    if symbol != PHASE_SYMBOL:
-        raise ValueError(f"V129 accepts only {PHASE_SYMBOL}, got {symbol!r}")
-
+    symbol = _normalize_symbol(payload.get("symbol"))
     minute_close = int(payload.get("minute_close") or 0)
     if minute_close <= 0:
         raise ValueError("minute_close is required")
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    if abs(now_ms - minute_close) > 6 * 60 * 60 * 1000:
-        raise ValueError("minute_close must be within 6 hours of server time")
+    # Queued work on a small free instance can arrive later when 9 alerts fire together.
+    if abs(now_ms - minute_close) > 12 * 60 * 60 * 1000:
+        raise ValueError("minute_close must be within 12 hours of server time")
 
     raw_tfs = payload.get("timeframes")
     if not isinstance(raw_tfs, dict):
@@ -606,25 +815,14 @@ def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if missing:
         raise ValueError(f"missing timeframe payloads: {', '.join(missing)}")
 
-    def norm_signal(raw: Any) -> dict[str, Any]:
-        if not isinstance(raw, dict):
-            raw = {}
-        max_tf = raw.get("max_timeframe")
-        allowed = set(MAX_CANDIDATES) | {None, ""}
-        if max_tf not in allowed:
-            max_tf = None
-        if max_tf == "":
-            max_tf = None
-        return {"chain_ok": bool(raw.get("chain_ok")), "max_timeframe": max_tf}
-
     tv = {
         "tv_price": _optional_float(payload.get("tv_price")),
         "timeframes": {tf: _normalize_tv_tf(raw_tfs[tf]) for tf in TF_ORDER},
-        "buy": norm_signal(payload.get("buy")),
-        "sell": norm_signal(payload.get("sell")),
+        "buy": _normalize_signal(payload.get("buy")),
+        "sell": _normalize_signal(payload.get("sell")),
     }
 
-    best = _compare_candidate(tv, evaluation_time_ms=minute_close)
+    best = _compare_candidate(symbol, tv, evaluation_time_ms=minute_close)
     tv_price = tv["tv_price"]
     server_price = best["server_price_1m"]
     price_diff = _numeric_diff(tv_price, server_price)
@@ -636,7 +834,8 @@ def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "ok": True,
         "phase": PHASE_NAME,
         "received_at_utc": datetime.now(timezone.utc).isoformat(),
-        "symbol": PHASE_SYMBOL,
+        "symbol": symbol,
+        "display_name": SUPPORTED_SYMBOLS[symbol],
         "pine_minute_close_ms": minute_close,
         "pine_minute_close_utc": datetime.fromtimestamp(minute_close / 1000, tz=timezone.utc).isoformat(),
         "pine_chart_time_ms": int(payload.get("chart_time") or 0) or None,
@@ -660,21 +859,67 @@ def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
     with _COMPARE_LOCK:
-        _COMPARE_RESULTS.append(record)
+        _update_stats_with_record(record, tv)
     return record
+
+
+def _record_error(symbol: str, minute_close: int, exc: Exception) -> None:
+    global _LATEST_OVERALL
+    received = datetime.now(timezone.utc).isoformat()
+    error_record = {
+        "ok": False,
+        "phase": PHASE_NAME,
+        "received_at_utc": received,
+        "symbol": symbol,
+        "display_name": SUPPORTED_SYMBOLS.get(symbol, symbol),
+        "pine_minute_close_ms": minute_close,
+        "pine_minute_close_utc": datetime.fromtimestamp(minute_close / 1000, tz=timezone.utc).isoformat() if minute_close else None,
+        "error": f"{type(exc).__name__}: {exc}",
+        "delivery_enabled": False,
+        "database_write_enabled": False,
+    }
+    with _COMPARE_LOCK:
+        if symbol in _STATS_BY_SYMBOL:
+            stats = _STATS_BY_SYMBOL[symbol]
+            stats["error_count"] += 1
+            stats["last_received_at_utc"] = received
+            stats["first_received_at_utc"] = stats["first_received_at_utc"] or received
+            stats["latest_error"] = error_record["error"]
+            _LATEST_BY_SYMBOL[symbol] = error_record
+        _LATEST_OVERALL = error_record
+        _record_event({
+            "event": "ERROR",
+            "received_at_utc": received,
+            "symbol": symbol,
+            "display_name": SUPPORTED_SYMBOLS.get(symbol, symbol),
+            "pine_minute_close_utc": error_record["pine_minute_close_utc"],
+            "error": error_record["error"],
+        })
 
 
 def enqueue_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("JSON object required")
-    if str(payload.get("event_type") or "") != "SERVER_ENGINE_TV_COMPARE_V129":
+    if str(payload.get("event_type") or "") != EVENT_TYPE:
         raise ValueError("unexpected event_type")
-    symbol = str(payload.get("symbol") or "").upper().replace("BINANCE:", "")
-    if symbol != PHASE_SYMBOL:
-        raise ValueError(f"V129 accepts only {PHASE_SYMBOL}, got {symbol!r}")
+    symbol = _normalize_symbol(payload.get("symbol"))
     minute_close = int(payload.get("minute_close") or 0)
     if minute_close <= 0:
         raise ValueError("minute_close is required")
+
+    key = (symbol, minute_close)
+    with _COMPARE_LOCK:
+        if key in _PENDING_OR_SEEN:
+            return {
+                "ok": True,
+                "accepted": False,
+                "duplicate": True,
+                "phase": PHASE_NAME,
+                "symbol": symbol,
+                "pine_minute_close_ms": minute_close,
+                "processing": "already_pending_or_processed",
+            }
+        _remember_seen(key)
 
     snapshot = dict(payload)
 
@@ -682,128 +927,178 @@ def enqueue_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             compare_tradingview_snapshot(snapshot)
         except Exception as exc:
-            error_record = {
-                "ok": False,
-                "phase": PHASE_NAME,
-                "received_at_utc": datetime.now(timezone.utc).isoformat(),
-                "symbol": PHASE_SYMBOL,
-                "pine_minute_close_ms": minute_close,
-                "error": f"{type(exc).__name__}: {exc}",
-                "delivery_enabled": False,
-                "database_write_enabled": False,
-            }
-            with _COMPARE_LOCK:
-                _COMPARE_RESULTS.append(error_record)
+            _record_error(symbol, minute_close, exc)
 
-    threading.Thread(
-        target=worker,
-        name="tv-server-engine-compare-v129",
-        daemon=True,
-    ).start()
+    _COMPARE_EXECUTOR.submit(worker)
     return {
         "ok": True,
         "accepted": True,
         "phase": PHASE_NAME,
-        "symbol": PHASE_SYMBOL,
+        "symbol": symbol,
+        "display_name": SUPPORTED_SYMBOLS[symbol],
         "pine_minute_close_ms": minute_close,
-        "processing": "background",
+        "processing": f"queued_background_pool_{COMPARE_WORKERS}_workers",
         "timeframes": list(TF_ORDER),
         "delivery_enabled": False,
         "database_write_enabled": False,
     }
 
 
-def comparison_latest() -> dict[str, Any]:
+def _pct(count: int, total: int) -> float | None:
+    return (count / total * 100.0) if total else None
+
+
+def _avg(total: float, count: int) -> float | None:
+    return (total / count) if count else None
+
+
+def _symbol_summary(symbol: str, stats: dict[str, Any]) -> dict[str, Any]:
+    samples = int(stats["sample_count"])
+    per_tf: dict[str, Any] = {}
+    for tf in reversed(TF_ORDER):
+        tfs = stats["per_timeframe"][tf]
+        tf_samples = int(tfs["samples"])
+        per_tf[tf] = {
+            "samples": tf_samples,
+            "condition_match_rate_pct": _pct(int(tfs["condition_match_count"]), tf_samples),
+            "mean_abs_indicator_diff_avg": _avg(float(tfs["indicator_abs_sum"]), int(tfs["indicator_abs_count"])),
+            "borderline_hits": int(tfs["borderline_hits"]),
+            "borderline_mismatch_hits": int(tfs["borderline_mismatch_hits"]),
+            "internal_chain_only": tf in INTERNAL_ONLY_TFS,
+        }
+    latest = _LATEST_BY_SYMBOL.get(symbol) or {}
+    latest_best = latest.get("best") or {}
+    return {
+        "symbol": symbol,
+        "display_name": SUPPORTED_SYMBOLS[symbol],
+        "sample_count": samples,
+        "error_count": int(stats["error_count"]),
+        "signal_match_rate_pct": _pct(int(stats["signal_match_count"]), samples),
+        "condition_match_rate_pct": _pct(int(stats["condition_match_count"]), samples),
+        "buy_chain_match_rate_pct": _pct(int(stats["buy_chain_match_count"]), samples),
+        "sell_chain_match_rate_pct": _pct(int(stats["sell_chain_match_count"]), samples),
+        "mean_abs_indicator_diff_avg": _avg(float(stats["indicator_abs_sum"]), int(stats["indicator_abs_count"])),
+        "abs_price_diff_bps_avg": _avg(float(stats["price_bps_abs_sum"]), int(stats["price_bps_count"])),
+        "buy_signal_sample_count": int(stats["buy_signal_sample_count"]),
+        "sell_signal_sample_count": int(stats["sell_signal_sample_count"]),
+        "signal_transition_count": int(stats["signal_transition_count"]),
+        "mismatch_count": int(stats["mismatch_count"]),
+        "first_received_at_utc": stats["first_received_at_utc"],
+        "last_received_at_utc": stats["last_received_at_utc"],
+        "latest_error": stats["latest_error"],
+        "latest_signal_match": latest.get("signal_match"),
+        "latest_buy": latest_best.get("server_buy"),
+        "latest_sell": latest_best.get("server_sell"),
+        "latest_price": latest.get("server_price_1m"),
+        "per_timeframe": per_tf,
+    }
+
+
+def comparison_latest(symbol: str | None = None) -> dict[str, Any]:
     with _COMPARE_LOCK:
-        if not _COMPARE_RESULTS:
+        if symbol:
+            normalized = _normalize_symbol(symbol)
+            row = _LATEST_BY_SYMBOL.get(normalized)
+            if row is None:
+                return {
+                    "ok": True,
+                    "phase": PHASE_NAME,
+                    "symbol": normalized,
+                    "sample_count": 0,
+                    "message": "No V130 comparison received for this symbol since this Render process started.",
+                }
+            return dict(row)
+        if _LATEST_OVERALL is None:
             return {
                 "ok": True,
                 "phase": PHASE_NAME,
                 "sample_count": 0,
-                "message": "No V129 TradingView comparison webhook received since this Render process started.",
+                "message": "No V130 TradingView comparison webhook received since this Render process started.",
             }
-        return dict(_COMPARE_RESULTS[-1])
+        return dict(_LATEST_OVERALL)
+
+
+def comparison_events(symbol: str | None = None, limit: int = 100) -> dict[str, Any]:
+    normalized = _normalize_symbol(symbol) if symbol else None
+    limit = max(1, min(int(limit), 500))
+    with _COMPARE_LOCK:
+        events = list(_RECENT_EVENTS)
+    if normalized:
+        events = [event for event in events if event.get("symbol") == normalized]
+    events = events[-limit:]
+    return {
+        "ok": True,
+        "phase": PHASE_NAME,
+        "symbol": normalized,
+        "count": len(events),
+        "events": list(reversed(events)),
+        "event_history_limit": EVENT_HISTORY_LIMIT,
+    }
 
 
 def comparison_summary() -> dict[str, Any]:
     with _COMPARE_LOCK:
-        rows = list(_COMPARE_RESULTS)
+        symbol_stats = {symbol: _symbol_summary(symbol, stats) for symbol, stats in _STATS_BY_SYMBOL.items()}
+        events = list(_RECENT_EVENTS)
 
-    total_records = len(rows)
-    valid_rows = [row for row in rows if "signal_match" in row]
-    error_rows = [row for row in rows if not row.get("ok", False)]
-    count = len(valid_rows)
+    active = [row for row in symbol_stats.values() if row["sample_count"] > 0 or row["error_count"] > 0]
+    total_samples = sum(int(row["sample_count"]) for row in symbol_stats.values())
+    total_errors = sum(int(row["error_count"]) for row in symbol_stats.values())
+    total_signal_match = sum(int(_STATS_BY_SYMBOL[s]["signal_match_count"]) for s in SUPPORTED_SYMBOLS)
+    total_condition_match = sum(int(_STATS_BY_SYMBOL[s]["condition_match_count"]) for s in SUPPORTED_SYMBOLS)
+    total_buy_match = sum(int(_STATS_BY_SYMBOL[s]["buy_chain_match_count"]) for s in SUPPORTED_SYMBOLS)
+    total_sell_match = sum(int(_STATS_BY_SYMBOL[s]["sell_chain_match_count"]) for s in SUPPORTED_SYMBOLS)
+    indicator_sum = sum(float(_STATS_BY_SYMBOL[s]["indicator_abs_sum"]) for s in SUPPORTED_SYMBOLS)
+    indicator_count = sum(int(_STATS_BY_SYMBOL[s]["indicator_abs_count"]) for s in SUPPORTED_SYMBOLS)
+    price_sum = sum(float(_STATS_BY_SYMBOL[s]["price_bps_abs_sum"]) for s in SUPPORTED_SYMBOLS)
+    price_count = sum(int(_STATS_BY_SYMBOL[s]["price_bps_count"]) for s in SUPPORTED_SYMBOLS)
 
-    if not rows:
-        return {
-            "ok": True,
-            "phase": PHASE_NAME,
-            "sample_count": 0,
-            "error_count": 0,
-            "signal_match_rate_pct": None,
-            "per_timeframe": {},
-            "database_write_enabled": False,
-            "retention_limit": COMPARE_HISTORY_LIMIT,
-        }
-
-    signal_matches = sum(1 for row in valid_rows if row.get("signal_match"))
-    condition_matches = sum(1 for row in valid_rows if row.get("condition_match"))
-    buy_matches = sum(1 for row in valid_rows if row.get("buy_chain_match"))
-    sell_matches = sum(1 for row in valid_rows if row.get("sell_chain_match"))
-    diffs: list[float] = []
-    price_bps: list[float] = []
-
-    per_tf: dict[str, dict[str, Any]] = {}
+    aggregate_tf: dict[str, Any] = {}
     for tf in reversed(TF_ORDER):
-        tf_samples = 0
-        tf_condition_match = 0
-        tf_numeric_diffs: list[float] = []
-        for row in valid_rows:
-            tf_row = (((row.get("best") or {}).get("timeframes") or {}).get(tf))
-            if not isinstance(tf_row, dict):
-                continue
-            tf_samples += 1
-            conds = tf_row.get("condition_matches") or {}
-            if conds and all(bool(v) for v in conds.values()):
-                tf_condition_match += 1
-            for value in (tf_row.get("server_minus_tv") or {}).values():
-                if value is not None:
-                    tf_numeric_diffs.append(abs(float(value)))
-        per_tf[tf] = {
-            "samples": tf_samples,
-            "condition_match_rate_pct": (tf_condition_match / tf_samples * 100.0) if tf_samples else None,
-            "mean_abs_indicator_diff_avg": (sum(tf_numeric_diffs) / len(tf_numeric_diffs)) if tf_numeric_diffs else None,
+        samples = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["samples"]) for s in SUPPORTED_SYMBOLS)
+        matches = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["condition_match_count"]) for s in SUPPORTED_SYMBOLS)
+        diff_sum = sum(float(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["indicator_abs_sum"]) for s in SUPPORTED_SYMBOLS)
+        diff_count = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["indicator_abs_count"]) for s in SUPPORTED_SYMBOLS)
+        borderline = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["borderline_hits"]) for s in SUPPORTED_SYMBOLS)
+        borderline_mismatch = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["borderline_mismatch_hits"]) for s in SUPPORTED_SYMBOLS)
+        aggregate_tf[tf] = {
+            "samples": samples,
+            "condition_match_rate_pct": _pct(matches, samples),
+            "mean_abs_indicator_diff_avg": _avg(diff_sum, diff_count),
+            "borderline_hits": borderline,
+            "borderline_mismatch_hits": borderline_mismatch,
             "internal_chain_only": tf in INTERNAL_ONLY_TFS,
         }
 
-    for row in valid_rows:
-        if row.get("mean_abs_indicator_diff") is not None:
-            diffs.append(float(row["mean_abs_indicator_diff"]))
-        if row.get("server_minus_tv_price_bps") is not None:
-            price_bps.append(abs(float(row["server_minus_tv_price_bps"])))
-
-    first_received = rows[0].get("received_at_utc") if rows else None
-    last_received = rows[-1].get("received_at_utc") if rows else None
+    first_times = [row["first_received_at_utc"] for row in active if row.get("first_received_at_utc")]
+    last_times = [row["last_received_at_utc"] for row in active if row.get("last_received_at_utc")]
     return {
         "ok": True,
         "phase": PHASE_NAME,
-        "total_record_count": total_records,
-        "sample_count": count,
-        "error_count": len(error_rows),
-        "signal_match_count": signal_matches,
-        "signal_match_rate_pct": (signal_matches / count * 100.0) if count else None,
-        "condition_match_rate_pct": (condition_matches / count * 100.0) if count else None,
-        "buy_chain_match_rate_pct": (buy_matches / count * 100.0) if count else None,
-        "sell_chain_match_rate_pct": (sell_matches / count * 100.0) if count else None,
-        "alignment_offset_counts": {"0": count},
-        "mean_abs_indicator_diff_avg": (sum(diffs) / len(diffs)) if diffs else None,
-        "abs_price_diff_bps_avg": (sum(price_bps) / len(price_bps)) if price_bps else None,
-        "per_timeframe": per_tf,
-        "first_received_at_utc": first_received,
-        "last_received_at_utc": last_received,
-        "latest_signal_match": valid_rows[-1].get("signal_match") if valid_rows else None,
-        "latest_error": error_rows[-1].get("error") if error_rows else None,
+        "configured_symbol_count": len(SUPPORTED_SYMBOLS),
+        "active_symbol_count": len(active),
+        "configured_symbols": SUPPORTED_SYMBOLS,
+        "sample_count": total_samples,
+        "error_count": total_errors,
+        "signal_match_count": total_signal_match,
+        "signal_match_rate_pct": _pct(total_signal_match, total_samples),
+        "condition_match_rate_pct": _pct(total_condition_match, total_samples),
+        "buy_chain_match_rate_pct": _pct(total_buy_match, total_samples),
+        "sell_chain_match_rate_pct": _pct(total_sell_match, total_samples),
+        "alignment_offset_counts": {"0": total_samples},
+        "mean_abs_indicator_diff_avg": _avg(indicator_sum, indicator_count),
+        "abs_price_diff_bps_avg": _avg(price_sum, price_count),
+        "per_symbol": symbol_stats,
+        "per_timeframe": aggregate_tf,
+        "first_received_at_utc": min(first_times) if first_times else None,
+        "last_received_at_utc": max(last_times) if last_times else None,
+        "recent_event_count": len(events),
+        "signal_transition_count": sum(int(_STATS_BY_SYMBOL[s]["signal_transition_count"]) for s in SUPPORTED_SYMBOLS),
+        "mismatch_count": sum(int(_STATS_BY_SYMBOL[s]["mismatch_count"]) for s in SUPPORTED_SYMBOLS),
         "database_write_enabled": False,
-        "retention_limit": COMPARE_HISTORY_LIMIT,
-        "retention_note": f"in-memory only, max {COMPARE_HISTORY_LIMIT}; about 33h at 1/min; resets on Render restart/redeploy",
+        "delivery_enabled": False,
+        "compare_workers": COMPARE_WORKERS,
+        "borderline_epsilon": BORDERLINE_EPSILON,
+        "storage_mode": comparison_storage_mode(),
+        "retention_note": "aggregate counters persist until Render restart/redeploy; only latest full record per symbol and recent events are retained in memory",
     }
