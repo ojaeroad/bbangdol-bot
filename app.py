@@ -1,3 +1,4 @@
+# V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
 # V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
 # V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
@@ -605,7 +606,7 @@ def _buy_valid_stage_emoji(ordinal: int) -> str:
 
 def _sell_valid_stage_emoji(ordinal: int) -> str:
     # v84 고정 규칙: 매도도 매수와 동일한 유효 단계 이모지를 사용한다.
-    # 집중은 ✍🏻 단독(카운터 제외), 이후 ❗ 1/3 → ‼️ 2/3 → 🚨 3/3.
+    # 집중은 ✍🏻 단독, 이후 ❗ 분할 1차 → ‼️ 분할 2차 → 🚨 분할 3차 타점.
     return _buy_valid_stage_emoji(ordinal)
 
 def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
@@ -613,10 +614,10 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     labels = {
         # v82: 집중은 관찰 시작이므로 매수/매도 모두 카운터를 붙이지 않는다.
         "FOCUS": "✍🏻 매수 집중",
-        "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 매수 유효 {ordinal}/3",
+        "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 분할매수 {ordinal}차 타점",
         "EXIT": "✍🏻 매도 집중",
-        "EXIT_RECHECK": f"{_sell_valid_stage_emoji(ordinal)} 매도 유효 {ordinal}/3",
-        "EXIT_FINAL": f"{_sell_valid_stage_emoji(ordinal)} 매도 유효 {ordinal}/3",
+        "EXIT_RECHECK": f"{_sell_valid_stage_emoji(ordinal)} 분할매도 {ordinal}차 타점",
+        "EXIT_FINAL": f"{_sell_valid_stage_emoji(ordinal)} 분할매도 {ordinal}차 타점",
     }
     phase_label = labels.get(phase, "")
 
@@ -632,12 +633,14 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
                 " · 🟣 매수 유효 1/3", " · 🟣🟣 매수 유효 2/3", " · 🟣🟣🟣 매수 유효 3/3",
                 " · ⚡ 매수 유효 1/3", " · ⚡⚡ 매수 유효 2/3", " · ⚡⚡⚡ 매수 유효 3/3",
                 " · ❗ 매수 유효 1/3", " · ‼️ 매수 유효 2/3", " · 🏹 매수 유효 3/3",
+                " · ❗ 분할매수 1차 타점", " · ‼️ 분할매수 2차 타점", " · 🚨 분할매수 3차 타점",
                 " · 💸 매도 집중", " · 💸 매도 집중 1/3",
                 " · 🎯 매도 집중", " · 🎯 매도 집중 1/3",
                 " · ✍🏻 매도 집중", " · ✍🏻 매도 집중 1/3",
                 " · ✅ 매도 유효 1/3", " · ✅ 매도 유효 2/3", " · ✅ 매도 유효 3/3",
                 " · ⚠️ 매도 유효 1/3", " · ⚠️ 매도 유효 2/3", " · ⚠️ 매도 유효 3/3",
                 " · 🚨 매도 유효 1/3", " · 🚨 매도 유효 2/3", " · 🚨 매도 유효 3/3",
+                " · ❗ 분할매도 1차 타점", " · ‼️ 분할매도 2차 타점", " · 🚨 분할매도 3차 타점",
             ):
                 normalized = normalized.replace(old_label, "")
             lines[i] = f"{normalized}\n{phase_label}"
@@ -2479,7 +2482,11 @@ def app_symbol_detail():
         direction = str(row.get("direction", "")).upper()
         stage = int(row.get("stage", 0) or 0)
         side_label = "매수" if direction == "LOW" else "매도"
-        alert_label = f"✍🏻 {side_label} 집중" if stage <= 0 else f"{emoji_by_stage.get(stage, '❗')} {side_label} 유효 {stage}/3"
+        if stage <= 0:
+            alert_label = f"✍🏻 {side_label} 집중"
+        else:
+            split_side_label = "분할매수" if direction == "LOW" else "분할매도"
+            alert_label = f"{emoji_by_stage.get(stage, '❗')} {split_side_label} {stage}차 타점"
         enriched = dict(row)
         market_value = item.get("market") or _app_symbol_market(item["symbol"])
         group_key, group_label = _app_timeframe_group(market_value, row.get("timeframe", ""))
@@ -2794,6 +2801,23 @@ def app_recent_alerts():
     except Exception:
         log.exception("TajumOn delivered push history lookup failed device=%s", device_id[:16])
         return jsonify({"ok": False, "error": "alert_lookup_failed"}), 500
+
+    # v131: 회원 노출 문구는 저장 당시의 레거시 1/3 표기와 무관하게
+    # 현재 확정된 "분할매수/분할매도 N차 타점"으로 통일한다.
+    normalized_alerts = []
+    emoji_by_stage = {1: "❗", 2: "‼️", 3: "🚨"}
+    for item in alerts:
+        row = dict(item)
+        direction = str(row.get("direction", "") or "").upper()
+        stage = max(0, min(int(row.get("stage", 0) or 0), 3))
+        side_label = "매수" if direction == "LOW" else "매도"
+        if stage <= 0:
+            row["alert_label"] = f"✍🏻 {side_label} 집중"
+        else:
+            split_side_label = "분할매수" if direction == "LOW" else "분할매도"
+            row["alert_label"] = f"{emoji_by_stage[stage]} {split_side_label} {stage}차 타점"
+        normalized_alerts.append(row)
+    alerts = normalized_alerts
 
     return jsonify({
         "ok": True,
@@ -7187,7 +7211,8 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         alert_label = f"✍🏻 {side_label} 집중"
     else:
         emoji = {1: "❗", 2: "‼️", 3: "🚨"}[stage]
-        alert_label = f"{emoji} {side_label} 유효 {stage}/3"
+        split_side_label = "분할매수" if direction == "LOW" else "분할매도"
+        alert_label = f"{emoji} {split_side_label} {stage}차 타점"
 
     price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
     price_text = price_match.group(1) if price_match else ""
