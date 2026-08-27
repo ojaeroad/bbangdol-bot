@@ -1,4 +1,4 @@
-"""Tajum On server signal engine - V132 COIN9 diagnostic comparator/export support.
+"""Tajum On server signal engine - V133 COIN9 TradingView OHLC diagnostic comparator.
 
 Safety / scope:
 - comparison-only: no Telegram, no FCM, no performance DB writes
@@ -6,8 +6,8 @@ Safety / scope:
 - TradingView Pine parity test for 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w
 - 2h is an internal chain gate only; it is NOT a user-facing maximum alert timeframe
 - comparisons align to Pine's exact 1-minute evaluation boundary
-- V130 stores aggregate counters + latest full record per symbol + recent state-change/mismatch events.
-  It does NOT retain every full 1-minute JSON record, keeping 9-symbol memory use bounded.
+- V133 stores aggregate counters + latest full record per symbol + recent state-change/mismatch events.
+  MISMATCH events also retain TradingView/server TF OHLC diagnostics. It still does NOT retain every full 1-minute record.
 
 Pine reference: PINE_CODE_별꽃_v26_V98_상위추세태그
 Signal math:
@@ -41,8 +41,10 @@ COMPARE_WORKERS = max(1, min(int(os.getenv("SERVER_ENGINE_COMPARE_WORKERS", "3")
 EVENT_HISTORY_LIMIT = max(100, min(int(os.getenv("SERVER_ENGINE_EVENT_HISTORY_LIMIT", "1000") or 1000), 5000))
 BORDERLINE_EPSILON = max(0.01, min(float(os.getenv("SERVER_ENGINE_BORDERLINE_EPSILON", "0.25") or 0.25), 2.0))
 
-PHASE_NAME = "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT"
-EVENT_TYPE = "SERVER_ENGINE_TV_COMPARE_V130"
+PHASE_NAME = "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC"
+EVENT_TYPE = "SERVER_ENGINE_TV_COMPARE_V133"
+LEGACY_EVENT_TYPES = frozenset(("SERVER_ENGINE_TV_COMPARE_V130",))
+PINE_PAYLOAD_VERSION = "V133_TF_OHLC"
 
 SUPPORTED_SYMBOLS: dict[str, str] = {
     "BTCUSDT": "Bitcoin",
@@ -110,6 +112,14 @@ def _new_tf_stats() -> dict[str, Any]:
         "indicator_abs_count": 0,
         "borderline_hits": 0,
         "borderline_mismatch_hits": 0,
+        # V133: TradingView HTF OHLC diagnostics. These counters are only
+        # incremented when the Pine payload actually contains TF OHLC values.
+        "tv_ohlc_samples": 0,
+        "ohlc_match_count": 0,
+        "condition_mismatch_ohlc_same": 0,
+        "condition_mismatch_ohlc_diff": 0,
+        "ohlc_max_abs_bps_sum": 0.0,
+        "ohlc_max_abs_bps_count": 0,
     }
 
 
@@ -150,16 +160,21 @@ def compare_key_matches(value: str | None) -> bool:
 
 
 def comparison_retention_limit() -> int:
-    # Kept for app.py backward compatibility. V130 retains events, not every minute's full record.
+    # Kept for app.py backward compatibility. V133 retains events, not every minute's full record.
     return EVENT_HISTORY_LIMIT
 
 
 def comparison_storage_mode() -> str:
-    return "aggregate_stats + latest_full_per_symbol + recent_signal/mismatch_events"
+    return "aggregate_stats + latest_full_per_symbol + mismatch_events_with_TV_and_server_OHLC"
 
 
 def supported_symbols() -> dict[str, str]:
     return dict(SUPPORTED_SYMBOLS)
+
+
+def _event_type_matches(value: Any) -> bool:
+    event_type = str(value or "").strip()
+    return event_type == EVENT_TYPE or event_type in LEGACY_EVENT_TYPES
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -582,6 +597,9 @@ def evaluate_phase1_btc() -> dict[str, Any]:
 def _normalize_tv_tf(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("timeframe payload must be an object")
+
+    # V133 Pine uses compact o/h/l/c keys to keep the dynamic alert payload
+    # comfortably small. Long-form keys are also accepted for diagnostics.
     return {
         "rsi14": _optional_float(raw.get("rsi14")),
         "stoch_5_3_k": _optional_float(raw.get("stoch_5_3_k")),
@@ -590,6 +608,10 @@ def _normalize_tv_tf(raw: Any) -> dict[str, Any]:
         "ob_basic": bool(raw.get("ob_basic")),
         "os_all": bool(raw.get("os_all")),
         "ob_all": bool(raw.get("ob_all")),
+        "open": _optional_float(raw.get("o") if "o" in raw else raw.get("open")),
+        "high": _optional_float(raw.get("h") if "h" in raw else raw.get("high")),
+        "low": _optional_float(raw.get("l") if "l" in raw else raw.get("low")),
+        "close": _optional_float(raw.get("c") if "c" in raw else raw.get("close")),
     }
 
 
@@ -599,12 +621,55 @@ def _numeric_diff(tv: float | None, server: float | None) -> float | None:
     return float(server) - float(tv)
 
 
+def _tv_ohlc_available(tv_tf: dict[str, Any]) -> bool:
+    return all(tv_tf.get(field) is not None for field in ("open", "high", "low", "close"))
+
+
+def _ohlc_close_enough(tv_value: float, server_value: float) -> bool:
+    # Ignore only binary floating-point representation noise. A real market-tick
+    # difference must remain visible for root-cause diagnosis.
+    tol = max(1e-12, abs(float(tv_value)) * 1e-11)
+    return abs(float(server_value) - float(tv_value)) <= tol
+
+
+def _ohlc_diagnostic(tv_tf: dict[str, Any], sv_tf: dict[str, Any]) -> dict[str, Any]:
+    if not _tv_ohlc_available(tv_tf):
+        return {
+            "available": False,
+            "match": None,
+            "tradingview": None,
+            "server": {k: sv_tf.get(k) for k in ("open", "high", "low", "close")},
+            "server_minus_tv": None,
+            "max_abs_diff": None,
+            "max_abs_diff_bps": None,
+        }
+
+    tv_ohlc = {k: float(tv_tf[k]) for k in ("open", "high", "low", "close")}
+    sv_ohlc = {k: float(sv_tf[k]) for k in ("open", "high", "low", "close")}
+    diffs = {k: sv_ohlc[k] - tv_ohlc[k] for k in tv_ohlc}
+    match = all(_ohlc_close_enough(tv_ohlc[k], sv_ohlc[k]) for k in tv_ohlc)
+    max_abs = max(abs(v) for v in diffs.values())
+    close_ref = abs(tv_ohlc["close"])
+    max_bps = (max_abs / close_ref * 10_000.0) if close_ref > 0 else None
+    return {
+        "available": True,
+        "match": bool(match),
+        "tradingview": tv_ohlc,
+        "server": sv_ohlc,
+        "server_minus_tv": diffs,
+        "max_abs_diff": max_abs,
+        "max_abs_diff_bps": max_bps,
+    }
+
+
 def _is_borderline(tv_tf: dict[str, Any]) -> bool:
     values_and_thresholds = (
         (tv_tf.get("rsi14"), RSI_OS),
         (tv_tf.get("rsi14"), RSI_OB),
         (tv_tf.get("stoch_5_3_k"), K_OS),
         (tv_tf.get("stoch_5_3_k"), K_OB),
+        (tv_tf.get("stoch_20_12_k"), K_OS),
+        (tv_tf.get("stoch_20_12_k"), K_OB),
     )
     for value, threshold in values_and_thresholds:
         if value is not None and abs(float(value) - threshold) <= BORDERLINE_EPSILON:
@@ -637,6 +702,7 @@ def _compare_candidate(symbol: str, tv: dict[str, Any], *, evaluation_time_ms: i
         if not all(condition_matches.values()):
             condition_match = False
 
+        ohlc_diag = _ohlc_diagnostic(tv_tf, sv_tf)
         tf_result[tf] = {
             "tradingview": tv_tf,
             "server": {
@@ -655,6 +721,7 @@ def _compare_candidate(symbol: str, tv: dict[str, Any], *, evaluation_time_ms: i
             "server_minus_tv": diffs,
             "condition_matches": condition_matches,
             "borderline": _is_borderline(tv_tf),
+            "ohlc_diagnostic": ohlc_diag,
         }
 
     buy_match = (
@@ -745,6 +812,21 @@ def _update_stats_with_record(record: dict[str, Any], tv: dict[str, Any]) -> Non
             tf_stats["borderline_hits"] += 1
             if not tf_match:
                 tf_stats["borderline_mismatch_hits"] += 1
+
+        ohlc_diag = tf_result.get("ohlc_diagnostic") or {}
+        if ohlc_diag.get("available"):
+            tf_stats["tv_ohlc_samples"] += 1
+            tf_stats["ohlc_match_count"] += int(bool(ohlc_diag.get("match")))
+            max_bps = ohlc_diag.get("max_abs_diff_bps")
+            if max_bps is not None:
+                tf_stats["ohlc_max_abs_bps_sum"] += abs(float(max_bps))
+                tf_stats["ohlc_max_abs_bps_count"] += 1
+            if not tf_match:
+                if ohlc_diag.get("match"):
+                    tf_stats["condition_mismatch_ohlc_same"] += 1
+                else:
+                    tf_stats["condition_mismatch_ohlc_diff"] += 1
+
         for diff in tf_result["server_minus_tv"].values():
             if diff is not None:
                 val = abs(float(diff))
@@ -790,7 +872,25 @@ def _update_stats_with_record(record: dict[str, Any], tv: dict[str, Any]) -> Non
                     "server_minus_tv": tf_result.get("server_minus_tv"),
                     "condition_matches": conds,
                     "borderline": bool(tf_result.get("borderline")),
+                    "ohlc_diagnostic": tf_result.get("ohlc_diagnostic"),
                 }
+
+        ohlc_states = [
+            (detail.get("ohlc_diagnostic") or {}).get("match")
+            for detail in mismatch_timeframes.values()
+            if (detail.get("ohlc_diagnostic") or {}).get("available")
+        ]
+        if not mismatch_timeframes:
+            root_cause_hint = "CHAIN_MISMATCH_WITH_TF_CONDITIONS_MATCHED"
+        elif not ohlc_states:
+            root_cause_hint = "TV_OHLC_NOT_AVAILABLE"
+        elif all(state is True for state in ohlc_states):
+            root_cause_hint = "SAME_OHLC_CHECK_INDICATOR_HISTORY_OR_CALC"
+        elif all(state is False for state in ohlc_states):
+            root_cause_hint = "TV_SERVER_OHLC_DIFFERENCE"
+        else:
+            root_cause_hint = "MIXED_OHLC_DIFFERENCE"
+
         _record_event({
             "event": "MISMATCH",
             "received_at_utc": received,
@@ -805,6 +905,8 @@ def _update_stats_with_record(record: dict[str, Any], tv: dict[str, Any]) -> Non
             "tv_sell": tv_sell,
             "server_sell": best["server_sell"],
             "mean_abs_indicator_diff": record.get("mean_abs_indicator_diff"),
+            "payload_version": record.get("payload_version"),
+            "root_cause_hint": root_cause_hint,
             "mismatch_timeframes": mismatch_timeframes,
         })
 
@@ -812,7 +914,7 @@ def _update_stats_with_record(record: dict[str, Any], tv: dict[str, Any]) -> Non
 def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("JSON object required")
-    if str(payload.get("event_type") or "") != EVENT_TYPE:
+    if not _event_type_matches(payload.get("event_type")):
         raise ValueError("unexpected event_type")
 
     symbol = _normalize_symbol(payload.get("symbol"))
@@ -853,6 +955,7 @@ def compare_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "received_at_utc": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
         "display_name": SUPPORTED_SYMBOLS[symbol],
+        "payload_version": str(payload.get("payload_version") or "V130_NO_TF_OHLC"),
         "pine_minute_close_ms": minute_close,
         "pine_minute_close_utc": datetime.fromtimestamp(minute_close / 1000, tz=timezone.utc).isoformat(),
         "pine_chart_time_ms": int(payload.get("chart_time") or 0) or None,
@@ -917,7 +1020,7 @@ def _record_error(symbol: str, minute_close: int, exc: Exception) -> None:
 def enqueue_tradingview_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("JSON object required")
-    if str(payload.get("event_type") or "") != EVENT_TYPE:
+    if not _event_type_matches(payload.get("event_type")):
         raise ValueError("unexpected event_type")
     symbol = _normalize_symbol(payload.get("symbol"))
     minute_close = int(payload.get("minute_close") or 0)
@@ -975,12 +1078,18 @@ def _symbol_summary(symbol: str, stats: dict[str, Any]) -> dict[str, Any]:
     for tf in reversed(TF_ORDER):
         tfs = stats["per_timeframe"][tf]
         tf_samples = int(tfs["samples"])
+        tv_ohlc_samples = int(tfs["tv_ohlc_samples"])
         per_tf[tf] = {
             "samples": tf_samples,
             "condition_match_rate_pct": _pct(int(tfs["condition_match_count"]), tf_samples),
             "mean_abs_indicator_diff_avg": _avg(float(tfs["indicator_abs_sum"]), int(tfs["indicator_abs_count"])),
             "borderline_hits": int(tfs["borderline_hits"]),
             "borderline_mismatch_hits": int(tfs["borderline_mismatch_hits"]),
+            "tv_ohlc_samples": tv_ohlc_samples,
+            "ohlc_match_rate_pct": _pct(int(tfs["ohlc_match_count"]), tv_ohlc_samples),
+            "condition_mismatch_ohlc_same": int(tfs["condition_mismatch_ohlc_same"]),
+            "condition_mismatch_ohlc_diff": int(tfs["condition_mismatch_ohlc_diff"]),
+            "ohlc_max_abs_diff_bps_avg": _avg(float(tfs["ohlc_max_abs_bps_sum"]), int(tfs["ohlc_max_abs_bps_count"])),
             "internal_chain_only": tf in INTERNAL_ONLY_TFS,
         }
     latest = _LATEST_BY_SYMBOL.get(symbol) or {}
@@ -1022,7 +1131,7 @@ def comparison_latest(symbol: str | None = None) -> dict[str, Any]:
                     "phase": PHASE_NAME,
                     "symbol": normalized,
                     "sample_count": 0,
-                    "message": "No V130 comparison received for this symbol since this Render process started.",
+                    "message": "No V133 comparison received for this symbol since this Render process started.",
                 }
             return dict(row)
         if _LATEST_OVERALL is None:
@@ -1030,7 +1139,7 @@ def comparison_latest(symbol: str | None = None) -> dict[str, Any]:
                 "ok": True,
                 "phase": PHASE_NAME,
                 "sample_count": 0,
-                "message": "No V130 TradingView comparison webhook received since this Render process started.",
+                "message": "No V133 TradingView comparison webhook received since this Render process started.",
             }
         return dict(_LATEST_OVERALL)
 
@@ -1078,12 +1187,23 @@ def comparison_summary() -> dict[str, Any]:
         diff_count = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["indicator_abs_count"]) for s in SUPPORTED_SYMBOLS)
         borderline = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["borderline_hits"]) for s in SUPPORTED_SYMBOLS)
         borderline_mismatch = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["borderline_mismatch_hits"]) for s in SUPPORTED_SYMBOLS)
+        tv_ohlc_samples = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["tv_ohlc_samples"]) for s in SUPPORTED_SYMBOLS)
+        ohlc_matches = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["ohlc_match_count"]) for s in SUPPORTED_SYMBOLS)
+        mismatch_ohlc_same = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["condition_mismatch_ohlc_same"]) for s in SUPPORTED_SYMBOLS)
+        mismatch_ohlc_diff = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["condition_mismatch_ohlc_diff"]) for s in SUPPORTED_SYMBOLS)
+        ohlc_bps_sum = sum(float(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["ohlc_max_abs_bps_sum"]) for s in SUPPORTED_SYMBOLS)
+        ohlc_bps_count = sum(int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["ohlc_max_abs_bps_count"]) for s in SUPPORTED_SYMBOLS)
         aggregate_tf[tf] = {
             "samples": samples,
             "condition_match_rate_pct": _pct(matches, samples),
             "mean_abs_indicator_diff_avg": _avg(diff_sum, diff_count),
             "borderline_hits": borderline,
             "borderline_mismatch_hits": borderline_mismatch,
+            "tv_ohlc_samples": tv_ohlc_samples,
+            "ohlc_match_rate_pct": _pct(ohlc_matches, tv_ohlc_samples),
+            "condition_mismatch_ohlc_same": mismatch_ohlc_same,
+            "condition_mismatch_ohlc_diff": mismatch_ohlc_diff,
+            "ohlc_max_abs_diff_bps_avg": _avg(ohlc_bps_sum, ohlc_bps_count),
             "internal_chain_only": tf in INTERNAL_ONLY_TFS,
         }
 
@@ -1116,6 +1236,15 @@ def comparison_summary() -> dict[str, Any]:
         "delivery_enabled": False,
         "compare_workers": COMPARE_WORKERS,
         "borderline_epsilon": BORDERLINE_EPSILON,
+        "tv_ohlc_diagnostic_enabled": True,
+        "condition_mismatch_ohlc_same_count": sum(
+            int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["condition_mismatch_ohlc_same"])
+            for s in SUPPORTED_SYMBOLS for tf in TF_ORDER
+        ),
+        "condition_mismatch_ohlc_diff_count": sum(
+            int(_STATS_BY_SYMBOL[s]["per_timeframe"][tf]["condition_mismatch_ohlc_diff"])
+            for s in SUPPORTED_SYMBOLS for tf in TF_ORDER
+        ),
         "storage_mode": comparison_storage_mode(),
         "retention_note": "aggregate counters persist until Render restart/redeploy; only latest full record per symbol and recent events are retained in memory",
     }

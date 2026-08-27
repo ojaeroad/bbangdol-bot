@@ -1,3 +1,4 @@
+# V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -159,6 +160,7 @@ def server_engine_health():
             TF_ORDER,
             INTERNAL_ONLY_TFS,
             COMPARE_WORKERS,
+            PINE_PAYLOAD_VERSION,
         )
         key_configured = compare_key_configured()
         retention_limit = comparison_retention_limit()
@@ -167,6 +169,7 @@ def server_engine_health():
         timeframes = list(TF_ORDER)
         internal_tfs = list(INTERNAL_ONLY_TFS)
         workers = COMPARE_WORKERS
+        pine_payload_version = PINE_PAYLOAD_VERSION
     except Exception:
         key_configured = False
         retention_limit = 1000
@@ -179,9 +182,10 @@ def server_engine_health():
         timeframes = ["1w", "1d", "12h", "6h", "4h", "2h", "1h", "30m", "15m", "5m"]
         internal_tfs = ["2h"]
         workers = 3
+        pine_payload_version = "V133_TF_OHLC"
     return jsonify({
         "ok": True,
-        "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
+        "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
         "symbol_count": len(symbols),
         "symbols": symbols,
         "signal_timeframes": timeframes,
@@ -194,6 +198,8 @@ def server_engine_health():
         "event_retention_limit": retention_limit,
         "storage_mode": storage_mode,
         "compare_workers": workers,
+        "expected_pine_payload_version": pine_payload_version,
+        "tv_tf_ohlc_diagnostic": True,
         "internal_chain_timeframes": internal_tfs,
         "delivery_mode": "COMPARE_ONLY_NO_TELEGRAM_NO_FCM_NO_DB",
     })
@@ -209,7 +215,7 @@ def server_engine_phase1_btc():
         log.exception("Server signal engine BTC manual evaluate failed")
         return jsonify({
             "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
             "delivery_enabled": False,
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
@@ -247,14 +253,14 @@ def server_engine_compare_tradingview():
     except ValueError as exc:
         return jsonify({
             "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
             "error": str(exc),
         }), 400
     except Exception as exc:
         log.exception("Server signal engine TradingView compare failed")
         return jsonify({
             "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V132_DIAGNOSTIC_EXPORT",
+            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
             "error": f"{type(exc).__name__}: {exc}",
         }), 500
 
@@ -305,12 +311,12 @@ def server_engine_compare_export_json():
         for symbol in symbols:
             latest_by_symbol[symbol] = comparison_latest(symbol)
         payload = {
-            "export_version": "V132_DIAGNOSTIC_EXPORT",
+            "export_version": "V133_TV_OHLC_DIAGNOSTIC_EXPORT",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "summary": comparison_summary(),
             "latest_by_symbol": latest_by_symbol,
             "events": comparison_events(limit=500),
-            "note": "MISMATCH events include mismatching timeframe indicator/condition details from V132 onward.",
+            "note": "V133 MISMATCH events include TradingView and server TF OHLC, OHLC diffs, indicator diffs, and an automatic root_cause_hint.",
         }
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -335,7 +341,8 @@ def server_engine_compare_events_csv():
         writer.writerow([
             "event", "symbol", "display_name", "pine_minute_close_utc", "received_at_utc",
             "tv_buy_tf", "server_buy_tf", "tv_sell_tf", "server_sell_tf",
-            "signal_match", "mean_abs_indicator_diff", "mismatch_timeframes", "error",
+            "signal_match", "mean_abs_indicator_diff", "mismatch_timeframes",
+            "root_cause_hint", "ohlc_same_timeframes", "ohlc_diff_timeframes", "max_ohlc_diff_bps", "error",
         ])
         for row in rows:
             tv_buy = row.get("tv_buy") or {}
@@ -343,13 +350,29 @@ def server_engine_compare_events_csv():
             tv_sell = row.get("tv_sell") or {}
             sv_sell = row.get("server_sell") or {}
             mismatch_tfs = row.get("mismatch_timeframes") or {}
+            ohlc_same_tfs = []
+            ohlc_diff_tfs = []
+            max_ohlc_bps = None
+            for tf_name, tf_detail in mismatch_tfs.items():
+                ohlc = (tf_detail or {}).get("ohlc_diagnostic") or {}
+                if not ohlc.get("available"):
+                    continue
+                if ohlc.get("match"):
+                    ohlc_same_tfs.append(tf_name)
+                else:
+                    ohlc_diff_tfs.append(tf_name)
+                bps = ohlc.get("max_abs_diff_bps")
+                if bps is not None:
+                    max_ohlc_bps = max(float(bps), float(max_ohlc_bps or 0.0))
             writer.writerow([
                 row.get("event", ""), row.get("symbol", ""), row.get("display_name", ""),
                 row.get("pine_minute_close_utc", ""), row.get("received_at_utc", ""),
                 tv_buy.get("max_timeframe") or "", sv_buy.get("max_timeframe") or "",
                 tv_sell.get("max_timeframe") or "", sv_sell.get("max_timeframe") or "",
                 row.get("signal_match", ""), row.get("mean_abs_indicator_diff", ""),
-                ";".join(sorted(mismatch_tfs.keys())), row.get("error", ""),
+                ";".join(sorted(mismatch_tfs.keys())), row.get("root_cause_hint", ""),
+                ";".join(sorted(ohlc_same_tfs)), ";".join(sorted(ohlc_diff_tfs)),
+                "" if max_ohlc_bps is None else max_ohlc_bps, row.get("error", ""),
             ])
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         return Response(
@@ -402,21 +425,27 @@ def server_engine_compare_dashboard():
                 "diff_text": num(row.get("mean_abs_indicator_diff_avg"), 5),
                 "borderline_hits": row.get("borderline_hits", 0),
                 "borderline_mismatch_hits": row.get("borderline_mismatch_hits", 0),
+                "tv_ohlc_samples": row.get("tv_ohlc_samples", 0),
+                "ohlc_match_text": pct(row.get("ohlc_match_rate_pct")),
+                "ohlc_match_rate_pct": row.get("ohlc_match_rate_pct"),
+                "mismatch_ohlc_same": row.get("condition_mismatch_ohlc_same", 0),
+                "mismatch_ohlc_diff": row.get("condition_mismatch_ohlc_diff", 0),
+                "ohlc_diff_bps_text": num(row.get("ohlc_max_abs_diff_bps_avg"), 5),
             })
 
         return render_template_string(r'''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>타점온 서버엔진 COIN9 검증</title>
+<title>타점온 서버엔진 COIN9 V133 OHLC 진단</title>
 <style>
 body{margin:0;background:#0f1115;color:#e8eaf0;font-family:Arial,"Noto Sans KR",sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px}
-h1{font-size:24px;margin:0 0 6px}.sub{color:#9aa3b2;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:18px}
+h1{font-size:24px;margin:0 0 6px}.sub{color:#9aa3b2;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px;margin-bottom:18px}
 .card{background:#171b22;border:1px solid #29303b;border-radius:12px;padding:14px}.k{color:#9aa3b2;font-size:12px}.v{font-size:23px;font-weight:700;margin-top:5px}
 table{width:100%;border-collapse:collapse;background:#171b22;margin:0 0 18px}th,td{padding:9px 10px;border-bottom:1px solid #29303b;text-align:right;font-size:13px}th{color:#aeb7c6;background:#1d222b;position:sticky;top:0}th:first-child,td:first-child{text-align:left}.ok{color:#5fe08b}.warn{color:#ffd166}.bad{color:#ff6b6b}.muted{color:#8f98a8}.section{font-size:18px;margin:20px 0 8px}.event{background:#171b22;border:1px solid #29303b;border-radius:10px;padding:10px 12px;margin:6px 0;font-size:13px}.event b{margin-right:8px}a{color:#8ab4ff}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}table{display:block;overflow:auto}}
 </style></head><body><div class="wrap">
-<h1>🧪 타점온 COIN9 서버엔진 검증 V132</h1>
-<div class="sub">1분마다 TradingView ↔ Binance 재구성 비교 · 자동 60초 새로고침 · 2h* = 내부 체인 전용</div>
+<h1>🧪 타점온 COIN9 서버엔진 검증 V133 · TV OHLC 진단</h1>
+<div class="sub">1분마다 TradingView ↔ Binance 재구성 비교 · TF별 OHLC 직접 대조 · 자동 60초 새로고침 · 2h* = 내부 체인 전용</div>
 <div class="cards">
 <div class="card"><div class="k">활성 종목</div><div class="v">{{s.active_symbol_count}} / {{s.configured_symbol_count}}</div></div>
 <div class="card"><div class="k">전체 비교</div><div class="v">{{s.sample_count}}</div></div>
@@ -424,17 +453,19 @@ table{width:100%;border-collapse:collapse;background:#171b22;margin:0 0 18px}th,
 <div class="card"><div class="k">조건 일치</div><div class="v ok">{{pct(s.condition_match_rate_pct)}}</div></div>
 <div class="card"><div class="k">오류</div><div class="v {{'bad' if s.error_count else 'ok'}}">{{s.error_count}}</div></div>
 <div class="card"><div class="k">불일치</div><div class="v {{'bad' if s.mismatch_count else 'ok'}}">{{s.mismatch_count}}</div></div>
+<div class="card"><div class="k">TF 불일치 · OHLC 동일</div><div class="v warn">{{s.condition_mismatch_ohlc_same_count}}</div></div>
+<div class="card"><div class="k">TF 불일치 · OHLC 차이</div><div class="v {{'bad' if s.condition_mismatch_ohlc_diff_count else 'ok'}}">{{s.condition_mismatch_ohlc_diff_count}}</div></div>
 </div>
 <div class="section">종목별 검증</div>
 <table><thead><tr><th>종목</th><th>상태</th><th>샘플</th><th>신호일치</th><th>조건일치</th><th>평균 지표오차</th><th>BUY 현재</th><th>SELL 현재</th><th>BUY 신호샘플</th><th>SELL 신호샘플</th><th>상태변화</th><th>오류</th></tr></thead><tbody>
 {% for r in symbol_rows %}<tr><td>🪙 {{r.symbol}} [{{r.display_name}}]</td><td>{{r.status}}</td><td>{{r.sample_count}}</td><td class="{{'ok' if r.signal_match_rate_pct == 100 else ('bad' if r.signal_match_rate_pct is not none else '')}}">{{r.signal_match_text}}</td><td>{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.buy_txt}}</td><td>{{r.sell_txt}}</td><td>{{r.buy_signal_sample_count}}</td><td>{{r.sell_signal_sample_count}}</td><td>{{r.signal_transition_count}}</td><td class="{{'bad' if r.error_count else 'ok'}}">{{r.error_count}}</td></tr>{% endfor %}
 </tbody></table>
 <div class="section">전체 시간봉별 검증</div>
-<table><thead><tr><th>TF</th><th>샘플</th><th>조건일치</th><th>평균 지표오차</th><th>임계값 근접</th><th>근접 불일치</th></tr></thead><tbody>
-{% for r in tf_rows %}<tr><td>{{r.tf}}</td><td>{{r.samples}}</td><td class="{{'ok' if r.condition_match_rate_pct == 100 else ('bad' if r.condition_match_rate_pct is not none else '')}}">{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.borderline_hits}}</td><td class="{{'bad' if r.borderline_mismatch_hits else 'ok'}}">{{r.borderline_mismatch_hits}}</td></tr>{% endfor %}
+<table><thead><tr><th>TF</th><th>샘플</th><th>조건일치</th><th>평균 지표오차</th><th>TV OHLC 샘플</th><th>OHLC 일치</th><th>불일치·OHLC 동일</th><th>불일치·OHLC 차이</th><th>평균 OHLC 최대차(bps)</th><th>임계값 근접</th><th>근접 불일치</th></tr></thead><tbody>
+{% for r in tf_rows %}<tr><td>{{r.tf}}</td><td>{{r.samples}}</td><td class="{{'ok' if r.condition_match_rate_pct == 100 else ('bad' if r.condition_match_rate_pct is not none else '')}}">{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.tv_ohlc_samples}}</td><td class="{{'ok' if r.ohlc_match_rate_pct == 100 else ('bad' if r.ohlc_match_rate_pct is not none else '')}}">{{r.ohlc_match_text}}</td><td class="{{'warn' if r.mismatch_ohlc_same else 'ok'}}">{{r.mismatch_ohlc_same}}</td><td class="{{'bad' if r.mismatch_ohlc_diff else 'ok'}}">{{r.mismatch_ohlc_diff}}</td><td>{{r.ohlc_diff_bps_text}}</td><td>{{r.borderline_hits}}</td><td class="{{'bad' if r.borderline_mismatch_hits else 'ok'}}">{{r.borderline_mismatch_hits}}</td></tr>{% endfor %}
 </tbody></table>
 <div class="section">최근 신호 변화 / 불일치 / 오류</div>
-{% if events %}{% for e in events %}<div class="event"><b>{{e.event}}</b> {{e.symbol}} [{{e.display_name}}] · {{e.pine_minute_close_utc or e.received_at_utc}}{% if e.error %} · <span class="bad">{{e.error}}</span>{% endif %}{% if e.tv_buy %} · BUY TV={{e.tv_buy.max_timeframe or '-'}} / SV={{(e.server_buy or {}).get('max_timeframe') or '-'}} · SELL TV={{e.tv_sell.max_timeframe or '-'}} / SV={{(e.server_sell or {}).get('max_timeframe') or '-' }}{% endif %}</div>{% endfor %}{% else %}<div class="event muted">아직 기록할 신호 상태변화·불일치·오류가 없습니다.</div>{% endif %}
+{% if events %}{% for e in events %}<div class="event"><b>{{e.event}}</b> {{e.symbol}} [{{e.display_name}}] · {{e.pine_minute_close_utc or e.received_at_utc}}{% if e.error %} · <span class="bad">{{e.error}}</span>{% endif %}{% if e.root_cause_hint %} · <span class="warn">{{e.root_cause_hint}}</span>{% endif %}{% if e.tv_buy %} · BUY TV={{e.tv_buy.max_timeframe or '-'}} / SV={{(e.server_buy or {}).get('max_timeframe') or '-'}} · SELL TV={{e.tv_sell.max_timeframe or '-'}} / SV={{(e.server_sell or {}).get('max_timeframe') or '-' }}{% endif %}</div>{% endfor %}{% else %}<div class="event muted">아직 기록할 신호 상태변화·불일치·오류가 없습니다.</div>{% endif %}
 <div class="sub">다운로드: <a href="/server-engine/compare/export.json">전체 진단 JSON</a> · <a href="/server-engine/compare/events.csv">이벤트 CSV</a> &nbsp; | &nbsp; JSON 보기: <a href="/server-engine/compare/summary">summary</a> · <a href="/server-engine/compare/latest">latest</a> · <a href="/server-engine/compare/events">events</a></div>
 </div></body></html>''', s=summary, symbol_rows=symbol_rows, tf_rows=tf_rows, events=events, pct=pct)
     except Exception as exc:
