@@ -712,9 +712,9 @@ def _decorate_cadence_message(msg: str, phase: str, ordinal: int = 1) -> str:
     """시간봉과 매수·매도 목적이 한눈에 구분되도록 문구를 정리한다."""
     labels = {
         # v82: 집중은 관찰 시작이므로 매수/매도 모두 카운터를 붙이지 않는다.
-        "FOCUS": "✍🏻 매수 집중",
+        "FOCUS": "매수 대기",
         "HOLD": f"{_buy_valid_stage_emoji(ordinal)} 분할매수 {ordinal}차 타점",
-        "EXIT": "✍🏻 매도 집중",
+        "EXIT": "매도 대기",
         "EXIT_RECHECK": f"{_sell_valid_stage_emoji(ordinal)} 분할매도 {ordinal}차 타점",
         "EXIT_FINAL": f"{_sell_valid_stage_emoji(ordinal)} 분할매도 {ordinal}차 타점",
     }
@@ -2088,6 +2088,11 @@ KRX_SYMBOL_NAMES = {
 _UPBIT_MARKET_CACHE_LOCK = threading.Lock()
 _UPBIT_MARKET_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
 _UPBIT_MARKET_CACHE_SECONDS = 6 * 60 * 60
+
+_BINANCE_SPOT_MARKET_CACHE_LOCK = threading.Lock()
+_BINANCE_SPOT_MARKET_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
+_BINANCE_SPOT_MARKET_CACHE_SECONDS = 6 * 60 * 60
+_BINANCE_SPOT_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 _UPBIT_MARKET_URL = "https://api.upbit.com/v1/market/all"
 
 
@@ -2126,6 +2131,10 @@ _APP_COIN_KO_NAMES = {
     "ADA": "에이다", "DOGE": "도지코인", "AVAX": "아발란체", "LINK": "체인링크",
     "SUI": "수이", "ONDO": "온도 파이낸스", "AAVE": "에이브", "ALGO": "알고랜드", "TRX": "트론",
     "DOT": "폴카닷", "LTC": "라이트코인", "BCH": "비트코인캐시", "ETC": "이더리움클래식",
+    "SHIB": "시바이누", "PEPE": "페페", "BONK": "봉크", "WIF": "도그위프햇",
+    "UNI": "유니스왑", "ARB": "아비트럼", "OP": "옵티미즘", "APT": "앱토스",
+    "SEI": "세이", "NEAR": "니어프로토콜", "ATOM": "코스모스", "FIL": "파일코인",
+    "INJ": "인젝티브", "TIA": "셀레스티아", "TON": "톤코인", "WLD": "월드코인",
 }
 
 
@@ -2185,6 +2194,44 @@ def _app_display_label(symbol: str, name: str = "", market: str = "", exchange: 
         clean_name = clean_name or _APP_US_EN_NAMES.get(code, "")
         return " ".join(part for part in (code, clean_name, "(미장)") if part)
     return " ".join(part for part in (code, clean_name) if part)
+
+
+def _app_user_display_label(symbol: str, name: str = "", market: str = "", exchange: str = "") -> str:
+    """Member-facing label: hide technical symbol codes except US company name itself."""
+    code = _clean_symbol_code(symbol).upper()
+    market_u = str(market or "").upper()
+    exchange_u = str(exchange or "").upper()
+    clean_name = str(name or "").strip()
+    if market_u == "COIN":
+        if not clean_name:
+            base = _coin_base_symbol(code, exchange_u)
+            clean_name = _APP_COIN_KO_NAMES.get(base, "") or _upbit_korean_name_by_base(base) or base
+        venue = "코인 KRW" if exchange_u == "UPBIT" else "코인 USDT"
+        return f"{clean_name} ({venue})"
+    if market_u == "KOREA":
+        clean_name = clean_name or KRX_SYMBOL_NAMES.get(code, "") or code
+        return f"{clean_name} (국장)"
+    if market_u == "US":
+        clean_name = clean_name or _APP_US_EN_NAMES.get(code, "") or code
+        return f"{clean_name} (미장)"
+    return clean_name or code
+
+
+def _app_friendly_timeframe_name(market: str, timeframe: str) -> str:
+    tf = _canonical_timeframe(str(timeframe or ""))
+    if str(market or "").upper() == "COIN":
+        return {
+            "5m": "짧은 단타", "15m": "긴 단타",
+            "30m": "짧은 스윙", "1h": "긴 스윙",
+            "4h": "짧은 장기", "6h": "긴 장기",
+            "12h": "짧은 인생 타점", "1d": "긴 인생 타점",
+            "1w": "강력 인생 타점",
+        }.get(tf, tf)
+    return {
+        "30m": "짧은 스윙", "1h": "긴 스윙",
+        "4h": "짧은 장기", "1d": "긴 장기",
+        "3d": "짧은 인생 타점", "1w": "긴 인생 타점",
+    }.get(tf, tf)
 
 
 def _app_market_category(market: str, exchange: str = "", symbol: str = "") -> tuple[str, str]:
@@ -2294,6 +2341,70 @@ def _load_upbit_market_catalog() -> list[dict[str, Any]]:
         return list(cached)
 
 
+def _upbit_korean_name_by_base(base: str) -> str:
+    target = _clean_symbol_code(base).upper()
+    if not target:
+        return ""
+    for item in _load_upbit_market_catalog():
+        pair = str(item.get("symbol", "") or "").upper()
+        if pair.startswith("KRW-") and pair.split("-", 1)[1] == target:
+            return str(item.get("korean_name") or item.get("name") or "").strip()
+    return ""
+
+
+def _load_binance_spot_market_catalog() -> list[dict[str, Any]]:
+    """Public Binance Spot USDT master, cached for 6h. Search-only; no API key."""
+    now_ts = time.time()
+    cached = _BINANCE_SPOT_MARKET_CACHE.get("items") or []
+    loaded_at = float(_BINANCE_SPOT_MARKET_CACHE.get("loaded_at") or 0.0)
+    if cached and now_ts - loaded_at < _BINANCE_SPOT_MARKET_CACHE_SECONDS:
+        return list(cached)
+    with _BINANCE_SPOT_MARKET_CACHE_LOCK:
+        cached = _BINANCE_SPOT_MARKET_CACHE.get("items") or []
+        loaded_at = float(_BINANCE_SPOT_MARKET_CACHE.get("loaded_at") or 0.0)
+        if cached and now_ts - loaded_at < _BINANCE_SPOT_MARKET_CACHE_SECONDS:
+            return list(cached)
+        try:
+            response = requests.get(
+                _BINANCE_SPOT_EXCHANGE_INFO_URL,
+                headers={"Accept": "application/json", "User-Agent": "TajumOn/1.0"},
+                timeout=7,
+            )
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+            raw_items = payload.get("symbols") if isinstance(payload, dict) else []
+            items: list[dict[str, Any]] = []
+            for raw in raw_items if isinstance(raw_items, list) else []:
+                if str((raw or {}).get("status", "")).upper() != "TRADING":
+                    continue
+                if str((raw or {}).get("quoteAsset", "")).upper() != "USDT":
+                    continue
+                if (raw or {}).get("isSpotTradingAllowed") is False:
+                    continue
+                symbol = _clean_symbol_code((raw or {}).get("symbol", ""))
+                base = _clean_symbol_code((raw or {}).get("baseAsset", ""))
+                if not symbol or not base:
+                    continue
+                ko_name = _APP_COIN_KO_NAMES.get(base, "") or _upbit_korean_name_by_base(base)
+                name = ko_name or base
+                items.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "korean_name": ko_name,
+                    "market": "COIN",
+                    "exchange": "BINANCE",
+                    "display": _app_display_label(symbol, name, "COIN", "BINANCE"),
+                    "source": "binance_spot_exchange_info",
+                })
+            if items:
+                _BINANCE_SPOT_MARKET_CACHE["loaded_at"] = now_ts
+                _BINANCE_SPOT_MARKET_CACHE["items"] = items
+                return list(items)
+        except Exception:
+            log.warning("TajumOn Binance Spot catalog refresh failed", exc_info=True)
+        return list(cached)
+
+
 def _upbit_name_for_pair(pair: str) -> str:
     target = _clean_symbol_code(pair)
     for item in _load_upbit_market_catalog():
@@ -2379,6 +2490,13 @@ def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
             if symbol:
                 catalog[("COIN", symbol)] = dict(item)
 
+    # Binance Spot: 앱 검색은 실제 상장 중인 USDT 현물 전체를 대상으로 한다.
+    # SHIBUSDT처럼 아직 서버 알림 이력에 없던 종목도 관심종목 등록이 가능해진다.
+    for item in _load_binance_spot_market_catalog():
+        symbol = _clean_symbol_code(item.get("symbol", ""))
+        if symbol and ("COIN", symbol) not in catalog:
+            catalog[("COIN", symbol)] = dict(item)
+
     # 미장/코인: 서버가 실제로 수신한 신호 종목.
     try:
         rows = known_symbols(1500)
@@ -2406,7 +2524,7 @@ def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
             name = _APP_COIN_KO_NAMES.get(_coin_base_symbol(symbol, exchange), "")
         display = _app_display_label(symbol, name, market, exchange)
         key = (market, symbol)
-        if key in catalog and catalog[key].get("source") in {"krx_map", "upbit_public_api"}:
+        if key in catalog and catalog[key].get("source") in {"krx_map", "upbit_public_api", "binance_spot_exchange_info"}:
             continue
         catalog[key] = {
             "symbol": symbol,
@@ -2610,10 +2728,10 @@ def app_symbol_detail():
         stage = int(row.get("stage", 0) or 0)
         side_label = "매수" if direction == "LOW" else "매도"
         if stage <= 0:
-            alert_label = f"✍🏻 {side_label} 집중"
+            alert_label = f"{side_label} 대기"
         else:
             split_side_label = "분할매수" if direction == "LOW" else "분할매도"
-            alert_label = f"{emoji_by_stage.get(stage, '❗')} {split_side_label} {stage}차 타점"
+            alert_label = f"{split_side_label} {stage}차 타점"
         enriched = dict(row)
         market_value = item.get("market") or _app_symbol_market(item["symbol"])
         group_key, group_label = _app_timeframe_group(market_value, row.get("timeframe", ""))
@@ -7358,11 +7476,10 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
 
     side_label = "매수" if direction == "LOW" else "매도"
     if stage == 0:
-        alert_label = f"✍🏻 {side_label} 집중"
+        alert_label = f"{side_label} 대기"
     else:
-        emoji = {1: "❗", 2: "‼️", 3: "🚨"}[stage]
         split_side_label = "분할매수" if direction == "LOW" else "분할매도"
-        alert_label = f"{emoji} {split_side_label} {stage}차 타점"
+        alert_label = f"{split_side_label} {stage}차 타점"
 
     price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
     price_text = price_match.group(1) if price_match else ""
@@ -7376,9 +7493,11 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
     else:
         name = ""
     display = _app_display_label(sym, name, market, exchange)
+    user_display = _app_user_display_label(sym, name, market, exchange)
     category_key, category_label = _app_market_category(market, exchange, sym)
     group_key, group_label = _app_timeframe_group(market, timeframe)
-    body_parts = [part for part in (group_label, timeframe) if part]
+    friendly_tf = _app_friendly_timeframe_name(market, timeframe)
+    body_parts = [part for part in (friendly_tf,) if part]
     if price_text:
         body_parts.append(price_text)
 
@@ -7412,12 +7531,12 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "title": " · ".join(
             part for part in (
                 alert_label,
-                " ".join(part for part in (group_label, timeframe) if part),
+                friendly_tf,
             )
             if part
         ),
         "body": " · ".join(
-            part for part in (display, price_text)
+            part for part in (user_display, price_text)
             if part
         ),
     }
