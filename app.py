@@ -1,4 +1,4 @@
-# V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -98,6 +98,16 @@ if not app.secret_key:
 # /performance/dashboard calculations.
 _AUTO_SUB_LOCK = threading.RLock()
 _AUTO_SUBSCRIPTIONS: dict[str, set[str]] = {}
+# Render redeploy resets process memory. Keep a lightweight cache copied from the
+# already-existing tajum_app_devices table so the automatic engine does not forget
+# the member watchlist after every deploy. The DB query deliberately bypasses
+# performance_store.ensure_schema() and runs only from the background engine thread.
+_AUTO_DB_SYMBOLS: set[str] = set()
+_AUTO_DB_DEVICE_COUNT = 0
+_AUTO_DB_LAST_REFRESH_AT = 0.0
+_AUTO_DB_LAST_ERROR = ""
+_AUTO_DB_REFRESH_SEC = 30.0
+
 
 def _auto_register_subscription_snapshot(device_id: str, symbols: list[str]) -> None:
     clean = {_clean_symbol_code(x) if '_clean_symbol_code' in globals() else str(x or '').strip().upper() for x in symbols}
@@ -105,47 +115,102 @@ def _auto_register_subscription_snapshot(device_id: str, symbols: list[str]) -> 
     with _AUTO_SUB_LOCK:
         _AUTO_SUBSCRIPTIONS[device_id] = clean
 
-def _auto_active_unique_symbols() -> list[str]:
-    """Return active coin symbols without touching the performance DB/schema path.
 
-    V134 called app_device_summary() here. That function calls ensure_schema() and can
-    block on performance_store._SCHEMA_LOCK while the performance automation is doing
-    its own schema work. On a single sync Gunicorn worker this made /auto/status hang
-    until WORKER TIMEOUT. V135 keeps the automatic engine subscription registry fully
-    isolated from the heavy performance center path.
+def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
+    """Refresh member coin symbols from DB without entering the schema lock.
+
+    This function is called by the daemon auto-engine provider, not by a Flask
+    request. Therefore a slow DB/network moment cannot block /auto/status or the
+    performance dashboard worker.
     """
+    global _AUTO_DB_SYMBOLS, _AUTO_DB_DEVICE_COUNT, _AUTO_DB_LAST_REFRESH_AT, _AUTO_DB_LAST_ERROR
+    ts = time.time()
     with _AUTO_SUB_LOCK:
+        if not force and _AUTO_DB_LAST_REFRESH_AT and ts - _AUTO_DB_LAST_REFRESH_AT < _AUTO_DB_REFRESH_SEC:
+            return
+    try:
+        import performance_store as _ps
+        connect = getattr(_ps, '_connect', None)
+        db_url = str(getattr(_ps, 'PERFORMANCE_DATABASE_URL', '') or '').strip()
+        if not db_url or connect is None:
+            raise RuntimeError('performance database connection unavailable')
+        rows = []
+        with connect() as conn:
+            # Table already exists in production. Do NOT call ensure_schema() here.
+            rows = conn.execute(
+                """
+                SELECT enabled_symbols
+                FROM tajum_app_devices
+                WHERE notifications_enabled=TRUE
+                  AND cardinality(enabled_symbols) > 0
+                """
+            ).fetchall()
         values: set[str] = set()
+        for row in rows:
+            for raw in (row[0] or []):
+                code = _clean_symbol_code(raw) if '_clean_symbol_code' in globals() else str(raw or '').strip().upper()
+                if code and (code.startswith('KRW-') or code.endswith('USDT')):
+                    values.add(code)
+        with _AUTO_SUB_LOCK:
+            _AUTO_DB_SYMBOLS = values
+            _AUTO_DB_DEVICE_COUNT = len(rows)
+            _AUTO_DB_LAST_REFRESH_AT = ts
+            _AUTO_DB_LAST_ERROR = ''
+    except Exception as exc:
+        with _AUTO_SUB_LOCK:
+            _AUTO_DB_LAST_REFRESH_AT = ts
+            _AUTO_DB_LAST_ERROR = f'{type(exc).__name__}: {exc}'
+        log.warning('V136 auto subscription DB refresh failed: %s', exc)
+
+
+def _auto_active_unique_symbols() -> list[str]:
+    """Background provider: DB-persisted subscriptions + live in-process snapshots."""
+    _auto_refresh_db_subscription_cache()
+    with _AUTO_SUB_LOCK:
+        values: set[str] = set(_AUTO_DB_SYMBOLS)
         for symbols in _AUTO_SUBSCRIPTIONS.values():
             values.update(symbols)
 
     # Production auto calculation is coin-only for now. Stock watchlist entries are
-    # intentionally excluded so 12 국장 + 8 미장 do not add useless engine work.
+    # intentionally excluded so 국장/미장 do not add useless engine work.
     values = {
         code for code in values
-        if str(code).startswith("KRW-") or str(code).endswith("USDT")
+        if str(code).startswith('KRW-') or str(code).endswith('USDT')
     }
 
-    seed = os.getenv("TAJUM_AUTO_ENGINE_SEED_SYMBOLS", "").strip()
+    seed = os.getenv('TAJUM_AUTO_ENGINE_SEED_SYMBOLS', '').strip()
     if seed:
         for item in seed.split(','):
             code = _clean_symbol_code(item.strip()) if '_clean_symbol_code' in globals() else item.strip().upper()
-            if code and (code.startswith("KRW-") or code.endswith("USDT")):
+            if code and (code.startswith('KRW-') or code.endswith('USDT')):
                 values.add(code)
     return sorted(values)
 
 
 def _auto_subscription_status() -> dict[str, Any]:
+    # Status is intentionally cache-only: never perform DB/schema work in a request.
     with _AUTO_SUB_LOCK:
-        device_count = len(_AUTO_SUBSCRIPTIONS)
+        memory_values: set[str] = set()
+        for symbols in _AUTO_SUBSCRIPTIONS.values():
+            memory_values.update(symbols)
+        db_values = set(_AUTO_DB_SYMBOLS)
+        active = {
+            code for code in memory_values.union(db_values)
+            if str(code).startswith('KRW-') or str(code).endswith('USDT')
+        }
         snapshot_sizes = {device_id: len(symbols) for device_id, symbols in _AUTO_SUBSCRIPTIONS.items()}
-    active = _auto_active_unique_symbols()
-    return {
-        "snapshot_device_count": device_count,
-        "snapshot_symbol_counts": snapshot_sizes,
-        "active_coin_symbol_count": len(active),
-        "active_coin_symbols": active,
-    }
+        return {
+            'snapshot_device_count': len(_AUTO_SUBSCRIPTIONS),
+            'snapshot_symbol_counts': snapshot_sizes,
+            'memory_coin_symbol_count': len({x for x in memory_values if x.startswith('KRW-') or x.endswith('USDT')}),
+            'db_device_count': _AUTO_DB_DEVICE_COUNT,
+            'db_coin_symbol_count': len(db_values),
+            'db_coin_symbols': sorted(db_values),
+            'db_last_refresh_at_epoch': _AUTO_DB_LAST_REFRESH_AT or None,
+            'db_last_error': _AUTO_DB_LAST_ERROR or None,
+            'active_coin_symbol_count': len(active),
+            'active_coin_symbols': sorted(active),
+        }
 
 
 app.config.update(
@@ -7791,10 +7856,10 @@ def _ensure_auto_exchange_engine_started() -> bool:
             from auto_exchange_engine import start as start_auto_exchange_engine
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V134 automatic exchange engine started=%s", started)
+            log.info("V136 automatic exchange engine started=%s", started)
             return started
         except Exception:
-            log.exception("V134 automatic exchange engine start failed")
+            log.exception("V136 automatic exchange engine start failed")
             return False
 
 @app.get("/server-engine/auto/status")
@@ -7805,7 +7870,7 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V135",
+            "version": "V136",
             "mode": "member_watchlist -> unique_coin_symbol_compute -> FCM_fanout",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_coin_symbols"],
@@ -7813,7 +7878,7 @@ def server_engine_auto_status():
             "engine": auto_engine_status(),
         }), 200
     except Exception as exc:
-        log.exception("V135 auto status failed")
+        log.exception("V136 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 _ensure_auto_exchange_engine_started()

@@ -1,4 +1,4 @@
-"""Tajum On V135 automatic exchange signal engine.
+"""Tajum On V136 automatic exchange signal engine.
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -221,7 +221,7 @@ def _run_loop(
                     elif symbol.endswith("USDT"):
                         result = _evaluate_binance(symbol)
                     else:
-                        # V135 production auto engine is deliberately coin-only.
+                        # V136 production auto engine is deliberately coin-only.
                         continue
                     success += 1
                     for side in ("buy", "sell"):
