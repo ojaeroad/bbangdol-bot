@@ -1,4 +1,4 @@
-# V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -98,6 +98,7 @@ if not app.secret_key:
 # /performance/dashboard calculations.
 _AUTO_SUB_LOCK = threading.RLock()
 _AUTO_SUBSCRIPTIONS: dict[str, set[str]] = {}
+_AUTO_DEVICE_SNAPSHOTS: dict[str, dict[str, Any]] = {}
 # Render redeploy resets process memory. Keep a lightweight cache copied from the
 # already-existing tajum_app_devices table so the automatic engine does not forget
 # the member watchlist after every deploy. The DB query deliberately bypasses
@@ -109,11 +110,53 @@ _AUTO_DB_LAST_ERROR = ""
 _AUTO_DB_REFRESH_SEC = 30.0
 
 
-def _auto_register_subscription_snapshot(device_id: str, symbols: list[str]) -> None:
+def _auto_register_subscription_snapshot(
+    device_id: str,
+    symbols: list[str],
+    *,
+    fcm_token: str = "",
+    enabled_signal_groups: Optional[dict[str, list[str]]] = None,
+    notifications_enabled: bool = True,
+    sound_profile: str = "clear",
+    vibration_enabled: bool = True,
+) -> None:
     clean = {_clean_symbol_code(x) if '_clean_symbol_code' in globals() else str(x or '').strip().upper() for x in symbols}
     clean = {x for x in clean if x}
+    device_key = str(device_id or "").strip()
+    if not device_key:
+        return
+    groups = enabled_signal_groups if isinstance(enabled_signal_groups, dict) else {}
     with _AUTO_SUB_LOCK:
-        _AUTO_SUBSCRIPTIONS[device_id] = clean
+        _AUTO_SUBSCRIPTIONS[device_key] = clean if notifications_enabled else set()
+        _AUTO_DEVICE_SNAPSHOTS[device_key] = {
+            "device_id": device_key,
+            "fcm_token": str(fcm_token or "").strip(),
+            "enabled_symbols": sorted(clean),
+            "enabled_signal_groups": groups,
+            "notifications_enabled": bool(notifications_enabled),
+            "sound_profile": str(sound_profile or "clear").strip().lower(),
+            "vibration_enabled": bool(vibration_enabled),
+        }
+
+
+def _auto_live_devices_for_symbol(symbol: str) -> list[dict[str, Any]]:
+    target = _clean_symbol_code(symbol)
+    if not target:
+        return []
+    out: list[dict[str, Any]] = []
+    with _AUTO_SUB_LOCK:
+        snapshots = list(_AUTO_DEVICE_SNAPSHOTS.values())
+    for item in snapshots:
+        if not item.get("notifications_enabled", True):
+            continue
+        token = str(item.get("fcm_token", "") or "").strip()
+        if not token:
+            continue
+        symbols = {_clean_symbol_code(x) for x in (item.get("enabled_symbols") or [])}
+        if target not in symbols:
+            continue
+        out.append(dict(item))
+    return out
 
 
 def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
@@ -160,7 +203,7 @@ def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
         with _AUTO_SUB_LOCK:
             _AUTO_DB_LAST_REFRESH_AT = ts
             _AUTO_DB_LAST_ERROR = f'{type(exc).__name__}: {exc}'
-        log.warning('V136 auto subscription DB refresh failed: %s', exc)
+        log.warning('V137 auto subscription DB refresh failed: %s', exc)
 
 
 def _auto_active_unique_symbols() -> list[str]:
@@ -201,6 +244,7 @@ def _auto_subscription_status() -> dict[str, Any]:
         snapshot_sizes = {device_id: len(symbols) for device_id, symbols in _AUTO_SUBSCRIPTIONS.items()}
         return {
             'snapshot_device_count': len(_AUTO_SUBSCRIPTIONS),
+            'live_device_count': len(_AUTO_DEVICE_SNAPSHOTS),
             'snapshot_symbol_counts': snapshot_sizes,
             'memory_coin_symbol_count': len({x for x in memory_values if x.startswith('KRW-') or x.endswith('USDT')}),
             'db_device_count': _AUTO_DB_DEVICE_COUNT,
@@ -3081,6 +3125,24 @@ def app_device_register():
                 for group in raw_groups
                 if str(group or "").strip()
             ]
+    # Live snapshot is updated first. This makes the user's phone a normal member
+    # immediately, even if the performance DB is briefly locked/unavailable.
+    _auto_register_subscription_snapshot(
+        device_id,
+        symbols if notifications_enabled else [],
+        fcm_token=fcm_token,
+        enabled_signal_groups=signal_groups or {},
+        notifications_enabled=notifications_enabled,
+        sound_profile=sound_profile,
+        vibration_enabled=vibration_enabled,
+    )
+    persisted = True
+    persist_error = ""
+    saved: dict[str, Any] = {
+        "device_id": device_id,
+        "enabled_symbols": symbols,
+        "notifications_enabled": notifications_enabled,
+    }
     try:
         saved = upsert_app_device(
             device_id=device_id,
@@ -3092,13 +3154,19 @@ def app_device_register():
             vibration_enabled=vibration_enabled,
             enabled_signal_groups=signal_groups,
         )
-        _auto_register_subscription_snapshot(device_id, symbols if notifications_enabled else [])
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception:
-        log.exception("TajumOn device registration failed device_id=%s", device_id[:16])
-        return jsonify({"ok": False, "error": "device_registration_failed"}), 500
-    return jsonify({"ok": True, **saved}), 200
+    except Exception as exc:
+        persisted = False
+        persist_error = f"{type(exc).__name__}: {exc}"
+        log.exception("TajumOn DB persistence delayed; live subscription kept device_id=%s", device_id[:16])
+    return jsonify({
+        "ok": True,
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "live_subscription": True,
+        **saved,
+    }), 200
 
 
 @app.get("/app/push/health")
@@ -7696,9 +7764,21 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         payload = _cadence_push_parts(route, msg, symbol, cadence_reason)
         if not payload:
             return
-        devices = app_devices_for_symbol(payload["symbol"], 500)
+        try:
+            devices = app_devices_for_symbol(payload["symbol"], 500)
+        except Exception:
+            log.exception("FCM DB recipient lookup failed; using live member snapshot symbol=%s", payload["symbol"])
+            devices = []
+        # Merge live app heartbeats with DB recipients. This also covers the short
+        # window immediately after a Render redeploy before DB recovery finishes.
+        live_devices = _auto_live_devices_for_symbol(payload["symbol"])
+        merged: dict[str, dict[str, Any]] = {}
+        for device in list(devices or []) + live_devices:
+            key = str(device.get("device_id") or device.get("fcm_token") or "").strip()
+            if key:
+                merged[key] = device
         devices = [
-            device for device in devices
+            device for device in merged.values()
             if _device_allows_signal_group(device, payload)
         ]
         if not devices:
@@ -7856,10 +7936,10 @@ def _ensure_auto_exchange_engine_started() -> bool:
             from auto_exchange_engine import start as start_auto_exchange_engine
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V136 automatic exchange engine started=%s", started)
+            log.info("V137 automatic exchange engine started=%s", started)
             return started
         except Exception:
-            log.exception("V136 automatic exchange engine start failed")
+            log.exception("V137 automatic exchange engine start failed")
             return False
 
 @app.get("/server-engine/auto/status")
@@ -7870,7 +7950,7 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V136",
+            "version": "V137",
             "mode": "member_watchlist -> unique_coin_symbol_compute -> FCM_fanout",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_coin_symbols"],
@@ -7878,7 +7958,7 @@ def server_engine_auto_status():
             "engine": auto_engine_status(),
         }), 200
     except Exception as exc:
-        log.exception("V136 auto status failed")
+        log.exception("V137 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 _ensure_auto_exchange_engine_started()
