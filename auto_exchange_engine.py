@@ -1,4 +1,4 @@
-"""Tajum On V139 automatic exchange signal engine (V138 parallel progress + source trace callback).
+"""Tajum On V141 automatic exchange signal engine (TV app-FCM block + partial-TF safe skip).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -58,6 +58,8 @@ _status: dict[str, Any] = {
     "worker_started_at": None,
     "worker_last_heartbeat": None,
     "worker_last_exception": None,
+    "last_warnings": [],
+    "last_skipped_timeframes": {},
 }
 
 
@@ -158,20 +160,68 @@ def _aggregate_rows(rows: list[dict[str, Any]], minutes: int) -> list[dict[str, 
     return out
 
 
+def _chain_signal_available(
+    symbol: str,
+    metrics_by_tf: dict[str, dict[str, Any]],
+    *,
+    is_ob: bool,
+    price: float,
+) -> dict[str, Any]:
+    """V141 chain calculation that tolerates missing *higher* history timeframes.
+
+    A candidate is considered only when every timeframe required from that candidate
+    down to 5m exists. Example: if a newly listed coin has only 13 weekly candles,
+    1w is skipped but 1d/12h/... signals can still be evaluated normally.
+    """
+    key = "ob_basic" if is_ob else "os_basic"
+    for i, tf in enumerate(v133.TF_ORDER):
+        if tf not in v133.MAX_CANDIDATES:
+            continue
+        required = list(v133.TF_ORDER[i:])
+        if any(req not in metrics_by_tf for req in required):
+            continue
+        if all(bool(metrics_by_tf[req][key]) for req in required):
+            route = v133._route_for_tf(tf, is_ob=is_ob)
+            return {
+                "chain_ok": True,
+                "max_timeframe": tf,
+                "route": route,
+                "message_preview": None,
+            }
+    return {"chain_ok": False, "max_timeframe": None, "route": "", "message_preview": None}
+
+
 def _evaluate_upbit(market: str) -> dict[str, Any]:
     evaluation_time_ms = int(datetime.now(timezone.utc).timestamp() // 60 * 60 * 1000)
     metrics: dict[str, dict[str, Any]] = {}
-    # V133 chain order. Fetch only once per needed TF; 2h stays internal chain-only.
+    warnings: list[str] = []
+    skipped_timeframes: list[str] = []
+
+    # V141: insufficient history in one timeframe (common for newly listed coins)
+    # must not fail the whole symbol. Skip only that TF; lower complete chains remain valid.
     for tf in reversed(v133.TF_ORDER):
         rows = _upbit_rows(market, tf)
-        if len(rows) < 20:
-            raise RuntimeError(f"not enough Upbit candles {market} {tf}: {len(rows)}")
-        metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=evaluation_time_ms)
-    # Current price from the smallest timeframe.
-    price = float(_upbit_rows(market, "5m", 50)[-1]["close"])
-    # _chain_signal only needs a label and metrics, not a Binance-only fetch.
-    buy = v133._chain_signal(market, metrics, is_ob=False, price=price)
-    sell = v133._chain_signal(market, metrics, is_ob=True, price=price)
+        if len(rows) < 31:  # RSI14 + Stoch20,12 warm-up needs more than 20 candles.
+            skipped_timeframes.append(tf)
+            warnings.append(f"{market} {tf}: not enough candles ({len(rows)})")
+            continue
+        try:
+            metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=evaluation_time_ms)
+        except RuntimeError as exc:
+            if "warm-up incomplete" in str(exc):
+                skipped_timeframes.append(tf)
+                warnings.append(f"{market} {tf}: {exc}")
+                continue
+            raise
+
+    # Current price is independent of the long-TF history availability.
+    price_rows = _upbit_rows(market, "5m", 50)
+    if not price_rows:
+        raise RuntimeError(f"no Upbit price candles {market} 5m")
+    price = float(price_rows[-1]["close"])
+
+    buy = _chain_signal_available(market, metrics, is_ob=False, price=price)
+    sell = _chain_signal_available(market, metrics, is_ob=True, price=price)
     return {
         "exchange": "UPBIT",
         "symbol": market,
@@ -180,6 +230,8 @@ def _evaluate_upbit(market: str) -> dict[str, Any]:
         "timeframes": metrics,
         "buy": buy,
         "sell": sell,
+        "warnings": warnings,
+        "skipped_timeframes": skipped_timeframes,
     }
 
 
@@ -242,6 +294,8 @@ def _run_loop(
         started = datetime.now(timezone.utc)
         _set_status(worker_last_heartbeat=started.isoformat(), worker_thread_alive=True)
         errors: list[str] = []
+        warnings: list[str] = []
+        skipped_by_symbol: dict[str, list[str]] = {}
         success = 0
         symbols: list[str] = []
         try:
@@ -268,6 +322,12 @@ def _run_loop(
                 try:
                     _, result = future.result()
                     success += 1
+                    result_warnings = [str(x) for x in (result.get("warnings") or []) if str(x)]
+                    if result_warnings:
+                        warnings.extend(result_warnings)
+                    skipped = [str(x) for x in (result.get("skipped_timeframes") or []) if str(x)]
+                    if skipped:
+                        skipped_by_symbol[symbol] = skipped
                     for side in ("buy", "sell"):
                         event = _event_from_chain(result, side)
                         if event:
@@ -302,6 +362,8 @@ def _run_loop(
             _status["last_success_count"] = success
             _status["last_error_count"] = len(errors)
             _status["last_errors"] = errors[-20:]
+            _status["last_warnings"] = warnings[-50:]
+            _status["last_skipped_timeframes"] = dict(skipped_by_symbol)
         elapsed = (finished - started).total_seconds()
         time.sleep(max(1.0, AUTO_INTERVAL_SEC - elapsed))
 
