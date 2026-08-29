@@ -30,6 +30,8 @@ AUTO_WORKERS = max(1, min(int(os.getenv("TAJUM_AUTO_ENGINE_WORKERS", "4") or 4),
 UPBIT_BASE = os.getenv("UPBIT_API_BASE", "https://api.upbit.com").rstrip("/")
 
 _started = False
+_started_pid = 0
+_worker_thread: threading.Thread | None = None
 _start_lock = threading.Lock()
 _status_lock = threading.Lock()
 _status: dict[str, Any] = {
@@ -51,12 +53,21 @@ _status: dict[str, Any] = {
     "last_error_count": 0,
     "last_errors": [],
     "workers": AUTO_WORKERS,
+    "worker_pid": None,
+    "worker_thread_alive": False,
+    "worker_started_at": None,
+    "worker_last_heartbeat": None,
+    "worker_last_exception": None,
 }
 
 
 def status() -> dict[str, Any]:
     with _status_lock:
-        return dict(_status)
+        out = dict(_status)
+    thread = _worker_thread
+    out["worker_thread_alive"] = bool(thread and thread.is_alive())
+    out["worker_pid"] = _started_pid or None
+    return out
 
 
 def _set_status(**kwargs: Any) -> None:
@@ -225,10 +236,11 @@ def _run_loop(
     subscription_provider: Callable[[], list[str]],
     signal_callback: Callable[[dict[str, Any]], None],
 ) -> None:
-    _set_status(running=True)
+    _set_status(running=True, worker_pid=os.getpid(), worker_thread_alive=True, worker_started_at=datetime.now(timezone.utc).isoformat(), worker_last_heartbeat=datetime.now(timezone.utc).isoformat(), worker_last_exception=None)
     executor = ThreadPoolExecutor(max_workers=AUTO_WORKERS, thread_name_prefix="tajum-coin-calc")
     while True:
         started = datetime.now(timezone.utc)
+        _set_status(worker_last_heartbeat=started.isoformat(), worker_thread_alive=True)
         errors: list[str] = []
         success = 0
         symbols: list[str] = []
@@ -278,6 +290,7 @@ def _run_loop(
                         _status["current_symbols_in_flight"] = remaining[:AUTO_WORKERS]
         except Exception as exc:
             errors.append(f"cycle: {type(exc).__name__}: {exc}")
+            _set_status(worker_last_exception=f"{type(exc).__name__}: {exc}")
             log.exception("Auto engine cycle failed")
         finished = datetime.now(timezone.utc)
         with _status_lock:
@@ -293,16 +306,26 @@ def _run_loop(
         time.sleep(max(1.0, AUTO_INTERVAL_SEC - elapsed))
 
 def start(subscription_provider: Callable[[], list[str]], signal_callback: Callable[[dict[str, Any]], None]) -> bool:
-    global _started
+    # Gunicorn imports app.py before/around worker fork. A daemon thread created in
+    # the parent process does not survive the fork, while module globals may still
+    # say "started" in the child. Track PID + actual thread liveness so each live
+    # worker can recover the engine safely.
+    global _started, _started_pid, _worker_thread
+    pid = os.getpid()
     with _start_lock:
-        if _started:
+        if _started_pid != pid:
+            _started = False
+            _worker_thread = None
+            _started_pid = pid
+        if _started and _worker_thread is not None and _worker_thread.is_alive():
             return False
         _started = True
-        thread = threading.Thread(
+        _worker_thread = threading.Thread(
             target=_run_loop,
             args=(subscription_provider, signal_callback),
             name="tajum-auto-exchange-engine",
             daemon=True,
         )
-        thread.start()
+        _worker_thread.start()
+        _set_status(worker_pid=pid, worker_thread_alive=True, worker_started_at=datetime.now(timezone.utc).isoformat())
         return True

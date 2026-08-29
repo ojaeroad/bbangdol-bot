@@ -1,4 +1,4 @@
-# V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V140_WORKER_START_RECOVERY: Gunicorn fork-safe auto-engine startup + V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -3136,6 +3136,7 @@ def app_device_register():
         sound_profile=sound_profile,
         vibration_enabled=vibration_enabled,
     )
+    _ensure_auto_exchange_engine_started()
     persisted = True
     persist_error = ""
     saved: dict[str, Any] = {
@@ -3228,7 +3229,18 @@ def app_recent_alerts():
     # Home already calls this endpoint with its enabled symbols, so reuse that request
     # to repopulate subscriptions immediately without entering performance_store schema.
     if raw_symbols:
-        _auto_register_subscription_snapshot(device_id, symbols)
+        with _AUTO_SUB_LOCK:
+            existing = dict(_AUTO_DEVICE_SNAPSHOTS.get(device_id, {}))
+        _auto_register_subscription_snapshot(
+            device_id,
+            symbols,
+            fcm_token=str(existing.get("fcm_token", "") or ""),
+            enabled_signal_groups=existing.get("enabled_signal_groups") if isinstance(existing.get("enabled_signal_groups"), dict) else None,
+            notifications_enabled=bool(existing.get("notifications_enabled", True)),
+            sound_profile=str(existing.get("sound_profile", "clear") or "clear"),
+            vibration_enabled=bool(existing.get("vibration_enabled", True)),
+        )
+        _ensure_auto_exchange_engine_started()
 
     try:
         requested_limit = int(request.args.get("limit", "300") or 300)
@@ -7938,6 +7950,7 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
 
 # --- V134 automatic exchange engine -------------------------------------------------
 _AUTO_ENGINE_STARTED = False
+_AUTO_ENGINE_PID = 0
 _AUTO_ENGINE_START_LOCK = threading.Lock()
 
 def _auto_engine_signal_callback(event: dict[str, Any]) -> None:
@@ -7966,29 +7979,39 @@ def _auto_engine_signal_callback(event: dict[str, Any]) -> None:
         log.exception("V134 auto-engine signal callback failed event=%s", event)
 
 def _ensure_auto_exchange_engine_started() -> bool:
-    global _AUTO_ENGINE_STARTED
+    global _AUTO_ENGINE_STARTED, _AUTO_ENGINE_PID
+    pid = os.getpid()
     with _AUTO_ENGINE_START_LOCK:
-        if _AUTO_ENGINE_STARTED:
-            return False
+        # Gunicorn child PID differs from the process that imported app.py. Never
+        # trust a copied True flag after fork; ask the engine to verify thread life.
+        if _AUTO_ENGINE_PID != pid:
+            _AUTO_ENGINE_STARTED = False
+            _AUTO_ENGINE_PID = pid
         try:
             from auto_exchange_engine import start as start_auto_exchange_engine
+            from auto_exchange_engine import status as auto_engine_status
+            st = auto_engine_status()
+            if _AUTO_ENGINE_STARTED and st.get("worker_thread_alive"):
+                return False
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V139 automatic exchange engine started=%s", started)
+            log.info("V140 automatic exchange engine ensure pid=%s started=%s", pid, started)
             return started
         except Exception:
-            log.exception("V139 automatic exchange engine start failed")
+            _AUTO_ENGINE_STARTED = False
+            log.exception("V140 automatic exchange engine start failed pid=%s", pid)
             return False
 
 @app.get("/server-engine/auto/status")
 def server_engine_auto_status():
     """Fast status endpoint. Never enters performance DB/schema locks."""
     try:
+        _ensure_auto_exchange_engine_started()
         from auto_exchange_engine import status as auto_engine_status
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V139",
+            "version": "V140",
             "mode": "member_watchlist -> unique_coin_symbol_compute -> FCM_fanout",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_coin_symbols"],
@@ -7997,10 +8020,13 @@ def server_engine_auto_status():
             "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V139 auto status failed")
+        log.exception("V140 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
-_ensure_auto_exchange_engine_started()
+# Do NOT start the daemon at module-import time. Gunicorn may import in the parent
+# process before forking; the child would inherit flags but not the thread. The
+# engine is started lazily from the live worker via device/register, alerts/recent,
+# and /server-engine/auto/status.
 
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
