@@ -1,4 +1,4 @@
-"""Tajum On V137 automatic exchange signal engine.
+"""Tajum On V139 automatic exchange signal engine (V138 parallel progress + source trace callback).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -14,6 +14,7 @@ import time
 import math
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -25,6 +26,7 @@ log = logging.getLogger("bbangdol-bot.auto-engine")
 AUTO_INTERVAL_SEC = max(30, min(int(os.getenv("TAJUM_AUTO_ENGINE_INTERVAL_SEC", "60") or 60), 300))
 HTTP_TIMEOUT = max(3, min(int(os.getenv("TAJUM_AUTO_ENGINE_HTTP_TIMEOUT_SEC", "8") or 8), 30))
 MAX_SYMBOLS_PER_CYCLE = max(1, min(int(os.getenv("TAJUM_AUTO_ENGINE_MAX_SYMBOLS", "300") or 300), 1000))
+AUTO_WORKERS = max(1, min(int(os.getenv("TAJUM_AUTO_ENGINE_WORKERS", "4") or 4), 8))
 UPBIT_BASE = os.getenv("UPBIT_API_BASE", "https://api.upbit.com").rstrip("/")
 
 _started = False
@@ -33,12 +35,22 @@ _status_lock = threading.Lock()
 _status: dict[str, Any] = {
     "running": False,
     "cycles": 0,
+    "cycles_started": 0,
+    "cycle_in_progress": False,
+    "current_cycle_total": 0,
+    "current_cycle_completed": 0,
+    "current_cycle_success": 0,
+    "current_cycle_error": 0,
+    "current_symbols_in_flight": [],
+    "last_processed_symbol": None,
+    "last_result_at": None,
     "last_cycle_started_at": None,
     "last_cycle_finished_at": None,
     "last_symbol_count": 0,
     "last_success_count": 0,
     "last_error_count": 0,
     "last_errors": [],
+    "workers": AUTO_WORKERS,
 }
 
 
@@ -201,53 +213,84 @@ def _event_from_chain(result: dict[str, Any], side_key: str) -> dict[str, Any] |
     }
 
 
+def _evaluate_one_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
+    if symbol.startswith("KRW-"):
+        return symbol, _evaluate_upbit(symbol)
+    if symbol.endswith("USDT"):
+        return symbol, _evaluate_binance(symbol)
+    raise ValueError(f"unsupported automatic coin symbol: {symbol}")
+
+
 def _run_loop(
     subscription_provider: Callable[[], list[str]],
     signal_callback: Callable[[dict[str, Any]], None],
 ) -> None:
     _set_status(running=True)
+    executor = ThreadPoolExecutor(max_workers=AUTO_WORKERS, thread_name_prefix="tajum-coin-calc")
     while True:
         started = datetime.now(timezone.utc)
         errors: list[str] = []
         success = 0
+        symbols: list[str] = []
         try:
             raw_symbols = subscription_provider() or []
-            # Unique symbol only: one calculation no matter how many members subscribe.
-            symbols = list(dict.fromkeys(str(x or "").strip().upper() for x in raw_symbols if str(x or "").strip()))[:MAX_SYMBOLS_PER_CYCLE]
-            for symbol in symbols:
+            symbols = list(dict.fromkeys(
+                str(x or "").strip().upper()
+                for x in raw_symbols
+                if str(x or "").strip()
+            ))[:MAX_SYMBOLS_PER_CYCLE]
+
+            with _status_lock:
+                _status["cycles_started"] = int(_status.get("cycles_started", 0)) + 1
+                _status["cycle_in_progress"] = True
+                _status["current_cycle_total"] = len(symbols)
+                _status["current_cycle_completed"] = 0
+                _status["current_cycle_success"] = 0
+                _status["current_cycle_error"] = 0
+                _status["current_symbols_in_flight"] = list(symbols[:AUTO_WORKERS])
+                _status["last_cycle_started_at"] = started.isoformat()
+
+            future_map = {executor.submit(_evaluate_one_symbol, symbol): symbol for symbol in symbols}
+            for future in as_completed(future_map):
+                symbol = future_map[future]
                 try:
-                    if symbol.startswith("KRW-"):
-                        result = _evaluate_upbit(symbol)
-                    elif symbol.endswith("USDT"):
-                        result = _evaluate_binance(symbol)
-                    else:
-                        # V137 production auto engine is deliberately coin-only.
-                        continue
+                    _, result = future.result()
                     success += 1
                     for side in ("buy", "sell"):
                         event = _event_from_chain(result, side)
                         if event:
                             signal_callback(event)
-                    # Avoid hammering exchange REST endpoints in one burst.
-                    time.sleep(0.05)
                 except Exception as exc:
-                    errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
+                    msg = f"{symbol}: {type(exc).__name__}: {exc}"
+                    errors.append(msg)
                     log.exception("Auto engine symbol failed %s", symbol)
+                finally:
+                    now = datetime.now(timezone.utc).isoformat()
+                    with _status_lock:
+                        completed = int(_status.get("current_cycle_completed", 0)) + 1
+                        _status["current_cycle_completed"] = completed
+                        _status["current_cycle_success"] = success
+                        _status["current_cycle_error"] = len(errors)
+                        _status["last_processed_symbol"] = symbol
+                        _status["last_result_at"] = now
+                        # Lightweight visibility only; exact futures state is not needed.
+                        remaining = [s for f, s in future_map.items() if not f.done()]
+                        _status["current_symbols_in_flight"] = remaining[:AUTO_WORKERS]
         except Exception as exc:
             errors.append(f"cycle: {type(exc).__name__}: {exc}")
             log.exception("Auto engine cycle failed")
         finished = datetime.now(timezone.utc)
         with _status_lock:
             _status["cycles"] = int(_status.get("cycles", 0)) + 1
-            _status["last_cycle_started_at"] = started.isoformat()
+            _status["cycle_in_progress"] = False
+            _status["current_symbols_in_flight"] = []
             _status["last_cycle_finished_at"] = finished.isoformat()
-            _status["last_symbol_count"] = len(locals().get("symbols", []))
+            _status["last_symbol_count"] = len(symbols)
             _status["last_success_count"] = success
             _status["last_error_count"] = len(errors)
             _status["last_errors"] = errors[-20:]
         elapsed = (finished - started).total_seconds()
         time.sleep(max(1.0, AUTO_INTERVAL_SEC - elapsed))
-
 
 def start(subscription_provider: Callable[[], list[str]], signal_callback: Callable[[dict[str, Any]], None]) -> bool:
     global _started

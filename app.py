@@ -1,4 +1,4 @@
-# V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -7759,7 +7759,42 @@ def _device_allows_signal_group(device: dict[str, Any], payload: dict[str, Any])
     return group_key in enabled
 
 
-def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_reason: str) -> None:
+_FCM_SOURCE_TRACE_LOCK = threading.Lock()
+_FCM_SOURCE_TRACE = {
+    "last_source": None,
+    "last_symbol": None,
+    "last_stage": None,
+    "last_success": 0,
+    "last_failure": 0,
+    "last_sent_at": None,
+    "auto_upbit_success": 0,
+    "auto_binance_success": 0,
+    "tradingview_success": 0,
+}
+
+def _record_fcm_source_trace(source: str, payload: dict[str, Any], success: int, failure: int) -> None:
+    source = str(source or "UNKNOWN").strip().upper()
+    with _FCM_SOURCE_TRACE_LOCK:
+        _FCM_SOURCE_TRACE["last_source"] = source
+        _FCM_SOURCE_TRACE["last_symbol"] = payload.get("symbol")
+        _FCM_SOURCE_TRACE["last_stage"] = payload.get("stage")
+        _FCM_SOURCE_TRACE["last_success"] = int(success or 0)
+        _FCM_SOURCE_TRACE["last_failure"] = int(failure or 0)
+        _FCM_SOURCE_TRACE["last_sent_at"] = datetime.now(timezone.utc).isoformat()
+        if success:
+            key = {
+                "AUTO_UPBIT": "auto_upbit_success",
+                "AUTO_BINANCE": "auto_binance_success",
+                "TRADINGVIEW": "tradingview_success",
+            }.get(source)
+            if key:
+                _FCM_SOURCE_TRACE[key] = int(_FCM_SOURCE_TRACE.get(key, 0) or 0) + int(success)
+
+def _fcm_source_trace_snapshot() -> dict[str, Any]:
+    with _FCM_SOURCE_TRACE_LOCK:
+        return dict(_FCM_SOURCE_TRACE)
+
+def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_reason: str, source: str = "TRADINGVIEW") -> None:
     try:
         payload = _cadence_push_parts(route, msg, symbol, cadence_reason)
         if not payload:
@@ -7843,7 +7878,7 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
             "alert_label": payload["alert_label"],
             "signal_price": payload["signal_price"],
             "route": payload["route"],
-            "source": "telegram_cadence",
+            "source": str(source or "TRADINGVIEW").upper(),
         }
 
         for (profile, vibration), group in grouped_devices.items():
@@ -7885,12 +7920,14 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
                 "signal_price": payload["signal_price"],
                 "route": payload["route"],
                 "occurred_at": payload["occurred_at"],
+                "source": str(source or "TRADINGVIEW").upper(),
             })
         if deliveries:
             save_app_push_history(deliveries)
+        _record_fcm_source_trace(source, payload, total_success, total_failure)
         log.info(
-            "FCM cadence push symbol=%s stage=%s success=%s failure=%s history=%s profiles=%s",
-            payload["symbol"], payload["stage"], total_success,
+            "FCM cadence push source=%s symbol=%s stage=%s success=%s failure=%s history=%s profiles=%s",
+            str(source or "TRADINGVIEW").upper(), payload["symbol"], payload["stage"], total_success,
             total_failure, len(deliveries), len(grouped_devices),
         )
     except Exception:
@@ -7918,9 +7955,10 @@ def _auto_engine_signal_callback(event: dict[str, Any]) -> None:
         cadence_ok, cadence_msg, cadence_reason = _telegram_cadence_decision(route, msg, symbol)
         if not cadence_ok:
             return
+        auto_source = "AUTO_UPBIT" if symbol.upper().startswith("KRW-") else "AUTO_BINANCE"
         threading.Thread(
             target=_send_cadence_push_background,
-            args=(route, cadence_msg, symbol, cadence_reason),
+            args=(route, cadence_msg, symbol, cadence_reason, auto_source),
             name="tajum-auto-fcm",
             daemon=True,
         ).start()
@@ -7936,10 +7974,10 @@ def _ensure_auto_exchange_engine_started() -> bool:
             from auto_exchange_engine import start as start_auto_exchange_engine
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V137 automatic exchange engine started=%s", started)
+            log.info("V139 automatic exchange engine started=%s", started)
             return started
         except Exception:
-            log.exception("V137 automatic exchange engine start failed")
+            log.exception("V139 automatic exchange engine start failed")
             return False
 
 @app.get("/server-engine/auto/status")
@@ -7950,15 +7988,16 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V137",
+            "version": "V139",
             "mode": "member_watchlist -> unique_coin_symbol_compute -> FCM_fanout",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_coin_symbols"],
             "subscription": subscription,
             "engine": auto_engine_status(),
+            "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V137 auto status failed")
+        log.exception("V139 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 _ensure_auto_exchange_engine_started()
@@ -8006,7 +8045,7 @@ def _handle_payload(route: str, msg: str, symbol: str = ""):
     threading.Thread(target=_send_telegram_background, daemon=True).start()
     threading.Thread(
         target=_send_cadence_push_background,
-        args=(route, msg, symbol, cadence_reason),
+        args=(route, msg, symbol, cadence_reason, "TRADINGVIEW"),
         daemon=True,
         name="tajum-fcm-push",
     ).start()
