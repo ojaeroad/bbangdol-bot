@@ -1,4 +1,4 @@
-"""Tajum On V134 automatic exchange signal engine.
+"""Tajum On V135 automatic exchange signal engine.
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -78,8 +78,11 @@ def _upbit_rows(market: str, timeframe: str, count: int = 300) -> list[dict[str,
         return [_upbit_item_to_row(x) for x in reversed(raw)]
     if timeframe in {"2h", "6h", "12h"}:
         hours = {"2h": 2, "6h": 6, "12h": 12}[timeframe]
-        url = f"{UPBIT_BASE}/v1/candles/minutes/60"
-        # Upbit count limit is 200; more than enough for RSI/Stoch seed after aggregation.
+        # Upbit minute-candle count is capped at 200. 200 x 1h gives only ~16
+        # 12h candles, which is not enough for RSI/Stoch seed. For 12h use 4h
+        # candles and aggregate 3 at a time; 2h/6h continue to use 1h candles.
+        base_unit = 240 if timeframe == "12h" else 60
+        url = f"{UPBIT_BASE}/v1/candles/minutes/{base_unit}"
         response = requests.get(url, params={"market": market, "count": 200}, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         base = [_upbit_item_to_row(x) for x in reversed(response.json())]
@@ -218,13 +221,15 @@ def _run_loop(
                     elif symbol.endswith("USDT"):
                         result = _evaluate_binance(symbol)
                     else:
-                        # V134 production auto engine is deliberately coin-only.
+                        # V135 production auto engine is deliberately coin-only.
                         continue
                     success += 1
                     for side in ("buy", "sell"):
                         event = _event_from_chain(result, side)
                         if event:
                             signal_callback(event)
+                    # Avoid hammering exchange REST endpoints in one burst.
+                    time.sleep(0.05)
                 except Exception as exc:
                     errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
                     log.exception("Auto engine symbol failed %s", symbol)

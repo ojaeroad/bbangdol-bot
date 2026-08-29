@@ -106,40 +106,46 @@ def _auto_register_subscription_snapshot(device_id: str, symbols: list[str]) -> 
         _AUTO_SUBSCRIPTIONS[device_id] = clean
 
 def _auto_active_unique_symbols() -> list[str]:
+    """Return active coin symbols without touching the performance DB/schema path.
+
+    V134 called app_device_summary() here. That function calls ensure_schema() and can
+    block on performance_store._SCHEMA_LOCK while the performance automation is doing
+    its own schema work. On a single sync Gunicorn worker this made /auto/status hang
+    until WORKER TIMEOUT. V135 keeps the automatic engine subscription registry fully
+    isolated from the heavy performance center path.
+    """
     with _AUTO_SUB_LOCK:
         values: set[str] = set()
         for symbols in _AUTO_SUBSCRIPTIONS.values():
             values.update(symbols)
 
-    # If performance_store exposes symbol details in its summary, absorb them too.
-    # Older deployments only return counts, so this remains backward compatible.
-    try:
-        summary = app_device_summary()
-        def collect(node):
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if str(key).lower() in {"enabled_symbols", "symbols", "active_symbols", "watchlist_symbols"}:
-                        collect(value)
-                    elif isinstance(value, (dict, list, tuple, set)):
-                        collect(value)
-            elif isinstance(node, (list, tuple, set)):
-                for item in node:
-                    collect(item)
-            elif isinstance(node, str):
-                code = _clean_symbol_code(node) if '_clean_symbol_code' in globals() else node.strip().upper()
-                if code.startswith('KRW-') or code.endswith('USDT'):
-                    values.add(code)
-        collect(summary)
-    except Exception:
-        pass
+    # Production auto calculation is coin-only for now. Stock watchlist entries are
+    # intentionally excluded so 12 국장 + 8 미장 do not add useless engine work.
+    values = {
+        code for code in values
+        if str(code).startswith("KRW-") or str(code).endswith("USDT")
+    }
 
     seed = os.getenv("TAJUM_AUTO_ENGINE_SEED_SYMBOLS", "").strip()
     if seed:
         for item in seed.split(','):
             code = _clean_symbol_code(item.strip()) if '_clean_symbol_code' in globals() else item.strip().upper()
-            if code:
+            if code and (code.startswith("KRW-") or code.endswith("USDT")):
                 values.add(code)
     return sorted(values)
+
+
+def _auto_subscription_status() -> dict[str, Any]:
+    with _AUTO_SUB_LOCK:
+        device_count = len(_AUTO_SUBSCRIPTIONS)
+        snapshot_sizes = {device_id: len(symbols) for device_id, symbols in _AUTO_SUBSCRIPTIONS.items()}
+    active = _auto_active_unique_symbols()
+    return {
+        "snapshot_device_count": device_count,
+        "snapshot_symbol_counts": snapshot_sizes,
+        "active_coin_symbol_count": len(active),
+        "active_coin_symbols": active,
+    }
 
 
 app.config.update(
@@ -3085,6 +3091,11 @@ def app_recent_alerts():
     raw_symbols = request.args.get("symbols", "").strip()
     symbols = [_clean_symbol_code(part) for part in raw_symbols.split(",") if part.strip()]
     symbols = [symbol for symbol in symbols if symbol]
+    # V135: after Render redeploy the in-memory auto-engine snapshot starts empty.
+    # Home already calls this endpoint with its enabled symbols, so reuse that request
+    # to repopulate subscriptions immediately without entering performance_store schema.
+    if raw_symbols:
+        _auto_register_subscription_snapshot(device_id, symbols)
 
     try:
         requested_limit = int(request.args.get("limit", "300") or 300)
@@ -3101,17 +3112,16 @@ def app_recent_alerts():
     # v131: 회원 노출 문구는 저장 당시의 레거시 1/3 표기와 무관하게
     # 현재 확정된 "분할매수/분할매도 N차 타점"으로 통일한다.
     normalized_alerts = []
-    emoji_by_stage = {1: "❗", 2: "‼️", 3: "🚨"}
     for item in alerts:
         row = dict(item)
         direction = str(row.get("direction", "") or "").upper()
         stage = max(0, min(int(row.get("stage", 0) or 0), 3))
         side_label = "매수" if direction == "LOW" else "매도"
         if stage <= 0:
-            row["alert_label"] = f"✍🏻 {side_label} 집중"
+            row["alert_label"] = f"{side_label} 대기"
         else:
             split_side_label = "분할 매수" if direction == "LOW" else "분할 매도"
-            row["alert_label"] = f"{emoji_by_stage[stage]} {split_side_label} {stage}차 타점"
+            row["alert_label"] = f"{split_side_label} {stage}차 타점"
 
         # v132: 과거 저장 이력도 현재 사용자 표기 규칙으로 다시 정규화한다.
         # 예: MSFT (미장) -> MSFT MICROSOFT (미장)
@@ -3131,7 +3141,7 @@ def app_recent_alerts():
         else:
             hist_name = ""
         if hist_symbol:
-            row["display"] = _app_display_label(hist_symbol, hist_name, hist_market, hist_exchange)
+            row["display"] = _app_user_display_label(hist_symbol, hist_name, hist_market, hist_exchange)
             category_key, category_label = _app_market_category(hist_market, hist_exchange, hist_symbol)
             row["category_key"] = category_key
             row["category_label"] = category_label
@@ -7789,17 +7799,22 @@ def _ensure_auto_exchange_engine_started() -> bool:
 
 @app.get("/server-engine/auto/status")
 def server_engine_auto_status():
+    """Fast status endpoint. Never enters performance DB/schema locks."""
     try:
         from auto_exchange_engine import status as auto_engine_status
+        subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "mode": "member_watchlist -> unique_symbol_compute -> FCM_fanout",
+            "version": "V135",
+            "mode": "member_watchlist -> unique_coin_symbol_compute -> FCM_fanout",
             "tradingview_required": False,
-            "active_unique_symbols": _auto_active_unique_symbols(),
+            "active_unique_symbols": subscription["active_coin_symbols"],
+            "subscription": subscription,
             "engine": auto_engine_status(),
         }), 200
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        log.exception("V135 auto status failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 _ensure_auto_exchange_engine_started()
 
