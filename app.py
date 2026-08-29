@@ -1,4 +1,4 @@
-# V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -91,6 +91,56 @@ if not app.secret_key:
     # Render 환경변수가 아직 없을 때 서버가 죽지는 않게 하되,
     # 반드시 PERFORMANCE_SESSION_SECRET을 등록해야 한다.
     app.secret_key = "CHANGE-ME-PERFORMANCE-SESSION-SECRET"
+
+# V134: active app subscriptions used by the automatic exchange engine.
+# The app re-registers on launch/settings change. This registry is intentionally
+# separate from the heavy performance-analysis path so the worker never blocks
+# /performance/dashboard calculations.
+_AUTO_SUB_LOCK = threading.RLock()
+_AUTO_SUBSCRIPTIONS: dict[str, set[str]] = {}
+
+def _auto_register_subscription_snapshot(device_id: str, symbols: list[str]) -> None:
+    clean = {_clean_symbol_code(x) if '_clean_symbol_code' in globals() else str(x or '').strip().upper() for x in symbols}
+    clean = {x for x in clean if x}
+    with _AUTO_SUB_LOCK:
+        _AUTO_SUBSCRIPTIONS[device_id] = clean
+
+def _auto_active_unique_symbols() -> list[str]:
+    with _AUTO_SUB_LOCK:
+        values: set[str] = set()
+        for symbols in _AUTO_SUBSCRIPTIONS.values():
+            values.update(symbols)
+
+    # If performance_store exposes symbol details in its summary, absorb them too.
+    # Older deployments only return counts, so this remains backward compatible.
+    try:
+        summary = app_device_summary()
+        def collect(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if str(key).lower() in {"enabled_symbols", "symbols", "active_symbols", "watchlist_symbols"}:
+                        collect(value)
+                    elif isinstance(value, (dict, list, tuple, set)):
+                        collect(value)
+            elif isinstance(node, (list, tuple, set)):
+                for item in node:
+                    collect(item)
+            elif isinstance(node, str):
+                code = _clean_symbol_code(node) if '_clean_symbol_code' in globals() else node.strip().upper()
+                if code.startswith('KRW-') or code.endswith('USDT'):
+                    values.add(code)
+        collect(summary)
+    except Exception:
+        pass
+
+    seed = os.getenv("TAJUM_AUTO_ENGINE_SEED_SYMBOLS", "").strip()
+    if seed:
+        for item in seed.split(','):
+            code = _clean_symbol_code(item.strip()) if '_clean_symbol_code' in globals() else item.strip().upper()
+            if code:
+                values.add(code)
+    return sorted(values)
+
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -2730,7 +2780,7 @@ def app_symbol_detail():
         if stage <= 0:
             alert_label = f"{side_label} 대기"
         else:
-            split_side_label = "분할매수" if direction == "LOW" else "분할매도"
+            split_side_label = "분할 매수" if direction == "LOW" else "분할 매도"
             alert_label = f"{split_side_label} {stage}차 타점"
         enriched = dict(row)
         market_value = item.get("market") or _app_symbol_market(item["symbol"])
@@ -2971,6 +3021,7 @@ def app_device_register():
             vibration_enabled=vibration_enabled,
             enabled_signal_groups=signal_groups,
         )
+        _auto_register_subscription_snapshot(device_id, symbols if notifications_enabled else [])
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception:
@@ -3059,7 +3110,7 @@ def app_recent_alerts():
         if stage <= 0:
             row["alert_label"] = f"✍🏻 {side_label} 집중"
         else:
-            split_side_label = "분할매수" if direction == "LOW" else "분할매도"
+            split_side_label = "분할 매수" if direction == "LOW" else "분할 매도"
             row["alert_label"] = f"{emoji_by_stage[stage]} {split_side_label} {stage}차 타점"
 
         # v132: 과거 저장 이력도 현재 사용자 표기 규칙으로 다시 정규화한다.
@@ -7478,7 +7529,7 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
     if stage == 0:
         alert_label = f"{side_label} 대기"
     else:
-        split_side_label = "분할매수" if direction == "LOW" else "분할매도"
+        split_side_label = "분할 매수" if direction == "LOW" else "분할 매도"
         alert_label = f"{split_side_label} {stage}차 타점"
 
     price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
@@ -7526,8 +7577,8 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "delivery_key": delivery_key,
         # Put the actionable signal information first so Android notification
         # truncation never hides buy/sell direction or timeframe.
-        # Example title: "✍🏻 매수 집중 · 단타 5m"
-        # Example body : "ETHUSDT 이더리움 (바이낸스) · 2,480.26"
+        # Example title: "매수 대기 · 짧은 단타"
+        # Example body : "이더리움 (코인 USDT) · 2,480.26"
         "title": " · ".join(
             part for part in (
                 alert_label,
@@ -7690,6 +7741,67 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
     except Exception:
         log.exception("FCM cadence push failed route=%s symbol=%s", route, symbol)
 
+
+
+
+# --- V134 automatic exchange engine -------------------------------------------------
+_AUTO_ENGINE_STARTED = False
+_AUTO_ENGINE_START_LOCK = threading.Lock()
+
+def _auto_engine_signal_callback(event: dict[str, Any]) -> None:
+    """Feed server-calculated signals through the existing V103 cadence and FCM fan-out.
+
+    Telegram is intentionally not sent here: automatic app alerts are independent of
+    manual TradingView/Telegram operation.
+    """
+    try:
+        route = str(event.get("route", "") or "")
+        msg = str(event.get("message", "") or "")
+        symbol = str(event.get("symbol", "") or "")
+        if not route or not msg or not symbol:
+            return
+        cadence_ok, cadence_msg, cadence_reason = _telegram_cadence_decision(route, msg, symbol)
+        if not cadence_ok:
+            return
+        threading.Thread(
+            target=_send_cadence_push_background,
+            args=(route, cadence_msg, symbol, cadence_reason),
+            name="tajum-auto-fcm",
+            daemon=True,
+        ).start()
+    except Exception:
+        log.exception("V134 auto-engine signal callback failed event=%s", event)
+
+def _ensure_auto_exchange_engine_started() -> bool:
+    global _AUTO_ENGINE_STARTED
+    with _AUTO_ENGINE_START_LOCK:
+        if _AUTO_ENGINE_STARTED:
+            return False
+        try:
+            from auto_exchange_engine import start as start_auto_exchange_engine
+            started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
+            _AUTO_ENGINE_STARTED = True
+            log.info("V134 automatic exchange engine started=%s", started)
+            return started
+        except Exception:
+            log.exception("V134 automatic exchange engine start failed")
+            return False
+
+@app.get("/server-engine/auto/status")
+def server_engine_auto_status():
+    try:
+        from auto_exchange_engine import status as auto_engine_status
+        return jsonify({
+            "ok": True,
+            "mode": "member_watchlist -> unique_symbol_compute -> FCM_fanout",
+            "tradingview_required": False,
+            "active_unique_symbols": _auto_active_unique_symbols(),
+            "engine": auto_engine_status(),
+        }), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+_ensure_auto_exchange_engine_started()
 
 def _handle_payload(route: str, msg: str, symbol: str = ""):
     if not route or not msg:
