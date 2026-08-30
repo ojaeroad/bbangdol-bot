@@ -1,4 +1,4 @@
-"""Tajum On V142 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V143 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -32,6 +32,14 @@ HTTP_TIMEOUT = max(3, min(int(os.getenv("TAJUM_AUTO_ENGINE_HTTP_TIMEOUT_SEC", "8
 MAX_SYMBOLS_PER_CYCLE = max(1, min(int(os.getenv("TAJUM_AUTO_ENGINE_MAX_SYMBOLS", "300") or 300), 1000))
 AUTO_WORKERS = max(1, min(int(os.getenv("TAJUM_AUTO_ENGINE_WORKERS", "4") or 4), 8))
 UPBIT_BASE = os.getenv("UPBIT_API_BASE", "https://api.upbit.com").rstrip("/")
+# Upbit candle REST limit is IP-based. Keep a conservative global rate across
+# all worker threads and reuse responses inside a cycle to avoid 429 bursts.
+UPBIT_MIN_INTERVAL_SEC = max(0.13, min(float(os.getenv("UPBIT_HTTP_MIN_INTERVAL_SEC", "0.13") or 0.13), 1.0))
+UPBIT_CACHE_TTL_SEC = max(5, min(int(os.getenv("UPBIT_CACHE_TTL_SEC", "50") or 50), 300))
+_upbit_http_lock = threading.Lock()
+_upbit_last_http_at = 0.0
+_upbit_cache_lock = threading.Lock()
+_upbit_cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 
 _started = False
 _started_pid = 0
@@ -90,33 +98,82 @@ def _float(value: Any) -> float:
     return out
 
 
+def _upbit_rate_guard() -> None:
+    global _upbit_last_http_at
+    with _upbit_http_lock:
+        now = time.monotonic()
+        wait = UPBIT_MIN_INTERVAL_SEC - (now - _upbit_last_http_at)
+        if wait > 0:
+            time.sleep(wait)
+        _upbit_last_http_at = time.monotonic()
+
+
+def _upbit_fetch(path: str, market: str, *, request_count: int = 200) -> list[dict[str, Any]]:
+    """Fetch one Upbit candle resource with global throttling/backoff/cache.
+
+    The cache key intentionally ignores the caller's smaller requested count: each
+    network call asks for up to 200 rows and callers slice locally. This lets 1h
+    share data with 2h/6h, 4h share with 12h, and 5m current-price reuse 5m metrics.
+    """
+    key = (f"{path}|{market}", 200)
+    now = time.monotonic()
+    with _upbit_cache_lock:
+        hit = _upbit_cache.get(key)
+        if hit and now - hit[0] <= UPBIT_CACHE_TTL_SEC:
+            return list(hit[1])
+
+    url = f"{UPBIT_BASE}{path}"
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        _upbit_rate_guard()
+        try:
+            response = requests.get(url, params={"market": market, "count": 200}, timeout=HTTP_TIMEOUT)
+            if response.status_code in {429, 418}:
+                # 429 = rate limit, 418 = temporary block. Back off globally before retry.
+                delay = min(8.0, 0.75 * (2 ** attempt))
+                time.sleep(delay)
+                last_exc = requests.HTTPError(f"Upbit {response.status_code} rate limit for {market} {path}")
+                continue
+            response.raise_for_status()
+            raw = response.json()
+            if not isinstance(raw, list):
+                raise RuntimeError(f"unexpected Upbit candle response: {type(raw).__name__}")
+            with _upbit_cache_lock:
+                _upbit_cache[key] = (time.monotonic(), list(raw))
+                # bounded cache: active symbols x a handful of candle resources only
+                if len(_upbit_cache) > 2000:
+                    cutoff = time.monotonic() - UPBIT_CACHE_TTL_SEC
+                    for cache_key, (ts, _) in list(_upbit_cache.items()):
+                        if ts < cutoff:
+                            _upbit_cache.pop(cache_key, None)
+            return raw
+        except (requests.RequestException, RuntimeError) as exc:
+            last_exc = exc
+            if attempt >= 4:
+                break
+            time.sleep(min(4.0, 0.35 * (2 ** attempt)))
+    assert last_exc is not None
+    raise last_exc
+
+
 def _upbit_rows(market: str, timeframe: str, count: int = 300) -> list[dict[str, Any]]:
     """Fetch Upbit candles, oldest -> newest, then aggregate 2h/6h/12h locally."""
     if timeframe in {"5m", "15m", "30m", "1h", "4h"}:
         unit = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}[timeframe]
-        url = f"{UPBIT_BASE}/v1/candles/minutes/{unit}"
-        response = requests.get(url, params={"market": market, "count": min(count, 200)}, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        raw = response.json()
+        raw = _upbit_fetch(f"/v1/candles/minutes/{unit}", market)
         rows = [_upbit_item_to_row(x) for x in reversed(raw)]
-        return rows
+        return rows[-min(count, 200):]
     if timeframe in {"1d", "1w"}:
         kind = "days" if timeframe == "1d" else "weeks"
-        url = f"{UPBIT_BASE}/v1/candles/{kind}"
-        response = requests.get(url, params={"market": market, "count": min(count, 200)}, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        raw = response.json()
-        return [_upbit_item_to_row(x) for x in reversed(raw)]
+        raw = _upbit_fetch(f"/v1/candles/{kind}", market)
+        rows = [_upbit_item_to_row(x) for x in reversed(raw)]
+        return rows[-min(count, 200):]
     if timeframe in {"2h", "6h", "12h"}:
         hours = {"2h": 2, "6h": 6, "12h": 12}[timeframe]
-        # Upbit minute-candle count is capped at 200. 200 x 1h gives only ~16
-        # 12h candles, which is not enough for RSI/Stoch seed. For 12h use 4h
-        # candles and aggregate 3 at a time; 2h/6h continue to use 1h candles.
+        # 12h uses cached 4h candles, 2h/6h reuse the cached 1h resource.
         base_unit = 240 if timeframe == "12h" else 60
-        url = f"{UPBIT_BASE}/v1/candles/minutes/{base_unit}"
-        response = requests.get(url, params={"market": market, "count": 200}, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        base = [_upbit_item_to_row(x) for x in reversed(response.json())]
+        raw = _upbit_fetch(f"/v1/candles/minutes/{base_unit}", market)
+        base = [_upbit_item_to_row(x) for x in reversed(raw)]
         return _aggregate_rows(base, hours * 60)
     raise ValueError(f"unsupported Upbit timeframe: {timeframe}")
 

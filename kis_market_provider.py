@@ -1,4 +1,4 @@
-"""Tajum On V142 KIS market-data provider.
+"""Tajum On V143 KIS market-data provider.
 
 Purpose
 -------
@@ -22,7 +22,7 @@ KIS_OVERSEAS_PAGES                                  default 4
 
 Notes
 -----
-Domestic KIS minute history is page-oriented 1-minute data. V142 intentionally
+Domestic KIS minute history is page-oriented 1-minute data. V143 intentionally
 caches fetched history on disk so expensive warm-up is not repeated every cycle.
 Attach a Render persistent disk and set KIS_CACHE_DIR to that mount for production.
 """
@@ -327,11 +327,41 @@ def _parse_domestic_minute_item(item: dict[str, Any], fallback_date: str) -> dic
         return None
 
 
+def _previous_weekday(day):
+    day = day - timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
+def _kr_first_query_point(day):
+    """Return (query_day, HHMMSS) accepted by KIS domestic minute history.
+
+    Official KIS examples/backtester query historical minutes from 15:30 backwards.
+    For today's open market we may start at the current KST minute; before 09:00 we
+    use the previous weekday. Exchange holidays are handled by the caller as an
+    empty/failed day and skipped without failing the whole symbol.
+    """
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+    if day.weekday() >= 5:
+        return _previous_weekday(day + timedelta(days=1)), "153000"
+    if day == now.date():
+        hhmmss = now.strftime("%H%M00")
+        if hhmmss < "090000":
+            return _previous_weekday(day), "153000"
+        if hhmmss > "153000":
+            return day, "153000"
+        return day, hhmmss
+    return day, "153000"
+
+
 def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
     """Warm-up KRX 1m rows across recent business days, cache on disk.
 
-    KIS domestic minute history is page based. The cache is intentionally reused
-    for all 30m/1h/4h calculations and refreshed only every CACHE_TTL seconds.
+    V143 follows the official KIS minute-history pattern: 15:30 (or today's current
+    market minute) backwards. A bad/holiday day is isolated and skipped instead of
+    aborting the whole stock calculation.
     """
     cached = _cache_load("kr_minute", symbol)
     if cached:
@@ -339,28 +369,38 @@ def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
     all_rows: dict[int, dict[str, Any]] = {}
     today = datetime.now(timezone(timedelta(hours=9))).date()
     days_seen = 0
+    calendar_scans = 0
     cursor_day = today
-    while days_seen < DOMESTIC_HISTORY_DAYS:
+    max_calendar_scans = DOMESTIC_HISTORY_DAYS * 3
+    while days_seen < DOMESTIC_HISTORY_DAYS and calendar_scans < max_calendar_scans:
+        calendar_scans += 1
         if cursor_day.weekday() >= 5:
             cursor_day -= timedelta(days=1)
             continue
+        query_day, cursor_time = _kr_first_query_point(cursor_day)
+        if query_day != cursor_day:
+            cursor_day = query_day
         ds = cursor_day.strftime("%Y%m%d")
-        cursor_time = "200000"
         day_had_data = False
         last_oldest = ""
         for _ in range(DOMESTIC_PAGES_PER_DAY):
-            body, _ = _get(
-                "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
-                "FHKST03010230",
-                {
-                    "FID_COND_MRKT_DIV_CODE": "J",
-                    "FID_INPUT_ISCD": symbol,
-                    "FID_INPUT_HOUR_1": cursor_time,
-                    "FID_INPUT_DATE_1": ds,
-                    "FID_PW_DATA_INCU_YN": "Y",
-                    "FID_FAKE_TICK_INCU_YN": "",
-                },
-            )
+            try:
+                body, _ = _get(
+                    "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+                    "FHKST03010230",
+                    {
+                        "FID_COND_MRKT_DIV_CODE": "J",
+                        "FID_INPUT_ISCD": symbol,
+                        "FID_INPUT_HOUR_1": cursor_time,
+                        "FID_INPUT_DATE_1": ds,
+                        "FID_PW_DATA_INCU_YN": "Y",
+                        "FID_FAKE_TICK_INCU_YN": "",
+                    },
+                )
+            except requests.HTTPError as exc:
+                # KIS may answer 500 for a holiday/unsupported historical point.
+                # Skip this day/page; previous trading days can still warm the chain.
+                break
             raw = body.get("output2") or []
             if not isinstance(raw, list) or not raw:
                 break
@@ -376,7 +416,7 @@ def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
             oldest = min(page_rows, key=lambda x: x["open_time"])
             local_oldest = datetime.fromtimestamp(oldest["open_time"] / 1000, timezone.utc).astimezone(timezone(timedelta(hours=9)))
             oldest_key = local_oldest.strftime("%H%M%S")
-            if oldest_key == last_oldest or oldest_key <= "085900":
+            if oldest_key == last_oldest or oldest_key <= "090000":
                 break
             last_oldest = oldest_key
             cursor_time = (local_oldest - timedelta(minutes=1)).strftime("%H%M%S")
@@ -514,19 +554,47 @@ def overseas_daily(symbol: str, exchange: str | None = None) -> list[dict[str, A
     if cached:
         return cached
     all_rows: dict[int, dict[str, Any]] = {}
-    bymd = datetime.now().strftime("%Y%m%d")
+
+    # KIS official dailyprice continuation keeps the same BYMD and advances with
+    # the tr_cont header. V142 changed BYMD to the last returned date, which could
+    # jump far backwards and eventually produce 500 responses. Restore the official
+    # continuation pattern and use the latest weekday as the query anchor.
+    anchor = datetime.now(timezone.utc).date()
+    while anchor.weekday() >= 5:
+        anchor -= timedelta(days=1)
+    bymd = anchor.strftime("%Y%m%d")
     tr_cont = ""
-    for page in range(4):
-        body, headers = _get(
-            "/uapi/overseas-price/v1/quotations/dailyprice",
-            "HHDFS76240000",
-            {"AUTH": "", "EXCD": excd, "SYMB": symbol.upper(), "GUBN": "0", "BYMD": bymd, "MODP": "1"},
-            tr_cont=tr_cont,
-        )
+    seen_pages: set[tuple[str, str]] = set()
+    for page in range(max(2, OVERSEAS_PAGES)):
+        try:
+            body, headers = _get(
+                "/uapi/overseas-price/v1/quotations/dailyprice",
+                "HHDFS76240000",
+                {"AUTH": "", "EXCD": excd, "SYMB": symbol.upper(), "GUBN": "0", "BYMD": bymd, "MODP": "1"},
+                tr_cont=tr_cont,
+            )
+        except requests.HTTPError:
+            # If the anchor is a US holiday, move back one weekday and retry once
+            # only before giving up/using already accumulated rows.
+            if page == 0:
+                anchor = _previous_weekday(anchor)
+                bymd = anchor.strftime("%Y%m%d")
+                try:
+                    body, headers = _get(
+                        "/uapi/overseas-price/v1/quotations/dailyprice",
+                        "HHDFS76240000",
+                        {"AUTH": "", "EXCD": excd, "SYMB": symbol.upper(), "GUBN": "0", "BYMD": bymd, "MODP": "1"},
+                        tr_cont=tr_cont,
+                    )
+                except requests.HTTPError:
+                    break
+            else:
+                break
         raw = body.get("output2") or []
         if not isinstance(raw, list) or not raw:
             break
-        last_date = ""
+        page_dates: list[str] = []
+        before = len(all_rows)
         for item in raw:
             ds = str(item.get("xymd") or "")
             if len(ds) != 8:
@@ -543,13 +611,19 @@ def overseas_daily(symbol: str, exchange: str | None = None) -> list[dict[str, A
                     "close_time": _ms(dt),
                 }
                 all_rows[row["open_time"]] = row
-                last_date = ds
+                page_dates.append(ds)
             except Exception:
                 continue
-        if not last_date:
+        if not page_dates:
             break
-        bymd = last_date
-        if str(headers.get("tr_cont", "")).upper() not in {"M", "F"}:
+        signature = (min(page_dates), max(page_dates))
+        if signature in seen_pages or len(all_rows) == before:
+            break
+        seen_pages.add(signature)
+        if len(all_rows) >= 220:  # enough for 31+ weekly bars after 5-day aggregation
+            break
+        cont = str(headers.get("tr_cont", "")).upper()
+        if cont not in {"M", "F"}:
             break
         tr_cont = "N"
     rows = [all_rows[k] for k in sorted(all_rows)]
