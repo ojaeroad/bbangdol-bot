@@ -1,4 +1,4 @@
-"""Tajum On V143 KIS market-data provider.
+"""Tajum On V144 KIS market-data provider.
 
 Purpose
 -------
@@ -13,12 +13,22 @@ KIS_APP_KEY, KIS_APP_SECRET                         required for stock direct ca
 KIS_ENV=real|demo                                   default real
 KIS_BASE_URL                                        optional override
 KIS_HTTP_TIMEOUT_SEC                                default 8
-KIS_HTTP_MIN_INTERVAL_SEC                           default 0.07 (global rate guard)
+KIS_HTTP_MIN_INTERVAL_SEC                           default 0.15 (global rate guard)
 KIS_CACHE_DIR                                       default /tmp/tajum_kis_cache
 KIS_CACHE_TTL_SEC                                   default 21600 (6h)
-KIS_DOMESTIC_HISTORY_DAYS                           default 24
-KIS_DOMESTIC_PAGES_PER_DAY                          default 8
+KIS_DOMESTIC_HISTORY_DAYS                           default 22 (hard max 30)
+KIS_DOMESTIC_PAGES_PER_DAY                          default 4 (KRX 390m / 120 rows)
 KIS_OVERSEAS_PAGES                                  default 4
+
+V144 notes
+----------
+- Follows the official KIS domestic minute pagination stop rule: stop when the
+  page is shorter than 120 rows or the oldest time reaches 09:00.
+- Reuses the oldest time as the next cursor (dedup handles overlap) instead of
+  subtracting one minute, which caused 09:20-era 500 responses on some days.
+- Stops domestic 1m warm-up as soon as enough aggregated 4h bars exist.
+- Retries only transient gateway/rate-limit errors; invalid historical points are
+  isolated without repeatedly hammering KIS.
 
 Notes
 -----
@@ -52,11 +62,11 @@ KIS_BASE_URL = os.getenv(
     "https://openapi.koreainvestment.com:9443" if KIS_ENV == "real" else "https://openapivts.koreainvestment.com:29443",
 ).rstrip("/")
 HTTP_TIMEOUT = max(3, min(int(os.getenv("KIS_HTTP_TIMEOUT_SEC", "8") or 8), 30))
-MIN_INTERVAL = max(0.03, min(float(os.getenv("KIS_HTTP_MIN_INTERVAL_SEC", "0.07") or 0.07), 1.0))
+MIN_INTERVAL = max(0.08, min(float(os.getenv("KIS_HTTP_MIN_INTERVAL_SEC", "0.15") or 0.15), 1.0))
 CACHE_DIR = Path(os.getenv("KIS_CACHE_DIR", "/tmp/tajum_kis_cache") or "/tmp/tajum_kis_cache")
 CACHE_TTL = max(300, min(int(os.getenv("KIS_CACHE_TTL_SEC", "21600") or 21600), 86400 * 7))
-DOMESTIC_HISTORY_DAYS = max(5, min(int(os.getenv("KIS_DOMESTIC_HISTORY_DAYS", "24") or 24), 40))
-DOMESTIC_PAGES_PER_DAY = max(1, min(int(os.getenv("KIS_DOMESTIC_PAGES_PER_DAY", "8") or 8), 20))
+DOMESTIC_HISTORY_DAYS = max(5, min(int(os.getenv("KIS_DOMESTIC_HISTORY_DAYS", "22") or 22), 30))
+DOMESTIC_PAGES_PER_DAY = max(1, min(int(os.getenv("KIS_DOMESTIC_PAGES_PER_DAY", "4") or 4), 6))
 OVERSEAS_PAGES = max(1, min(int(os.getenv("KIS_OVERSEAS_PAGES", "4") or 4), 10))
 
 _token_lock = threading.Lock()
@@ -78,6 +88,11 @@ _status: dict[str, Any] = {
     "request_count": 0,
     "success_count": 0,
     "error_count": 0,
+    "rate_limit_count": 0,
+    "transient_retry_count": 0,
+    "cache_hit_count": 0,
+    "domestic_warmup_calls": 0,
+    "domestic_warmup_days": 0,
 }
 
 
@@ -136,38 +151,87 @@ def _access_token() -> str:
 
 
 def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") -> tuple[dict[str, Any], dict[str, str]]:
+    """KIS GET with conservative pacing and bounded transient retries.
+
+    429/5xx gateway errors are retried at most twice. Business-level EGW00201 is
+    treated as a rate-limit event and retried after a longer pause. Other KIS
+    business errors fail immediately so a bad historical cursor cannot create a
+    retry storm.
+    """
     if not configured():
         raise RuntimeError("KIS_NOT_CONFIGURED")
-    _rate_guard()
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        _rate_guard()
+        with _status_lock:
+            _status["request_count"] = int(_status.get("request_count", 0) or 0) + 1
+            _status["last_request_at"] = datetime.now(timezone.utc).isoformat()
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {_access_token()}",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET,
+            "tr_id": tr_id,
+            "custtype": "P",
+        }
+        if tr_cont:
+            headers["tr_cont"] = tr_cont
+        try:
+            resp = requests.get(f"{KIS_BASE_URL}{path}", headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            if resp.status_code in {429, 500, 502, 503, 504}:
+                if resp.status_code == 429:
+                    with _status_lock:
+                        _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
+                last_exc = requests.HTTPError(
+                    f"{resp.status_code} Server Error: {resp.text[:240]}", response=resp
+                )
+                # Historical 500s are often invalid cursor points. One retry is
+                # enough; repeated retries only multiply load.
+                if attempt >= (1 if resp.status_code == 500 else 2):
+                    raise last_exc
+                with _status_lock:
+                    _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                time.sleep(0.8 * (attempt + 1))
+                continue
+
+            resp.raise_for_status()
+            body = resp.json()
+            rt_cd = str(body.get("rt_cd", "0"))
+            if rt_cd not in {"0", ""}:
+                msg_cd = str(body.get("msg_cd") or "")
+                msg1 = str(body.get("msg1") or "")
+                if msg_cd == "EGW00201":
+                    with _status_lock:
+                        _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
+                    if attempt < 2:
+                        with _status_lock:
+                            _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                        time.sleep(2.0 * (attempt + 1))
+                        continue
+                raise RuntimeError(f"KIS {msg_cd}: {msg1}")
+
+            with _status_lock:
+                _status["success_count"] = int(_status.get("success_count", 0) or 0) + 1
+                _status["last_success_at"] = datetime.now(timezone.utc).isoformat()
+                _status["last_error"] = None
+            return body, {str(k).lower(): str(v) for k, v in resp.headers.items()}
+        except Exception as exc:
+            last_exc = exc
+            # Only connection/timeouts get another loop here. HTTP and business
+            # errors have already been explicitly classified above.
+            if isinstance(exc, (requests.ConnectionError, requests.Timeout)) and attempt < 2:
+                with _status_lock:
+                    _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            break
+
     with _status_lock:
-        _status["request_count"] = int(_status.get("request_count", 0) or 0) + 1
-        _status["last_request_at"] = datetime.now(timezone.utc).isoformat()
-    headers = {
-        "content-type": "application/json; charset=utf-8",
-        "authorization": f"Bearer {_access_token()}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
-        "tr_id": tr_id,
-        "custtype": "P",
-    }
-    if tr_cont:
-        headers["tr_cont"] = tr_cont
-    try:
-        resp = requests.get(f"{KIS_BASE_URL}{path}", headers=headers, params=params, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        body = resp.json()
-        if str(body.get("rt_cd", "0")) not in {"0", ""}:
-            raise RuntimeError(f"KIS {body.get('msg_cd')}: {body.get('msg1')}")
-        with _status_lock:
-            _status["success_count"] = int(_status.get("success_count", 0) or 0) + 1
-            _status["last_success_at"] = datetime.now(timezone.utc).isoformat()
-            _status["last_error"] = None
-        return body, {str(k).lower(): str(v) for k, v in resp.headers.items()}
-    except Exception as exc:
-        with _status_lock:
-            _status["error_count"] = int(_status.get("error_count", 0) or 0) + 1
-            _status["last_error"] = f"{type(exc).__name__}: {exc}"
-        raise
+        _status["error_count"] = int(_status.get("error_count", 0) or 0) + 1
+        _status["last_error"] = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown"
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("KIS request failed")
 
 
 def _num(value: Any) -> float:
@@ -189,13 +253,18 @@ def _cache_path(kind: str, symbol: str) -> Path:
     return CACHE_DIR / f"{kind}_{safe}.json"
 
 
-def _cache_load(kind: str, symbol: str) -> list[dict[str, Any]] | None:
+def _cache_load(kind: str, symbol: str, max_age: int | float | None = None) -> list[dict[str, Any]] | None:
     path = _cache_path(kind, symbol)
     try:
-        if not path.exists() or time.time() - path.stat().st_mtime > CACHE_TTL:
+        ttl = CACHE_TTL if max_age is None else max(1.0, float(max_age))
+        if not path.exists() or time.time() - path.stat().st_mtime > ttl:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else None
+        if isinstance(data, list):
+            with _status_lock:
+                _status["cache_hit_count"] = int(_status.get("cache_hit_count", 0) or 0) + 1
+            return data
+        return None
     except Exception:
         return None
 
@@ -264,42 +333,63 @@ def _day_aggregate(rows: list[dict[str, Any]], days: int) -> list[dict[str, Any]
 
 def domestic_daily(symbol: str, count_hint: int = 180) -> list[dict[str, Any]]:
     cached = _cache_load("kr_daily", symbol)
-    if cached:
+    if cached and len(cached) >= min(160, count_hint):
         return cached
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=max(240, count_hint * 2))).strftime("%Y%m%d")
-    body, _ = _get(
-        "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-        "FHKST03010100",
-        {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": symbol,
-            "FID_INPUT_DATE_1": start,
-            "FID_INPUT_DATE_2": end,
-            "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "0",
-        },
-    )
-    raw = body.get("output2") or body.get("output") or []
-    rows = []
-    for item in raw if isinstance(raw, list) else []:
-        ds = str(item.get("stck_bsop_date") or "")
-        if len(ds) != 8:
-            continue
-        dt = datetime.strptime(ds, "%Y%m%d").replace(tzinfo=timezone.utc)
-        try:
-            rows.append({
-                "open_time": _ms(dt),
-                "open": _num(item.get("stck_oprc")),
-                "high": _num(item.get("stck_hgpr")),
-                "low": _num(item.get("stck_lwpr")),
-                "close": _num(item.get("stck_clpr")),
-                "volume": _num(item.get("acml_vol")),
-                "close_time": _ms(dt),
-            })
-        except Exception:
-            continue
-    rows.sort(key=lambda x: x["open_time"])
+
+    end_day = datetime.now(timezone(timedelta(hours=9))).date()
+    while end_day.weekday() >= 5:
+        end_day = _previous_weekday(end_day + timedelta(days=1))
+    start_day = end_day - timedelta(days=max(360, count_hint * 3))
+    all_rows: dict[int, dict[str, Any]] = {}
+    current_end = end_day
+
+    for _ in range(4):
+        body, _ = _get(
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            "FHKST03010100",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_DATE_1": start_day.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": current_end.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": "D",
+                "FID_ORG_ADJ_PRC": "0",
+            },
+        )
+        raw = body.get("output2") or body.get("output") or []
+        if not isinstance(raw, list) or not raw:
+            break
+        page_dates: list[str] = []
+        before = len(all_rows)
+        for item in raw:
+            ds = str(item.get("stck_bsop_date") or "")
+            if len(ds) != 8:
+                continue
+            try:
+                dt = datetime.strptime(ds, "%Y%m%d").replace(tzinfo=timezone.utc)
+                row = {
+                    "open_time": _ms(dt),
+                    "open": _num(item.get("stck_oprc")),
+                    "high": _num(item.get("stck_hgpr")),
+                    "low": _num(item.get("stck_lwpr")),
+                    "close": _num(item.get("stck_clpr")),
+                    "volume": _num(item.get("acml_vol")),
+                    "close_time": _ms(dt),
+                }
+                all_rows[row["open_time"]] = row
+                page_dates.append(ds)
+            except Exception:
+                continue
+        if not page_dates or len(all_rows) == before:
+            break
+        if len(all_rows) >= count_hint:
+            break
+        oldest = min(page_dates)
+        current_end = datetime.strptime(oldest, "%Y%m%d").date() - timedelta(days=1)
+        if current_end <= start_day or len(raw) < 100:
+            break
+
+    rows = [all_rows[k] for k in sorted(all_rows)]
     _cache_save("kr_daily", symbol, rows)
     return rows
 
@@ -356,73 +446,136 @@ def _kr_first_query_point(day):
     return day, "153000"
 
 
-def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
-    """Warm-up KRX 1m rows across recent business days, cache on disk.
+def _fetch_domestic_minute_day(symbol: str, day, *, max_pages: int) -> list[dict[str, Any]]:
+    """Fetch one KRX business day using the official 120-row cursor rules."""
+    query_day, cursor_time = _kr_first_query_point(day)
+    ds = query_day.strftime("%Y%m%d")
+    out: dict[int, dict[str, Any]] = {}
+    seen_cursors: set[str] = set()
+    kst = timezone(timedelta(hours=9))
 
-    V143 follows the official KIS minute-history pattern: 15:30 (or today's current
-    market minute) backwards. A bad/holiday day is isolated and skipped instead of
-    aborting the whole stock calculation.
+    for _ in range(max_pages):
+        if cursor_time in seen_cursors:
+            break
+        seen_cursors.add(cursor_time)
+        body, _ = _get(
+            "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+            "FHKST03010230",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_HOUR_1": cursor_time,
+                "FID_INPUT_DATE_1": ds,
+                "FID_PW_DATA_INCU_YN": "Y",
+                "FID_FAKE_TICK_INCU_YN": "",
+            },
+        )
+        with _status_lock:
+            _status["domestic_warmup_calls"] = int(_status.get("domestic_warmup_calls", 0) or 0) + 1
+
+        raw = body.get("output2") or []
+        if not isinstance(raw, list) or not raw:
+            break
+        requested_day_rows: list[dict[str, Any]] = []
+        for item in raw:
+            row = _parse_domestic_minute_item(item, ds)
+            if not row:
+                continue
+            out[int(row["open_time"])] = row
+            local_dt = datetime.fromtimestamp(row["open_time"] / 1000, timezone.utc).astimezone(kst)
+            if local_dt.strftime("%Y%m%d") == ds:
+                requested_day_rows.append(row)
+
+        if not requested_day_rows:
+            break
+        oldest_dt = min(
+            (datetime.fromtimestamp(r["open_time"] / 1000, timezone.utc).astimezone(kst) for r in requested_day_rows),
+            key=lambda x: x.time(),
+        )
+        min_time = oldest_dt.strftime("%H%M%S")
+        # Official KIS backtester termination rule.
+        if len(raw) < 120 or min_time <= "090000":
+            break
+        cursor_time = min_time  # one-row overlap is intentional; dict dedups it
+
+    return [out[k] for k in sorted(out)]
+
+
+def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
+    """KRX 1m warm-up with long-lived history + cheap current-session refresh.
+
+    Cold start: backfill only until >=35 aggregated 4h bars exist (normally ~18
+    sessions, max four calls per session). Warm cycle: keep that history and refresh
+    only the latest session tail (two pages while market is open). This avoids both
+    the V143 hundreds-of-calls-per-cycle problem and a six-hour stale minute cache.
     """
-    cached = _cache_load("kr_minute", symbol)
-    if cached:
-        return cached
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+    latest_business_day = now.date()
+    while latest_business_day.weekday() >= 5:
+        latest_business_day = _previous_weekday(latest_business_day + timedelta(days=1))
+
+    # Historical warm-up can live for days; the active session tail is refreshed
+    # separately below. With a Render persistent disk this survives deploys.
+    cached = _cache_load("kr_minute", symbol, max_age=86400 * 7) or []
     all_rows: dict[int, dict[str, Any]] = {}
-    today = datetime.now(timezone(timedelta(hours=9))).date()
-    days_seen = 0
-    calendar_scans = 0
-    cursor_day = today
-    max_calendar_scans = DOMESTIC_HISTORY_DAYS * 3
-    while days_seen < DOMESTIC_HISTORY_DAYS and calendar_scans < max_calendar_scans:
-        calendar_scans += 1
-        if cursor_day.weekday() >= 5:
-            cursor_day -= timedelta(days=1)
-            continue
-        query_day, cursor_time = _kr_first_query_point(cursor_day)
-        if query_day != cursor_day:
-            cursor_day = query_day
-        ds = cursor_day.strftime("%Y%m%d")
-        day_had_data = False
-        last_oldest = ""
-        for _ in range(DOMESTIC_PAGES_PER_DAY):
+    for row in cached:
+        try:
+            all_rows[int(row["open_time"])] = row
+        except Exception:
+            pass
+
+    market_open = (
+        now.weekday() < 5
+        and now.time() >= datetime.strptime("090000", "%H%M%S").time()
+        and now.time() <= datetime.strptime("153000", "%H%M%S").time()
+    )
+    # Refresh current/latest business session if market is open, or if the cache
+    # does not yet contain that session. Two pages cover the live 4h bucket tail.
+    cached_dates = set()
+    for row in all_rows.values():
+        try:
+            local_dt = datetime.fromtimestamp(int(row["open_time"]) / 1000, timezone.utc).astimezone(kst)
+            cached_dates.add(local_dt.date())
+        except Exception:
+            pass
+    need_latest_day = market_open or latest_business_day not in cached_dates
+    if need_latest_day:
+        try:
+            fresh_pages = 2 if cached else DOMESTIC_PAGES_PER_DAY
+            for row in _fetch_domestic_minute_day(symbol, latest_business_day, max_pages=fresh_pages):
+                all_rows[int(row["open_time"])] = row
+        except (requests.HTTPError, RuntimeError):
+            # Do not discard valid cached history if the latest session probe fails.
+            pass
+
+    # Cold/incomplete cache: walk backward only until the signal warm-up target is met.
+    if len(aggregate([all_rows[k] for k in sorted(all_rows)], 240)) < 35:
+        cursor_day = _previous_weekday(latest_business_day)
+        sessions_with_data = 0
+        calendar_scans = 0
+        max_calendar_scans = DOMESTIC_HISTORY_DAYS * 2
+        while sessions_with_data < DOMESTIC_HISTORY_DAYS and calendar_scans < max_calendar_scans:
+            current_rows = [all_rows[k] for k in sorted(all_rows)]
+            if len(aggregate(current_rows, 240)) >= 35:
+                break
+            calendar_scans += 1
+            if cursor_day.weekday() >= 5:
+                cursor_day = _previous_weekday(cursor_day + timedelta(days=1))
             try:
-                body, _ = _get(
-                    "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
-                    "FHKST03010230",
-                    {
-                        "FID_COND_MRKT_DIV_CODE": "J",
-                        "FID_INPUT_ISCD": symbol,
-                        "FID_INPUT_HOUR_1": cursor_time,
-                        "FID_INPUT_DATE_1": ds,
-                        "FID_PW_DATA_INCU_YN": "Y",
-                        "FID_FAKE_TICK_INCU_YN": "",
-                    },
-                )
-            except requests.HTTPError as exc:
-                # KIS may answer 500 for a holiday/unsupported historical point.
-                # Skip this day/page; previous trading days can still warm the chain.
-                break
-            raw = body.get("output2") or []
-            if not isinstance(raw, list) or not raw:
-                break
-            page_rows = []
-            for item in raw:
-                row = _parse_domestic_minute_item(item, ds)
-                if row:
-                    all_rows[row["open_time"]] = row
-                    page_rows.append(row)
-            if not page_rows:
-                break
-            day_had_data = True
-            oldest = min(page_rows, key=lambda x: x["open_time"])
-            local_oldest = datetime.fromtimestamp(oldest["open_time"] / 1000, timezone.utc).astimezone(timezone(timedelta(hours=9)))
-            oldest_key = local_oldest.strftime("%H%M%S")
-            if oldest_key == last_oldest or oldest_key <= "090000":
-                break
-            last_oldest = oldest_key
-            cursor_time = (local_oldest - timedelta(minutes=1)).strftime("%H%M%S")
-        if day_had_data:
-            days_seen += 1
-        cursor_day -= timedelta(days=1)
+                day_rows = _fetch_domestic_minute_day(symbol, cursor_day, max_pages=DOMESTIC_PAGES_PER_DAY)
+            except (requests.HTTPError, RuntimeError):
+                day_rows = []
+            if day_rows:
+                for row in day_rows:
+                    all_rows[int(row["open_time"])] = row
+                sessions_with_data += 1
+                with _status_lock:
+                    _status["domestic_warmup_days"] = max(
+                        int(_status.get("domestic_warmup_days", 0) or 0), sessions_with_data
+                    )
+            cursor_day = _previous_weekday(cursor_day)
+
     rows = [all_rows[k] for k in sorted(all_rows)]
     _cache_save("kr_minute", symbol, rows)
     return rows
@@ -487,7 +640,7 @@ def domestic_current_price(symbol: str) -> float:
 def overseas_minutes(symbol: str, minutes: int, exchange: str | None = None) -> list[dict[str, Any]]:
     excd = exchange or resolve_us_exchange(symbol)
     kind = f"us_{excd}_{minutes}m"
-    cached = _cache_load(kind, symbol)
+    cached = _cache_load(kind, symbol, max_age=45)
     if cached:
         return cached
     all_rows: dict[int, dict[str, Any]] = {}
@@ -622,6 +775,10 @@ def overseas_daily(symbol: str, exchange: str | None = None) -> list[dict[str, A
         seen_pages.add(signature)
         if len(all_rows) >= 220:  # enough for 31+ weekly bars after 5-day aggregation
             break
+        # Official KIS continuation: move BYMD to the last returned trading date
+        # and pass tr_cont=N when the response indicates more data.
+        oldest_ds = min(page_dates)
+        bymd = oldest_ds
         cont = str(headers.get("tr_cont", "")).upper()
         if cont not in {"M", "F"}:
             break

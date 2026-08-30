@@ -1,4 +1,4 @@
-"""Tajum On V143 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V144 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -72,6 +72,8 @@ _status: dict[str, Any] = {
     "worker_last_exception": None,
     "last_warnings": [],
     "last_skipped_timeframes": {},
+    "market_success": {"BINANCE": 0, "UPBIT": 0, "KIS_KR": 0, "KIS_US": 0},
+    "market_error": {"BINANCE": 0, "UPBIT": 0, "KIS_KR": 0, "KIS_US": 0},
     "kis": kis.status(),
 }
 
@@ -79,6 +81,8 @@ _status: dict[str, Any] = {
 def status() -> dict[str, Any]:
     with _status_lock:
         out = dict(_status)
+        out["market_success"] = dict(_status.get("market_success") or {})
+        out["market_error"] = dict(_status.get("market_error") or {})
     thread = _worker_thread
     out["worker_thread_alive"] = bool(thread and thread.is_alive())
     out["worker_pid"] = _started_pid or None
@@ -411,6 +415,17 @@ def _event_from_chain(result: dict[str, Any], side_key: str) -> dict[str, Any] |
     }
 
 
+def _market_name_for_symbol(symbol: str) -> str:
+    symbol = str(symbol or "").strip().upper()
+    if symbol.startswith("KRW-"):
+        return "UPBIT"
+    if symbol.endswith("USDT"):
+        return "BINANCE"
+    if symbol.isdigit() and len(symbol) == 6:
+        return "KIS_KR"
+    return "KIS_US"
+
+
 def _evaluate_one_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
     if symbol.startswith("KRW-"):
         return symbol, _evaluate_upbit(symbol)
@@ -461,6 +476,11 @@ def _run_loop(
                 try:
                     _, result = future.result()
                     success += 1
+                    exchange = str(result.get("exchange") or _market_name_for_symbol(symbol))
+                    with _status_lock:
+                        bucket = dict(_status.get("market_success") or {})
+                        bucket[exchange] = int(bucket.get(exchange, 0) or 0) + 1
+                        _status["market_success"] = bucket
                     result_warnings = [str(x) for x in (result.get("warnings") or []) if str(x)]
                     if result_warnings:
                         warnings.extend(result_warnings)
@@ -474,6 +494,11 @@ def _run_loop(
                 except Exception as exc:
                     msg = f"{symbol}: {type(exc).__name__}: {exc}"
                     errors.append(msg)
+                    exchange = _market_name_for_symbol(symbol)
+                    with _status_lock:
+                        bucket = dict(_status.get("market_error") or {})
+                        bucket[exchange] = int(bucket.get(exchange, 0) or 0) + 1
+                        _status["market_error"] = bucket
                     log.exception("Auto engine symbol failed %s", symbol)
                 finally:
                     now = datetime.now(timezone.utc).isoformat()
