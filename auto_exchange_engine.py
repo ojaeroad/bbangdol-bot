@@ -1,4 +1,4 @@
-"""Tajum On V141 automatic exchange signal engine (TV app-FCM block + partial-TF safe skip).
+"""Tajum On V142 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -20,8 +20,12 @@ from typing import Any, Callable
 
 import requests
 import server_signal_engine as v133
+import kis_market_provider as kis
 
 log = logging.getLogger("bbangdol-bot.auto-engine")
+
+STOCK_TF_ORDER = ("1w", "3d", "1d", "4h", "1h", "30m")
+STOCK_MIN_BARS = 31
 
 AUTO_INTERVAL_SEC = max(30, min(int(os.getenv("TAJUM_AUTO_ENGINE_INTERVAL_SEC", "60") or 60), 300))
 HTTP_TIMEOUT = max(3, min(int(os.getenv("TAJUM_AUTO_ENGINE_HTTP_TIMEOUT_SEC", "8") or 8), 30))
@@ -60,6 +64,7 @@ _status: dict[str, Any] = {
     "worker_last_exception": None,
     "last_warnings": [],
     "last_skipped_timeframes": {},
+    "kis": kis.status(),
 }
 
 
@@ -69,6 +74,7 @@ def status() -> dict[str, Any]:
     thread = _worker_thread
     out["worker_thread_alive"] = bool(thread and thread.is_alive())
     out["worker_pid"] = _started_pid or None
+    out["kis"] = kis.status()
     return out
 
 
@@ -249,6 +255,72 @@ def _evaluate_binance(symbol: str) -> dict[str, Any]:
     }
 
 
+
+def _stock_route_for_tf(timeframe: str, *, is_ob: bool) -> str:
+    if timeframe in ("30m", "1h"):
+        return "SELL_SWING_1Q" if is_ob else "BUY_SWING_1Q"
+    if timeframe in ("4h", "1d"):
+        return "SELL_LONG_1Q" if is_ob else "BUY_LONG_1Q"
+    if timeframe in ("3d", "1w"):
+        return "SELL_LIFE_1Q" if is_ob else "BUY_LIFE_1Q"
+    return ""
+
+
+def _stock_chain_signal(metrics_by_tf: dict[str, dict[str, Any]], *, is_ob: bool) -> dict[str, Any]:
+    key = "ob_basic" if is_ob else "os_basic"
+    # Descending order. A candidate requires every lower stock timeframe down to 30m.
+    for i, tf in enumerate(STOCK_TF_ORDER):
+        required = STOCK_TF_ORDER[i:]
+        if any(req not in metrics_by_tf for req in required):
+            continue
+        if all(bool(metrics_by_tf[req][key]) for req in required):
+            return {
+                "chain_ok": True,
+                "max_timeframe": tf,
+                "route": _stock_route_for_tf(tf, is_ob=is_ob),
+                "message_preview": None,
+            }
+    return {"chain_ok": False, "max_timeframe": None, "route": "", "message_preview": None}
+
+
+def _evaluate_kis_stock(symbol: str) -> dict[str, Any]:
+    if not kis.configured():
+        raise RuntimeError("KIS_NOT_CONFIGURED: set KIS_APP_KEY/KIS_APP_SECRET")
+    evaluation_time_ms = int(datetime.now(timezone.utc).timestamp() // 60 * 60 * 1000)
+    metrics: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    skipped: list[str] = []
+    market = "KOREA" if symbol.isdigit() and len(symbol) == 6 else "US"
+    for tf in reversed(STOCK_TF_ORDER):
+        try:
+            _, rows = kis.rows(symbol, tf)
+            if len(rows) < STOCK_MIN_BARS:
+                skipped.append(tf)
+                warnings.append(f"{symbol} {tf}: not enough KIS candles ({len(rows)})")
+                continue
+            metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=evaluation_time_ms)
+        except RuntimeError as exc:
+            if "warm-up incomplete" in str(exc) or "not enough" in str(exc).lower():
+                skipped.append(tf)
+                warnings.append(f"{symbol} {tf}: {exc}")
+                continue
+            raise
+    _, price = kis.current_price(symbol)
+    buy = _stock_chain_signal(metrics, is_ob=False)
+    sell = _stock_chain_signal(metrics, is_ob=True)
+    return {
+        "exchange": "KIS_KR" if market == "KOREA" else "KIS_US",
+        "market": market,
+        "symbol": symbol,
+        "price": float(price),
+        "evaluation_time_ms": evaluation_time_ms,
+        "timeframes": metrics,
+        "buy": buy,
+        "sell": sell,
+        "warnings": warnings,
+        "skipped_timeframes": skipped,
+    }
+
 def _event_from_chain(result: dict[str, Any], side_key: str) -> dict[str, Any] | None:
     chain = result.get(side_key) or {}
     if not chain.get("chain_ok"):
@@ -263,8 +335,14 @@ def _event_from_chain(result: dict[str, Any], side_key: str) -> dict[str, Any] |
     price = float(result.get("price") or 0.0)
     word = "저점" if direction == "LOW" else "고점"
     # Existing cadence parser only needs route/symbol/timeframe/message shape.
-    prefix = "UPBIT" if exchange == "UPBIT" else "BINANCE"
-    message = f"🪙 [{prefix}] {symbol} : {price}\n\n{tf} {word}"
+    prefix = {
+        "UPBIT": "UPBIT",
+        "BINANCE": "BINANCE",
+        "KIS_KR": "KIS-KR",
+        "KIS_US": "KIS-US",
+    }.get(exchange, exchange or "AUTO")
+    icon = "🪙" if exchange in {"UPBIT", "BINANCE"} else "📈"
+    message = f"{icon} [{prefix}] {symbol} : {price}\n\n{tf} {word}"
     return {
         "exchange": exchange,
         "symbol": symbol,
@@ -281,7 +359,11 @@ def _evaluate_one_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
         return symbol, _evaluate_upbit(symbol)
     if symbol.endswith("USDT"):
         return symbol, _evaluate_binance(symbol)
-    raise ValueError(f"unsupported automatic coin symbol: {symbol}")
+    if symbol.isdigit() and len(symbol) == 6:
+        return symbol, _evaluate_kis_stock(symbol)
+    if symbol and symbol.replace(".", "").replace("-", "").isalnum():
+        return symbol, _evaluate_kis_stock(symbol)
+    raise ValueError(f"unsupported automatic market symbol: {symbol}")
 
 
 def _run_loop(
@@ -289,7 +371,7 @@ def _run_loop(
     signal_callback: Callable[[dict[str, Any]], None],
 ) -> None:
     _set_status(running=True, worker_pid=os.getpid(), worker_thread_alive=True, worker_started_at=datetime.now(timezone.utc).isoformat(), worker_last_heartbeat=datetime.now(timezone.utc).isoformat(), worker_last_exception=None)
-    executor = ThreadPoolExecutor(max_workers=AUTO_WORKERS, thread_name_prefix="tajum-coin-calc")
+    executor = ThreadPoolExecutor(max_workers=AUTO_WORKERS, thread_name_prefix="tajum-market-calc")
     while True:
         started = datetime.now(timezone.utc)
         _set_status(worker_last_heartbeat=started.isoformat(), worker_thread_alive=True)
@@ -385,7 +467,7 @@ def start(subscription_provider: Callable[[], list[str]], signal_callback: Calla
         _worker_thread = threading.Thread(
             target=_run_loop,
             args=(subscription_provider, signal_callback),
-            name="tajum-auto-exchange-engine",
+            name="tajum-auto-market-engine",
             daemon=True,
         )
         _worker_thread.start()

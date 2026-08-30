@@ -1,4 +1,4 @@
-# V141_TV_FCM_BLOCK_TELEGRAM_KEEP: TradingView->App FCM blocked, Telegram preserved + V140_WORKER_START_RECOVERY: Gunicorn fork-safe auto-engine startup + V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V142_KIS_STOCK_AUTO_PUSH_LAYOUT: KIS 국장/미장 직접계산 + FCM 종목/가격 우선 표시 + V141_TV_FCM_BLOCK_TELEGRAM_KEEP: TradingView->App FCM blocked, Telegram preserved + V140_WORKER_START_RECOVERY: Gunicorn fork-safe auto-engine startup + V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -160,7 +160,7 @@ def _auto_live_devices_for_symbol(symbol: str) -> list[dict[str, Any]]:
 
 
 def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
-    """Refresh member coin symbols from DB without entering the schema lock.
+    """Refresh member watch symbols from DB without entering the schema lock.
 
     This function is called by the daemon auto-engine provider, not by a Flask
     request. Therefore a slow DB/network moment cannot block /auto/status or the
@@ -192,7 +192,7 @@ def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
         for row in rows:
             for raw in (row[0] or []):
                 code = _clean_symbol_code(raw) if '_clean_symbol_code' in globals() else str(raw or '').strip().upper()
-                if code and (code.startswith('KRW-') or code.endswith('USDT')):
+                if code:
                     values.add(code)
         with _AUTO_SUB_LOCK:
             _AUTO_DB_SYMBOLS = values
@@ -207,27 +207,40 @@ def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
 
 
 def _auto_active_unique_symbols() -> list[str]:
-    """Background provider: DB-persisted subscriptions + live in-process snapshots."""
+    """Background provider: member watchlist -> one compute per unique market symbol.
+
+    Coins are always supported. KRX/US stocks are added automatically only when
+    KIS credentials are configured, so missing KIS keys can never break coin FCM.
+    """
     _auto_refresh_db_subscription_cache()
     with _AUTO_SUB_LOCK:
         values: set[str] = set(_AUTO_DB_SYMBOLS)
         for symbols in _AUTO_SUBSCRIPTIONS.values():
             values.update(symbols)
 
-    # Production auto calculation is coin-only for now. Stock watchlist entries are
-    # intentionally excluded so 국장/미장 do not add useless engine work.
-    values = {
-        code for code in values
-        if str(code).startswith('KRW-') or str(code).endswith('USDT')
-    }
+    try:
+        import kis_market_provider as _kis
+        kis_ready = bool(_kis.configured())
+    except Exception:
+        kis_ready = False
+
+    active: set[str] = set()
+    for code in values:
+        code = _clean_symbol_code(code) if '_clean_symbol_code' in globals() else str(code or '').strip().upper()
+        if not code:
+            continue
+        if code.startswith('KRW-') or code.endswith('USDT'):
+            active.add(code)
+        elif kis_ready and ((code.isdigit() and len(code) == 6) or re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,14}', code)):
+            active.add(code)
 
     seed = os.getenv('TAJUM_AUTO_ENGINE_SEED_SYMBOLS', '').strip()
     if seed:
         for item in seed.split(','):
             code = _clean_symbol_code(item.strip()) if '_clean_symbol_code' in globals() else item.strip().upper()
-            if code and (code.startswith('KRW-') or code.endswith('USDT')):
-                values.add(code)
-    return sorted(values)
+            if code:
+                active.add(code)
+    return sorted(active)
 
 
 def _auto_subscription_status() -> dict[str, Any]:
@@ -237,24 +250,44 @@ def _auto_subscription_status() -> dict[str, Any]:
         for symbols in _AUTO_SUBSCRIPTIONS.values():
             memory_values.update(symbols)
         db_values = set(_AUTO_DB_SYMBOLS)
-        active = {
-            code for code in memory_values.union(db_values)
-            if str(code).startswith('KRW-') or str(code).endswith('USDT')
-        }
         snapshot_sizes = {device_id: len(symbols) for device_id, symbols in _AUTO_SUBSCRIPTIONS.items()}
-        return {
-            'snapshot_device_count': len(_AUTO_SUBSCRIPTIONS),
-            'live_device_count': len(_AUTO_DEVICE_SNAPSHOTS),
-            'snapshot_symbol_counts': snapshot_sizes,
-            'memory_coin_symbol_count': len({x for x in memory_values if x.startswith('KRW-') or x.endswith('USDT')}),
-            'db_device_count': _AUTO_DB_DEVICE_COUNT,
-            'db_coin_symbol_count': len(db_values),
-            'db_coin_symbols': sorted(db_values),
-            'db_last_refresh_at_epoch': _AUTO_DB_LAST_REFRESH_AT or None,
-            'db_last_error': _AUTO_DB_LAST_ERROR or None,
-            'active_coin_symbol_count': len(active),
-            'active_coin_symbols': sorted(active),
-        }
+    all_values = {str(x or '').strip().upper() for x in memory_values.union(db_values) if str(x or '').strip()}
+    coins = {x for x in all_values if x.startswith('KRW-') or x.endswith('USDT')}
+    korea = {x for x in all_values if x.isdigit() and len(x) == 6}
+    us = {x for x in all_values if x not in coins and x not in korea and re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,14}', x)}
+    try:
+        import kis_market_provider as _kis
+        kis_ready = bool(_kis.configured())
+        kis_status = _kis.status()
+    except Exception as exc:
+        kis_ready = False
+        kis_status = {'configured': False, 'last_error': f'{type(exc).__name__}: {exc}'}
+    active = set(coins) | ((korea | us) if kis_ready else set())
+    return {
+        'snapshot_device_count': len(_AUTO_SUBSCRIPTIONS),
+        'live_device_count': len(_AUTO_DEVICE_SNAPSHOTS),
+        'snapshot_symbol_counts': snapshot_sizes,
+        'memory_symbol_count': len(memory_values),
+        'db_device_count': _AUTO_DB_DEVICE_COUNT,
+        'db_symbol_count': len(db_values),
+        'db_symbols': sorted(db_values),
+        'db_last_refresh_at_epoch': _AUTO_DB_LAST_REFRESH_AT or None,
+        'db_last_error': _AUTO_DB_LAST_ERROR or None,
+        'kis_configured': kis_ready,
+        'kis_status': kis_status,
+        'registered_coin_symbol_count': len(coins),
+        'registered_korea_symbol_count': len(korea),
+        'registered_us_symbol_count': len(us),
+        'active_symbol_count': len(active),
+        'active_symbols': sorted(active),
+        # Backward-compatible fields used by existing status screenshots/UI.
+        'active_coin_symbol_count': len(coins),
+        'active_coin_symbols': sorted(coins),
+        'memory_coin_symbol_count': len({x for x in memory_values if x.startswith('KRW-') or x.endswith('USDT')}),
+        'db_coin_symbol_count': len({x for x in db_values if x.startswith('KRW-') or x.endswith('USDT')}),
+        'db_coin_symbols': sorted({x for x in db_values if x.startswith('KRW-') or x.endswith('USDT')}),
+    }
+
 
 
 app.config.update(
@@ -2378,7 +2411,9 @@ def _app_user_display_label(symbol: str, name: str = "", market: str = "", excha
         return f"{clean_name} (국장)"
     if market_u == "US":
         clean_name = clean_name or _APP_US_EN_NAMES.get(code, "") or code
-        return f"{clean_name} (미장)"
+        if clean_name.upper() == code:
+            return f"{code} (미장)"
+        return f"{code} {clean_name} (미장)"
     return clean_name or code
 
 
@@ -2647,6 +2682,23 @@ def _app_symbol_catalog(include_upbit: bool = True) -> list[dict[str, Any]]:
             "source": "krx_map",
         }
 
+    # V142: KIS official KOSPI/KOSDAQ master expands member search beyond the
+    # small legacy KRX name map. Public master downloads do not require account keys.
+    try:
+        import kis_market_provider as _kis_catalog
+        for raw in _kis_catalog.domestic_master():
+            code = _clean_symbol_code(raw.get("symbol", ""))
+            name = str(raw.get("name", "") or "").strip()
+            if code and name:
+                catalog[("KOREA", code)] = {
+                    "symbol": code, "name": name, "market": "KOREA",
+                    "exchange": "KRX",
+                    "display": _app_display_label(code, name, "KOREA", "KRX"),
+                    "source": "kis_domestic_master",
+                }
+    except Exception:
+        log.debug("KIS domestic master unavailable", exc_info=True)
+
     # 업비트: 종목 검색/업비트 상세 조회에서만 공개 마켓 API를 사용한다.
     # 홈의 BTCUSDT/NVDA/국장 상세 조회가 업비트 외부 API 상태에 영향을 받지 않도록 분리한다.
     if include_upbit:
@@ -2790,6 +2842,26 @@ def app_symbol_search():
 
     ranked.sort(key=lambda row: (row[0], row[1]))
     results = [dict(row[2]) for row in ranked[:safe_limit]]
+    # V142: a new US ticker does not need prior TradingView history. If the typed
+    # query looks like a ticker and KIS is configured, resolve its exchange live
+    # and allow the member to register it immediately.
+    if not results and re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,14}", raw_query):
+        try:
+            import kis_market_provider as _kis_search
+            if _kis_search.configured():
+                ticker = _clean_symbol_code(raw_query)
+                excd = _kis_search.resolve_us_exchange(ticker)
+                item = {
+                    "symbol": ticker, "name": _APP_US_EN_NAMES.get(ticker, ticker),
+                    "market": "US", "exchange": excd,
+                    "display": _app_display_label(ticker, _APP_US_EN_NAMES.get(ticker, ticker), "US", excd),
+                    "source": "kis_us_live_resolve",
+                }
+                item["category_key"], item["category_label"] = _app_market_category("US", excd, ticker)
+                item["timeframe_groups"] = _app_timeframe_groups("US")
+                results = [item]
+        except Exception:
+            log.debug("KIS US ticker live search miss q=%s", raw_query, exc_info=True)
     return jsonify({"ok": True, "query": raw_query, "results": results}), 200
 
 
@@ -7690,12 +7762,33 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
     price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
     price_text = price_match.group(1) if price_match else ""
     market = _app_symbol_market(sym, exchange, exchange)
+    if price_text:
+        try:
+            price_value = float(price_text.replace(",", ""))
+            if market == "KOREA":
+                price_text = f"{price_value:,.0f}"
+            elif market == "US":
+                price_text = f"{price_value:,.2f}"
+            elif price_value >= 1000:
+                price_text = f"{price_value:,.2f}".rstrip("0").rstrip(".")
+            else:
+                price_text = f"{price_value:.8f}".rstrip("0").rstrip(".")
+        except Exception:
+            pass
     if market == "KOREA":
         name = KRX_SYMBOL_NAMES.get(sym, "")
+        if not name:
+            try:
+                import kis_market_provider as _kis_names
+                name = _kis_names.domestic_name(sym)
+            except Exception:
+                name = ""
     elif exchange == "UPBIT":
         name = _upbit_name_for_pair(sym)
     elif market == "COIN":
         name = _APP_COIN_KO_NAMES.get(_coin_base_symbol(sym, exchange), "")
+    elif market == "US":
+        name = _APP_US_EN_NAMES.get(sym, "")
     else:
         name = ""
     display = _app_display_label(sym, name, market, exchange)
@@ -7730,19 +7823,18 @@ def _cadence_push_parts(route: str, msg: str, symbol: str, cadence_reason: str) 
         "route": route_key,
         "occurred_at": occurred_at.isoformat(),
         "delivery_key": delivery_key,
-        # Put the actionable signal information first so Android notification
-        # truncation never hides buy/sell direction or timeframe.
-        # Example title: "매수 대기 · 짧은 단타"
-        # Example body : "이더리움 (코인 USDT) · 2,480.26"
+        # V142 phone-popup hierarchy:
+        # Android renders notification title larger than body. Put the first-glance
+        # information (symbol/name + price) in the title, and the signal/timeframe
+        # in the smaller second line.
+        # Example title: "솔라나 (코인 KRW) · 147,100"
+        # Example body : "분할 매도 2차 타점 · 짧은 스윙"
         "title": " · ".join(
-            part for part in (
-                alert_label,
-                friendly_tf,
-            )
+            part for part in (user_display, price_text)
             if part
         ),
         "body": " · ".join(
-            part for part in (user_display, price_text)
+            part for part in (alert_label, friendly_tf)
             if part
         ),
     }
@@ -7781,6 +7873,8 @@ _FCM_SOURCE_TRACE = {
     "last_sent_at": None,
     "auto_upbit_success": 0,
     "auto_binance_success": 0,
+    "auto_kis_korea_success": 0,
+    "auto_kis_us_success": 0,
     # V141: TradingView remains the Telegram/verification source, but it is no
     # longer allowed to fan out member-app FCM notifications.
     "tradingview_success": 0,
@@ -7803,6 +7897,8 @@ def _record_fcm_source_trace(source: str, payload: dict[str, Any], success: int,
             key = {
                 "AUTO_UPBIT": "auto_upbit_success",
                 "AUTO_BINANCE": "auto_binance_success",
+                "AUTO_KIS_KOREA": "auto_kis_korea_success",
+                "AUTO_KIS_US": "auto_kis_us_success",
                 "TRADINGVIEW": "tradingview_success",
             }.get(source)
             if key:
@@ -8000,7 +8096,16 @@ def _auto_engine_signal_callback(event: dict[str, Any]) -> None:
         cadence_ok, cadence_msg, cadence_reason = _telegram_cadence_decision(route, msg, symbol)
         if not cadence_ok:
             return
-        auto_source = "AUTO_UPBIT" if symbol.upper().startswith("KRW-") else "AUTO_BINANCE"
+        symbol_u = symbol.upper()
+        event_exchange = str(event.get("exchange", "") or "").upper()
+        if symbol_u.startswith("KRW-"):
+            auto_source = "AUTO_UPBIT"
+        elif symbol_u.endswith("USDT"):
+            auto_source = "AUTO_BINANCE"
+        elif event_exchange == "KIS_KR" or (symbol_u.isdigit() and len(symbol_u) == 6):
+            auto_source = "AUTO_KIS_KOREA"
+        else:
+            auto_source = "AUTO_KIS_US"
         threading.Thread(
             target=_send_cadence_push_background,
             args=(route, cadence_msg, symbol, cadence_reason, auto_source),
@@ -8027,11 +8132,11 @@ def _ensure_auto_exchange_engine_started() -> bool:
                 return False
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V141 automatic exchange engine ensure pid=%s started=%s", pid, started)
+            log.info("V142 automatic market engine ensure pid=%s started=%s", pid, started)
             return started
         except Exception:
             _AUTO_ENGINE_STARTED = False
-            log.exception("V141 automatic exchange engine start failed pid=%s", pid)
+            log.exception("V142 automatic market engine start failed pid=%s", pid)
             return False
 
 @app.get("/server-engine/auto/status")
@@ -8043,16 +8148,16 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V141",
-            "mode": "member_watchlist -> unique_coin_symbol_compute -> FCM_fanout",
+            "version": "V142",
+            "mode": "member_watchlist -> unique market symbol compute (Upbit/Binance/KIS) -> FCM_fanout",
             "tradingview_required": False,
-            "active_unique_symbols": subscription["active_coin_symbols"],
+            "active_unique_symbols": subscription["active_symbols"],
             "subscription": subscription,
             "engine": auto_engine_status(),
             "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V141 auto status failed")
+        log.exception("V142 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 # Do NOT start the daemon at module-import time. Gunicorn may import in the parent
