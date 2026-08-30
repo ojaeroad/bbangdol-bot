@@ -1,4 +1,4 @@
-# V144_KIS_WARMUP_STABILITY: official KIS pagination + bounded warmup + rate guards + V143_API_STABILITY_PATCH: Upbit rate-limit + KIS calendar/minute pagination stabilization + V142_KIS_STOCK_AUTO_PUSH_LAYOUT: KIS 국장/미장 직접계산 + FCM 종목/가격 우선 표시 + V141_TV_FCM_BLOCK_TELEGRAM_KEEP: TradingView->App FCM blocked, Telegram preserved + V140_WORKER_START_RECOVERY: Gunicorn fork-safe auto-engine startup + V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
+# V145_KIS_RATE_LIMIT_STABILITY: official KIS pagination + bounded warmup + rate guards + V143_API_STABILITY_PATCH: Upbit rate-limit + KIS calendar/minute pagination stabilization + V142_KIS_STOCK_AUTO_PUSH_LAYOUT: KIS 국장/미장 직접계산 + FCM 종목/가격 우선 표시 + V141_TV_FCM_BLOCK_TELEGRAM_KEEP: TradingView->App FCM blocked, Telegram preserved + V140_WORKER_START_RECOVERY: Gunicorn fork-safe auto-engine startup + V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
 # V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
 # V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
 # V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
@@ -8132,11 +8132,11 @@ def _ensure_auto_exchange_engine_started() -> bool:
                 return False
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V144 automatic market engine ensure pid=%s started=%s", pid, started)
+            log.info("V145 automatic market engine ensure pid=%s started=%s", pid, started)
             return started
         except Exception:
             _AUTO_ENGINE_STARTED = False
-            log.exception("V144 automatic market engine start failed pid=%s", pid)
+            log.exception("V145 automatic market engine start failed pid=%s", pid)
             return False
 
 @app.get("/server-engine/auto/status")
@@ -8148,7 +8148,7 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V144",
+            "version": "V145",
             "mode": "member_watchlist -> unique market symbol compute (Upbit/Binance/KIS) -> FCM_fanout",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_symbols"],
@@ -8157,7 +8157,7 @@ def server_engine_auto_status():
             "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V144 auto status failed")
+        log.exception("V145 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 # Do NOT start the daemon at module-import time. Gunicorn may import in the parent

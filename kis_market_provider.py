@@ -1,4 +1,4 @@
-"""Tajum On V144 KIS market-data provider.
+"""Tajum On V145 KIS market-data provider.
 
 Purpose
 -------
@@ -13,14 +13,16 @@ KIS_APP_KEY, KIS_APP_SECRET                         required for stock direct ca
 KIS_ENV=real|demo                                   default real
 KIS_BASE_URL                                        optional override
 KIS_HTTP_TIMEOUT_SEC                                default 8
-KIS_HTTP_MIN_INTERVAL_SEC                           default 0.15 (global rate guard)
+KIS_HTTP_MIN_INTERVAL_SEC                           default 0.30 (global rate guard)
 KIS_CACHE_DIR                                       default /tmp/tajum_kis_cache
 KIS_CACHE_TTL_SEC                                   default 21600 (6h)
 KIS_DOMESTIC_HISTORY_DAYS                           default 22 (hard max 30)
 KIS_DOMESTIC_PAGES_PER_DAY                          default 4 (KRX 390m / 120 rows)
 KIS_OVERSEAS_PAGES                                  default 4
+KIS_RATE_LIMIT_COOLDOWN_SEC                         default 1.5
+KIS_OVERSEAS_MINUTE_CACHE_TTL_SEC                  default 75
 
-V144 notes
+V145 notes
 ----------
 - Follows the official KIS domestic minute pagination stop rule: stop when the
   page is shorter than 120 rows or the oldest time reaches 09:00.
@@ -62,18 +64,22 @@ KIS_BASE_URL = os.getenv(
     "https://openapi.koreainvestment.com:9443" if KIS_ENV == "real" else "https://openapivts.koreainvestment.com:29443",
 ).rstrip("/")
 HTTP_TIMEOUT = max(3, min(int(os.getenv("KIS_HTTP_TIMEOUT_SEC", "8") or 8), 30))
-MIN_INTERVAL = max(0.08, min(float(os.getenv("KIS_HTTP_MIN_INTERVAL_SEC", "0.15") or 0.15), 1.0))
+MIN_INTERVAL = max(0.20, min(float(os.getenv("KIS_HTTP_MIN_INTERVAL_SEC", "0.30") or 0.30), 1.0))
 CACHE_DIR = Path(os.getenv("KIS_CACHE_DIR", "/tmp/tajum_kis_cache") or "/tmp/tajum_kis_cache")
 CACHE_TTL = max(300, min(int(os.getenv("KIS_CACHE_TTL_SEC", "21600") or 21600), 86400 * 7))
 DOMESTIC_HISTORY_DAYS = max(5, min(int(os.getenv("KIS_DOMESTIC_HISTORY_DAYS", "22") or 22), 30))
 DOMESTIC_PAGES_PER_DAY = max(1, min(int(os.getenv("KIS_DOMESTIC_PAGES_PER_DAY", "4") or 4), 6))
 OVERSEAS_PAGES = max(1, min(int(os.getenv("KIS_OVERSEAS_PAGES", "4") or 4), 10))
 
+RATE_LIMIT_COOLDOWN_SEC = max(0.5, min(float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "1.5") or 1.5), 10.0))
+OVERSEAS_MINUTE_CACHE_TTL = max(45, min(int(os.getenv("KIS_OVERSEAS_MINUTE_CACHE_TTL_SEC", "75") or 75), 300))
+
 _token_lock = threading.Lock()
 _token_value = ""
 _token_expiry = 0.0
 _http_lock = threading.Lock()
 _last_http_at = 0.0
+_rate_blocked_until = 0.0
 _us_exchange_cache: dict[str, str] = {}
 _status_lock = threading.Lock()
 _status: dict[str, Any] = {
@@ -111,13 +117,26 @@ def _status_update(**kwargs: Any) -> None:
 
 
 def _rate_guard() -> None:
-    global _last_http_at
+    """Global KIS request pacer shared by every auto-engine worker thread."""
+    global _last_http_at, _rate_blocked_until
     with _http_lock:
         now = time.monotonic()
-        wait = MIN_INTERVAL - (now - _last_http_at)
+        wait_interval = MIN_INTERVAL - (now - _last_http_at)
+        wait_block = _rate_blocked_until - now
+        wait = max(0.0, wait_interval, wait_block)
         if wait > 0:
             time.sleep(wait)
         _last_http_at = time.monotonic()
+
+
+def _apply_global_backoff(seconds: float) -> None:
+    """Extend the shared KIS cooldown so all workers slow down together."""
+    global _rate_blocked_until
+    delay = max(0.0, float(seconds))
+    with _http_lock:
+        target = time.monotonic() + delay
+        if target > _rate_blocked_until:
+            _rate_blocked_until = target
 
 
 def _access_token() -> str:
@@ -151,21 +170,25 @@ def _access_token() -> str:
 
 
 def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") -> tuple[dict[str, Any], dict[str, str]]:
-    """KIS GET with conservative pacing and bounded transient retries.
+    """KIS GET with one shared pacer and bounded, classified retries.
 
-    429/5xx gateway errors are retried at most twice. Business-level EGW00201 is
-    treated as a rate-limit event and retried after a longer pause. Other KIS
-    business errors fail immediately so a bad historical cursor cannot create a
-    retry storm.
+    Important:
+    - KIS may return EGW00201 (per-second request limit) inside an HTTP 500 body.
+      Detect that business code before treating the response as a generic 500.
+    - A rate-limit event slows *all* worker threads, not just the failing request.
+    - Generic HTTP 500 is retried once only. 502/503/504 and network timeouts are
+      retried at most twice. Permanent business errors fail immediately.
     """
     if not configured():
         raise RuntimeError("KIS_NOT_CONFIGURED")
+
     last_exc: Exception | None = None
     for attempt in range(3):
         _rate_guard()
         with _status_lock:
             _status["request_count"] = int(_status.get("request_count", 0) or 0) + 1
             _status["last_request_at"] = datetime.now(timezone.utc).isoformat()
+
         headers = {
             "content-type": "application/json; charset=utf-8",
             "authorization": f"Bearer {_access_token()}",
@@ -176,38 +199,72 @@ def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") ->
         }
         if tr_cont:
             headers["tr_cont"] = tr_cont
+
         try:
             resp = requests.get(f"{KIS_BASE_URL}{path}", headers=headers, params=params, timeout=HTTP_TIMEOUT)
-            if resp.status_code in {429, 500, 502, 503, 504}:
-                if resp.status_code == 429:
+
+            # KIS frequently embeds the real business error in JSON even when HTTP=500.
+            body: dict[str, Any] | None = None
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    body = parsed
+            except Exception:
+                body = None
+
+            msg_cd = str((body or {}).get("msg_cd") or "")
+            msg1 = str((body or {}).get("msg1") or (body or {}).get("message") or "")
+            rt_cd = str((body or {}).get("rt_cd", ""))
+
+            # EGW00201 = KIS per-second transaction limit.
+            if msg_cd == "EGW00201":
+                with _status_lock:
+                    _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
+                delay = RATE_LIMIT_COOLDOWN_SEC * (attempt + 1)
+                _apply_global_backoff(delay)
+                last_exc = RuntimeError(f"KIS {msg_cd}: {msg1 or 'rate limit'}")
+                if attempt < 2:
                     with _status_lock:
-                        _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
+                        _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                    continue
+                raise last_exc
+
+            if resp.status_code == 429:
+                with _status_lock:
+                    _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
+                delay = RATE_LIMIT_COOLDOWN_SEC * (attempt + 1)
+                _apply_global_backoff(delay)
+                last_exc = requests.HTTPError(f"429 Client Error: {resp.text[:240]}", response=resp)
+                if attempt < 2:
+                    with _status_lock:
+                        _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                    continue
+                raise last_exc
+
+            if resp.status_code in {500, 502, 503, 504}:
                 last_exc = requests.HTTPError(
                     f"{resp.status_code} Server Error: {resp.text[:240]}", response=resp
                 )
-                # Historical 500s are often invalid cursor points. One retry is
-                # enough; repeated retries only multiply load.
-                if attempt >= (1 if resp.status_code == 500 else 2):
-                    raise last_exc
-                with _status_lock:
-                    _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
-                time.sleep(0.8 * (attempt + 1))
-                continue
+                # Plain 500s are often bad historical cursor points; retry once only.
+                max_retry_attempt = 1 if resp.status_code == 500 else 2
+                if attempt < max_retry_attempt:
+                    with _status_lock:
+                        _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                    _apply_global_backoff(0.7 * (attempt + 1))
+                    continue
+                raise last_exc
 
             resp.raise_for_status()
-            body = resp.json()
+            if body is None:
+                parsed = resp.json()
+                if not isinstance(parsed, dict):
+                    raise RuntimeError(f"KIS non-object response: {type(parsed).__name__}")
+                body = parsed
+
             rt_cd = str(body.get("rt_cd", "0"))
             if rt_cd not in {"0", ""}:
                 msg_cd = str(body.get("msg_cd") or "")
                 msg1 = str(body.get("msg1") or "")
-                if msg_cd == "EGW00201":
-                    with _status_lock:
-                        _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
-                    if attempt < 2:
-                        with _status_lock:
-                            _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
-                        time.sleep(2.0 * (attempt + 1))
-                        continue
                 raise RuntimeError(f"KIS {msg_cd}: {msg1}")
 
             with _status_lock:
@@ -215,14 +272,13 @@ def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") ->
                 _status["last_success_at"] = datetime.now(timezone.utc).isoformat()
                 _status["last_error"] = None
             return body, {str(k).lower(): str(v) for k, v in resp.headers.items()}
+
         except Exception as exc:
             last_exc = exc
-            # Only connection/timeouts get another loop here. HTTP and business
-            # errors have already been explicitly classified above.
             if isinstance(exc, (requests.ConnectionError, requests.Timeout)) and attempt < 2:
                 with _status_lock:
                     _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
-                time.sleep(0.8 * (attempt + 1))
+                _apply_global_backoff(0.7 * (attempt + 1))
                 continue
             break
 
@@ -640,7 +696,7 @@ def domestic_current_price(symbol: str) -> float:
 def overseas_minutes(symbol: str, minutes: int, exchange: str | None = None) -> list[dict[str, Any]]:
     excd = exchange or resolve_us_exchange(symbol)
     kind = f"us_{excd}_{minutes}m"
-    cached = _cache_load(kind, symbol, max_age=45)
+    cached = _cache_load(kind, symbol, max_age=OVERSEAS_MINUTE_CACHE_TTL)
     if cached:
         return cached
     all_rows: dict[int, dict[str, Any]] = {}

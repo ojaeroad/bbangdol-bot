@@ -1,4 +1,4 @@
-"""Tajum On V144 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V145 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -347,25 +347,63 @@ def _stock_chain_signal(metrics_by_tf: dict[str, dict[str, Any]], *, is_ob: bool
 def _evaluate_kis_stock(symbol: str) -> dict[str, Any]:
     if not kis.configured():
         raise RuntimeError("KIS_NOT_CONFIGURED: set KIS_APP_KEY/KIS_APP_SECRET")
+
     evaluation_time_ms = int(datetime.now(timezone.utc).timestamp() // 60 * 60 * 1000)
     metrics: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     skipped: list[str] = []
     market = "KOREA" if symbol.isdigit() and len(symbol) == 6 else "US"
-    for tf in reversed(STOCK_TF_ORDER):
+
+    def add_metric(tf: str, rows: list[dict[str, Any]]) -> None:
+        if len(rows) < STOCK_MIN_BARS:
+            skipped.append(tf)
+            warnings.append(f"{symbol} {tf}: not enough KIS candles ({len(rows)})")
+            return
         try:
-            _, rows = kis.rows(symbol, tf)
-            if len(rows) < STOCK_MIN_BARS:
-                skipped.append(tf)
-                warnings.append(f"{symbol} {tf}: not enough KIS candles ({len(rows)})")
-                continue
             metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=evaluation_time_ms)
         except RuntimeError as exc:
             if "warm-up incomplete" in str(exc) or "not enough" in str(exc).lower():
                 skipped.append(tf)
                 warnings.append(f"{symbol} {tf}: {exc}")
-                continue
+                return
             raise
+
+    if market == "KOREA":
+        # V145: fetch the expensive KRX 1-minute warm-up ONCE per symbol/cycle,
+        # then derive 30m/1h/4h locally. V144 called domestic_minutes() once per
+        # timeframe; during market hours that refreshed the current session tail
+        # three separate times and multiplied KIS traffic.
+        minute_rows = kis.domestic_minutes(symbol)
+        add_metric("30m", kis.aggregate(minute_rows, 30))
+        add_metric("1h", kis.aggregate(minute_rows, 60))
+        add_metric("4h", kis.aggregate(minute_rows, 240))
+
+        # Daily history is also fetched once and reused for 1d/3d/1w.
+        daily = kis.domestic_daily(symbol)
+        add_metric("1d", daily)
+        add_metric("3d", kis._day_aggregate(daily, 3))
+        add_metric("1w", kis._day_aggregate(daily, 5))
+    else:
+        # Keep KIS-native 30/60/240-minute bars for US stocks so candle anchoring
+        # remains identical to the exchange/KIS definition. Provider-level caching
+        # and the global KIS pacer control request volume.
+        for tf in ("30m", "1h", "4h"):
+            try:
+                _, rows = kis.rows(symbol, tf)
+                add_metric(tf, rows)
+            except RuntimeError as exc:
+                if "warm-up incomplete" in str(exc) or "not enough" in str(exc).lower():
+                    skipped.append(tf)
+                    warnings.append(f"{symbol} {tf}: {exc}")
+                    continue
+                raise
+
+        # One daily fetch, reused locally for all long stock timeframes.
+        daily = kis.overseas_daily(symbol)
+        add_metric("1d", daily)
+        add_metric("3d", kis._day_aggregate(daily, 3))
+        add_metric("1w", kis._day_aggregate(daily, 5))
+
     _, price = kis.current_price(symbol)
     buy = _stock_chain_signal(metrics, is_ob=False)
     sell = _stock_chain_signal(metrics, is_ob=True)
