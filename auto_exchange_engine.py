@@ -1,4 +1,4 @@
-"""Tajum On V149 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V150 automatic market signal engine (Binance/Upbit + Korea + US provider router).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -23,6 +23,7 @@ from typing import Any, Callable
 import requests
 import server_signal_engine as v133
 import kis_market_provider as kis
+import alpaca_market_provider as alpaca
 
 log = logging.getLogger("bbangdol-bot.auto-engine")
 
@@ -91,6 +92,8 @@ def status() -> dict[str, Any]:
     out["worker_thread_alive"] = bool(thread and thread.is_alive())
     out["worker_pid"] = _started_pid or None
     out["kis"] = kis.status()
+    out["alpaca_us"] = alpaca.status()
+    out["us_stock_provider"] = "ALPACA" if alpaca.configured() else "KIS_FALLBACK"
     return out
 
 
@@ -454,13 +457,13 @@ from alert_queue import AlertQueue
 from market_stream_engine import MarketStreamHub, classify as _classify_market
 from prediction_engine import PredictionEngine
 
-# V149 uses four independent market calculation workers. REST evaluators remain
+# V150 uses four independent market calculation workers. REST evaluators remain
 # available as warm-up / gap-fill / fallback. WebSocket-owned candle series take priority.
-_V149_STARTED = False
-_V149_PID = 0
-_V149_LOCK = threading.Lock()
-_V149_STOP_EVENT = threading.Event()
-_V149_ATEXIT_REGISTERED = False
+_V150_STARTED = False
+_V150_PID = 0
+_V150_LOCK = threading.Lock()
+_V150_STOP_EVENT = threading.Event()
+_V150_ATEXIT_REGISTERED = False
 _STREAM_HUB: MarketStreamHub | None = None
 _ALERT_QUEUE: AlertQueue | None = None
 _PREDICTION = PredictionEngine()
@@ -479,9 +482,9 @@ _SEED_LOCK = threading.Lock()
 _STOCK_REFRESH_LOCK = threading.Lock()
 _STOCK_LAST_REFRESH: dict[tuple[str, str], float] = {}
 
-V149_INTERVAL = max(
+V150_INTERVAL = max(
     15,
-    min(int(os.getenv("TAJUM_V149_EVAL_INTERVAL_SEC", "60") or 60), 300),
+    min(int(os.getenv("TAJUM_V150_EVAL_INTERVAL_SEC", "60") or 60), 300),
 )
 STOCK_REST_REFRESH_SEC = max(
     45,
@@ -542,7 +545,26 @@ def _stock_seed_rows(symbol: str, market: str) -> dict[str, list[dict[str, Any]]
             "5m": kis.aggregate_stock_session(minute_rows, 5, "KOREA"),
         }
 
-    # US: 5m source -> 5/15/30m, 60m source -> 1/2/6h, native 240m -> 4h.
+    # US primary = Alpaca when configured. KIS remains a compatibility fallback.
+    if alpaca.configured():
+        src = alpaca.warmup_sources(symbol)
+        base_5m = src["5m"]
+        base_30m = src["30m"]
+        daily = src["1d"]
+        return {
+            "1w": kis._day_aggregate(daily, 5),
+            "3d": kis._day_aggregate(daily, 3),
+            "1d": daily,
+            "6h": kis.aggregate_stock_session(base_30m, 360, "US"),
+            "4h": kis.aggregate_stock_session(base_30m, 240, "US"),
+            "2h": kis.aggregate_stock_session(base_30m, 120, "US"),
+            "1h": kis.aggregate_stock_session(base_30m, 60, "US"),
+            "30m": base_30m,
+            "15m": kis.aggregate_stock_session(base_5m, 15, "US"),
+            "5m": base_5m,
+        }
+
+    # KIS US fallback when Alpaca credentials are not configured yet.
     excd = kis.resolve_us_exchange(symbol)
     base_5m = kis.overseas_minutes(symbol, 5, exchange=excd)
     base_60m = kis.overseas_minutes(symbol, 60, exchange=excd)
@@ -577,7 +599,7 @@ def _seed_symbol(symbol: str, market: str) -> None:
 
     V147 seeded stock history only when WebSocket was already healthy, which meant a
     failed/quiet KIS stream kept calling REST forever and never populated CandleBook.
-    V149 always seeds stock history exactly once first.
+    V150 always seeds stock history exactly once first.
     """
     if _STREAM_HUB is None:
         return
@@ -607,7 +629,7 @@ def _seed_symbol(symbol: str, market: str) -> None:
 
     except Exception:
         # REST evaluator below is still available if initial warm-up fails.
-        log.exception("V149 warm-up seed failed market=%s symbol=%s", market, symbol)
+        log.exception("V150 warm-up seed failed market=%s symbol=%s", market, symbol)
 
 
 def _refresh_stock_book_if_due(symbol: str, market: str, *, force: bool = False) -> bool:
@@ -666,7 +688,20 @@ def _metric_result_from_book(symbol: str, market: str) -> dict[str, Any] | None:
         buy = _stock_chain_signal(metrics, is_ob=False)
         sell = _stock_chain_signal(metrics, is_ob=True)
 
-    source = "WEBSOCKET" if _STREAM_HUB.healthy(market) else "REST_SEEDED_CANDLEBOOK"
+    if market == "KIS_US" and alpaca.configured():
+        source = (
+            "ALPACA_WEBSOCKET"
+            if _STREAM_HUB.healthy(market)
+            else "ALPACA_REST_SEEDED_CANDLEBOOK"
+        )
+    elif market == "KIS_KR":
+        source = (
+            "KIS_WEBSOCKET"
+            if _STREAM_HUB.healthy(market)
+            else "KIS_REST_SEEDED_CANDLEBOOK"
+        )
+    else:
+        source = "WEBSOCKET" if _STREAM_HUB.healthy(market) else "REST_SEEDED_CANDLEBOOK"
     return {
         "exchange": market,
         "market": "KOREA" if market == "KIS_KR" else ("US" if market == "KIS_US" else market),
@@ -710,18 +745,20 @@ def _evaluate_market_symbol(symbol: str, market: str) -> dict[str, Any]:
             try:
                 _refresh_stock_book_if_due(symbol, market)
             except Exception:
-                log.exception("V149 stock REST fallback refresh failed market=%s symbol=%s", market, symbol)
+                log.exception("V150 stock REST fallback refresh failed market=%s symbol=%s", market, symbol)
 
         result = _metric_result_from_book(symbol, market)
         if result is not None:
             return result
 
     # Last-resort compatibility fallback.
+    # Even after Alpaca becomes primary, KIS US can keep the service alive if Alpaca
+    # is temporarily unavailable during the migration period.
     return _evaluate_kis_stock(symbol)
 
 
 def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) -> None:
-    while not _V149_STOP_EVENT.is_set():
+    while not _V150_STOP_EVENT.is_set():
         started = datetime.now(timezone.utc)
         symbols = [s.upper() for s in (subscription_provider() or []) if _classify_market(s) == market and _owned(s.upper())]
 
@@ -731,13 +768,13 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
             with _MARKET_STATUS_LOCK:
                 us_cycles = int(_MARKET_STATUS["KIS_US"].get("cycles", 0) or 0)
             if us_cycles == 0:
-                _V149_STOP_EVENT.wait(2.0)
+                _V150_STOP_EVENT.wait(2.0)
                 continue
         if market == "KIS_US" and not _stock_market_is_open("KIS_US") and _stock_market_is_open("KIS_KR"):
             with _MARKET_STATUS_LOCK:
                 kr_cycles = int(_MARKET_STATUS["KIS_KR"].get("cycles", 0) or 0)
             if kr_cycles == 0:
-                _V149_STOP_EVENT.wait(2.0)
+                _V150_STOP_EVENT.wait(2.0)
                 continue
         symbols = list(dict.fromkeys(symbols))
         with _MARKET_STATUS_LOCK:
@@ -767,7 +804,7 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
                 with _MARKET_STATUS_LOCK:
                     _MARKET_STATUS[market]["current_error"] = error
                 last_error = f"{symbol}: {type(exc).__name__}: {exc}"
-                log.exception("V149 market worker failed market=%s symbol=%s", market, symbol)
+                log.exception("V150 market worker failed market=%s symbol=%s", market, symbol)
             finally:
                 with _MARKET_STATUS_LOCK:
                     _MARKET_STATUS[market]["current_completed"] = int(_MARKET_STATUS[market].get("current_completed", 0)) + 1
@@ -786,40 +823,40 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
             st["last_finished_at"] = finished.isoformat()
             st["last_duration_sec"] = round((finished-started).total_seconds(),3)
         elapsed = (finished-started).total_seconds()
-        _V149_STOP_EVENT.wait(max(1.0, V149_INTERVAL-elapsed))
+        _V150_STOP_EVENT.wait(max(1.0, V150_INTERVAL-elapsed))
 
 def stop() -> None:
     """Best-effort graceful shutdown for Render/Gunicorn worker replacement."""
-    global _V149_STARTED
-    _V149_STOP_EVENT.set()
+    global _V150_STARTED
+    _V150_STOP_EVENT.set()
     try:
         if _STREAM_HUB is not None:
             _STREAM_HUB.stop()
     except Exception:
-        log.exception("V149 stream shutdown failed")
+        log.exception("V150 stream shutdown failed")
     try:
         if _ALERT_QUEUE is not None:
             _ALERT_QUEUE.stop(drain_timeout=1.5)
     except Exception:
-        log.exception("V149 alert queue shutdown failed")
+        log.exception("V150 alert queue shutdown failed")
     for thread in list(_MARKET_THREADS.values()):
         try:
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=0.4)
         except Exception:
             pass
-    _V149_STARTED = False
+    _V150_STARTED = False
 
 
 def start(subscription_provider: Callable[[], list[str]], signal_callback: Callable[[dict[str, Any]], None]) -> bool:
-    global _V149_STARTED, _V149_PID, _STREAM_HUB, _ALERT_QUEUE, _V149_ATEXIT_REGISTERED
+    global _V150_STARTED, _V150_PID, _STREAM_HUB, _ALERT_QUEUE, _V150_ATEXIT_REGISTERED
     pid = os.getpid()
-    with _V149_LOCK:
-        if _V149_STARTED and _V149_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
+    with _V150_LOCK:
+        if _V150_STARTED and _V150_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
             return False
-        _V149_STOP_EVENT.clear()
-        _V149_STARTED = True
-        _V149_PID = pid
+        _V150_STOP_EVENT.clear()
+        _V150_STARTED = True
+        _V150_PID = pid
         _STREAM_HUB = MarketStreamHub(subscription_provider)
         _STREAM_HUB.start()
         _ALERT_QUEUE = AlertQueue(signal_callback)
@@ -833,9 +870,9 @@ def start(subscription_provider: Callable[[], list[str]], signal_callback: Calla
             )
             _MARKET_THREADS[market] = thread
             thread.start()
-        if not _V149_ATEXIT_REGISTERED:
+        if not _V150_ATEXIT_REGISTERED:
             atexit.register(stop)
-            _V149_ATEXIT_REGISTERED = True
+            _V150_ATEXIT_REGISTERED = True
         return True
 
 def status() -> dict[str, Any]:
@@ -853,12 +890,12 @@ def status() -> dict[str, Any]:
     queue_status = _ALERT_QUEUE.status() if _ALERT_QUEUE else {}
     # Backward-compatible keys remain so existing screenshots/status checks still work.
     return {
-        "running": _V149_STARTED,
-        "shutdown_requested": _V149_STOP_EVENT.is_set(),
-        "worker_pid": _V149_PID or None,
+        "running": _V150_STARTED,
+        "shutdown_requested": _V150_STOP_EVENT.is_set(),
+        "worker_pid": _V150_PID or None,
         "worker_thread_alive": all(t.is_alive() for t in _MARKET_THREADS.values()) if _MARKET_THREADS else False,
         "workers": 4,
-        "worker_model": "4_market_workers + 2_crypto_ws + 1_shared_kis_ws + alert_queue",
+        "worker_model": "4_market_workers + crypto_ws + korea_kis_ws + us_alpaca_ws_or_kis_fallback + alert_queue",
         "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
         "cycles": total_cycles, "cycles_started": total_cycles + sum(1 for x in markets.values() if x.get("in_progress")),
         "cycle_in_progress": any(bool(x.get("in_progress")) for x in markets.values()),
@@ -874,12 +911,18 @@ def status() -> dict[str, Any]:
         "streams": streams,
         "alert_queue": queue_status,
         "prediction_engine": _PREDICTION.status(),
+        "stock_providers": {
+            "korea_primary": "KIS",
+            "us_primary": "ALPACA" if alpaca.configured() else "KIS_FALLBACK",
+            "us_alpaca": alpaca.status(),
+            "migration_note": "US worker is provider-routed; signal/candle/FCM logic is unchanged.",
+        },
         "chain": {
             "coin_order": list(v133.TF_ORDER),
             "coin_internal_only": sorted(v133.INTERNAL_ONLY_TFS),
             "stock_order": list(STOCK_TF_ORDER),
             "stock_internal_only": sorted(STOCK_INTERNAL_CHAIN_TFS),
-            "note": "V149: stock/coin mandatory chains preserved; KIS KR+US share one transport socket but calculate in separate workers",
+            "note": "V150: stock/coin mandatory chains preserved; KIS KR+US share one transport socket but calculate in separate workers",
         },
         "kis": kis.status(),
     }

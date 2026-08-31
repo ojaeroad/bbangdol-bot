@@ -1,4 +1,4 @@
-"""Tajum On V149 real-time market stream hub.
+"""Tajum On V150 real-time market stream hub.
 
 Primary market-data paths
 -------------------------
@@ -10,7 +10,7 @@ Why one KIS socket?
 -------------------
 KIS official samples subscribe domestic + overseas real-time data on one session.
 V147 opened KR and US KIS sockets concurrently with the same approval key; on the
-live server KIS_US repeatedly ended with BrokenPipe. V149 follows the official
+live server KIS_US repeatedly ended with BrokenPipe. V150 follows the official
 single-session pattern and keeps the *calculation workers* separated.
 
 REST is still the warm-up / gap-fill / fallback source. WebSocket loss must never
@@ -28,6 +28,8 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import requests
+
+import alpaca_market_provider as alpaca
 
 from candle_builder import CandleBook
 
@@ -142,21 +144,32 @@ class MarketStreamHub:
             st["last_error"] = None
 
     def start(self) -> None:
-        # Two crypto sockets + one shared KIS socket.
-        for name, target in [
+        # Crypto sockets are unchanged. Korea stays on KIS. US uses Alpaca when
+        # credentials exist; otherwise the existing KIS US path remains active.
+        targets = [
             ("BINANCE", self._binance_loop),
             ("UPBIT", self._upbit_loop),
             ("KIS_SHARED", self._kis_loop_combined),
-        ]:
+        ]
+        if alpaca.configured():
+            targets.append(("ALPACA_US", self._alpaca_us_loop))
+
+        for name, target in targets:
             if name in self._threads and self._threads[name].is_alive():
                 continue
-            t = threading.Thread(target=target, name=f"tajum-ws-{name.lower()}", daemon=True)
-            self._threads[name] = t
+            thread = threading.Thread(
+                target=target,
+                name=f"tajum-ws-{name.lower()}",
+                daemon=True,
+            )
+            self._threads[name] = thread
             if name == "KIS_SHARED":
-                # Both market status entries point to the same transport thread.
-                self._threads["KIS_KR"] = t
-                self._threads["KIS_US"] = t
-            t.start()
+                self._threads["KIS_KR"] = thread
+                if not alpaca.configured():
+                    self._threads["KIS_US"] = thread
+            elif name == "ALPACA_US":
+                self._threads["KIS_US"] = thread
+            thread.start()
 
     def stop(self) -> None:
         """Signal all market stream loops to exit during Gunicorn/Render shutdown."""
@@ -192,18 +205,32 @@ class MarketStreamHub:
             data = {k: dict(v) for k, v in self._status.items()}
         for market in data:
             thread = self._threads.get(market)
-            if market in {"KIS_KR", "KIS_US"}:
+            if market == "KIS_KR":
                 thread = self._threads.get("KIS_SHARED") or thread
                 data[market]["transport"] = "KIS_SHARED_SOCKET"
+                data[market]["provider"] = "KIS"
                 data[market]["subscription_limit_per_socket"] = KIS_WS_MAX_SUBSCRIPTIONS
+            elif market == "KIS_US":
+                if alpaca.configured():
+                    thread = self._threads.get("ALPACA_US") or thread
+                    data[market]["transport"] = "ALPACA_WEBSOCKET"
+                    data[market]["provider"] = "ALPACA"
+                    data[market]["feed"] = alpaca.STOCK_FEED
+                    data[market]["configured_stream_symbol_limit"] = alpaca.STREAM_SYMBOL_LIMIT
+                else:
+                    thread = self._threads.get("KIS_SHARED") or thread
+                    data[market]["transport"] = "KIS_SHARED_SOCKET"
+                    data[market]["provider"] = "KIS_FALLBACK"
+                    data[market]["subscription_limit_per_socket"] = KIS_WS_MAX_SUBSCRIPTIONS
             data[market]["thread_alive"] = bool(thread and thread.is_alive())
             data[market]["symbols"] = len(self._symbols(market))
         data["candle_book"] = self.book.snapshot()
         data["kis_transport"] = {
-            "model": "single_shared_socket",
+            "model": "korea_primary_plus_us_fallback_when_alpaca_unconfigured",
             "max_subscriptions": KIS_WS_MAX_SUBSCRIPTIONS,
             "subscribe_interval_sec": KIS_WS_SUBSCRIBE_INTERVAL,
         }
+        data["alpaca_us"] = alpaca.status()
         return data
 
     # -----------------------------------------------------------------
@@ -334,6 +361,189 @@ class MarketStreamHub:
                 self._stop.wait(2)
 
     # -----------------------------------------------------------------
+    # Alpaca US stock transport
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _alpaca_regular_session(ts: str) -> bool:
+        try:
+            norm = str(ts).replace("Z", "+00:00")
+            if "." in norm:
+                left, right = norm.split(".", 1)
+                suffix = "+00:00" if right.endswith("+00:00") else ""
+                frac = right[:-6] if suffix else right
+                norm = f"{left}.{frac[:6]}{suffix}"
+            dt = datetime.fromisoformat(norm)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            local = dt.astimezone(NY)
+            if local.weekday() >= 5:
+                return False
+            hm = local.hour * 60 + local.minute
+            return (9 * 60 + 30) <= hm < (16 * 60)
+        except Exception:
+            return False
+
+    def _alpaca_us_loop(self) -> None:
+        if websocket is None:
+            self._set("KIS_US", last_error="websocket-client not installed")
+            return
+        if not alpaca.configured():
+            return
+
+        last_set: tuple[str, ...] | None = None
+        reconnect_attempt = 0
+
+        while not self._stop.is_set():
+            all_symbols = self._symbols("KIS_US")
+            stream_symbols, overflow = alpaca.stream_symbols(all_symbols)
+            if not stream_symbols:
+                self._set(
+                    "KIS_US",
+                    connected=False,
+                    mode="ALPACA_REST_FALLBACK",
+                    subscribed_count=0,
+                    overflow_count=len(overflow),
+                    last_error=None,
+                )
+                self._stop.wait(2)
+                continue
+
+            try:
+                ws = websocket.create_connection(
+                    alpaca.STREAM_URL,
+                    timeout=30,
+                    enable_multithread=True,
+                )
+
+                # welcome
+                welcome = ws.recv()
+                if isinstance(welcome, bytes):
+                    welcome = welcome.decode("utf-8")
+
+                ws.send(json.dumps({
+                    "action": "auth",
+                    "key": alpaca.API_KEY,
+                    "secret": alpaca.API_SECRET,
+                }))
+                auth_raw = ws.recv()
+                if isinstance(auth_raw, bytes):
+                    auth_raw = auth_raw.decode("utf-8")
+                auth_msg = json.loads(auth_raw)
+                auth_items = auth_msg if isinstance(auth_msg, list) else [auth_msg]
+                if not any(
+                    isinstance(x, dict)
+                    and x.get("T") == "success"
+                    and str(x.get("msg", "")).lower() == "authenticated"
+                    for x in auth_items
+                ):
+                    raise RuntimeError(f"Alpaca authentication failed: {auth_items[:1]}")
+
+                ws.send(json.dumps({
+                    "action": "subscribe",
+                    "bars": stream_symbols,
+                }))
+
+                # Subscription ACK is normally immediate.
+                ack_raw = ws.recv()
+                if isinstance(ack_raw, bytes):
+                    ack_raw = ack_raw.decode("utf-8")
+                ack = json.loads(ack_raw)
+                ack_items = ack if isinstance(ack, list) else [ack]
+                subscribed = stream_symbols
+                for item in ack_items:
+                    if isinstance(item, dict) and item.get("T") == "subscription":
+                        subscribed = [
+                            str(x).upper() for x in (item.get("bars") or [])
+                        ]
+                        break
+
+                last_set = tuple(all_symbols)
+                reconnect_attempt = 0
+                self._set(
+                    "KIS_US",
+                    connected=True,
+                    mode="ALPACA_WEBSOCKET_PRIMARY",
+                    last_error=None,
+                    subscribed_count=len(subscribed),
+                    overflow_count=len(overflow),
+                    subscription_errors=0,
+                    symbols=len(all_symbols),
+                )
+
+                while not self._stop.is_set():
+                    if tuple(self._symbols("KIS_US")) != last_set:
+                        break
+                    raw = ws.recv()
+                    if not raw:
+                        continue
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8")
+                    payload = json.loads(raw)
+                    items = payload if isinstance(payload, list) else [payload]
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        typ = str(item.get("T") or "")
+                        if typ == "error":
+                            raise RuntimeError(
+                                f"Alpaca stream error {item.get('code')}: {item.get('msg')}"
+                            )
+                        if typ != "b":
+                            continue
+                        ts = str(item.get("t") or "")
+                        if not self._alpaca_regular_session(ts):
+                            # Alpaca includes pre/after-market bars. Tajum stock
+                            # signals intentionally preserve regular-session candles.
+                            continue
+                        sym = str(item.get("S") or "").upper()
+                        norm = ts.replace("Z", "+00:00")
+                        if "." in norm:
+                            left, right = norm.split(".", 1)
+                            suffix = "+00:00" if right.endswith("+00:00") else ""
+                            frac = right[:-6] if suffix else right
+                            norm = f"{left}.{frac[:6]}{suffix}"
+                        dt = datetime.fromisoformat(norm)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=UTC)
+                        open_ms = int(dt.astimezone(UTC).timestamp() * 1000)
+                        self.book.update_minute_snapshot(
+                            sym,
+                            "KIS_US",  # logical US-stock market key; provider=Alpaca
+                            open_ms,
+                            float(item["o"]),
+                            float(item["h"]),
+                            float(item["l"]),
+                            float(item["c"]),
+                            float(item.get("v") or 0.0),
+                            open_ms + 59_999,
+                        )
+                        with self._status_lock:
+                            st = self._status["KIS_US"]
+                            st["messages"] += 1
+                            st["last_message_at"] = datetime.now(UTC).isoformat()
+                            st["connected"] = True
+                            st["mode"] = "ALPACA_WEBSOCKET_PRIMARY"
+                            st["last_error"] = None
+
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+            except Exception as exc:
+                reconnect_attempt += 1
+                delay = min(30.0, 1.5 * (2 ** min(reconnect_attempt - 1, 4)))
+                self._set(
+                    "KIS_US",
+                    connected=False,
+                    mode="ALPACA_REST_FALLBACK",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+                self._inc("KIS_US", "reconnects")
+                self._stop.wait(delay)
+
+    # -----------------------------------------------------------------
     # KIS shared transport
     # -----------------------------------------------------------------
     def _approval(self) -> str:
@@ -391,10 +601,14 @@ class MarketStreamHub:
     def _kis_subscription_plan(self) -> tuple[list[tuple[str, str, str, str]], dict[str, int]]:
         """Return [(market,tr_id,tr_key,symbol), ...] capped at official 40/session."""
         kr = self._symbols("KIS_KR")
-        us = self._symbols("KIS_US")
+        us = [] if alpaca.configured() else self._symbols("KIS_US")
 
-        # If capacity is ever exceeded, prioritize the market that is open now.
-        market_order = ["KIS_US", "KIS_KR"] if _stock_market_open("KIS_US") else ["KIS_KR", "KIS_US"]
+        # When Alpaca is configured, KIS is Korea-only. During migration without
+        # Alpaca credentials, the legacy KIS US fallback is still available.
+        if alpaca.configured():
+            market_order = ["KIS_KR"]
+        else:
+            market_order = ["KIS_US", "KIS_KR"] if _stock_market_open("KIS_US") else ["KIS_KR", "KIS_US"]
         by_market = {"KIS_KR": kr, "KIS_US": us}
 
         plan: list[tuple[str, str, str, str]] = []
@@ -576,7 +790,8 @@ class MarketStreamHub:
                     pass
 
                 self._kis_subscribed = {"KIS_KR": set(), "KIS_US": set()}
-                for market in ("KIS_KR", "KIS_US"):
+                kis_markets = ("KIS_KR",) if alpaca.configured() else ("KIS_KR", "KIS_US")
+                for market in kis_markets:
                     count = sum(1 for item in plan if item[0] == market)
                     self._set(
                         market,
@@ -602,7 +817,7 @@ class MarketStreamHub:
                     time.sleep(KIS_WS_SUBSCRIBE_INTERVAL)
 
                 # Socket accepted the subscription batch; ACKs/realtime follow below.
-                for market in ("KIS_KR", "KIS_US"):
+                for market in kis_markets:
                     count = sum(1 for item in plan if item[0] == market)
                     if count:
                         self._set(market, connected=True, mode="WEBSOCKET_SUBSCRIBED")
@@ -640,7 +855,8 @@ class MarketStreamHub:
             except Exception as exc:
                 reconnect_attempt += 1
                 delay = min(30.0, 1.5 * (2 ** min(reconnect_attempt - 1, 4)))
-                for market in ("KIS_KR", "KIS_US"):
+                kis_markets = ("KIS_KR",) if alpaca.configured() else ("KIS_KR", "KIS_US")
+                for market in kis_markets:
                     self._set(
                         market,
                         connected=False,
