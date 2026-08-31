@@ -1,29 +1,10 @@
-# V145_KIS_RATE_LIMIT_STABILITY: official KIS pagination + bounded warmup + rate guards + V143_API_STABILITY_PATCH: Upbit rate-limit + KIS calendar/minute pagination stabilization + V142_KIS_STOCK_AUTO_PUSH_LAYOUT: KIS 국장/미장 직접계산 + FCM 종목/가격 우선 표시 + V141_TV_FCM_BLOCK_TELEGRAM_KEEP: TradingView->App FCM blocked, Telegram preserved + V140_WORKER_START_RECOVERY: Gunicorn fork-safe auto-engine startup + V139_FCM_SOURCE_TRACE: FCM source trace + V138_PARALLEL_PROGRESS_ENGINE + V137_LIVE_SUBSCRIPTION_FALLBACK: 앱 heartbeat 구독 + DB 실패 시 live FCM fallback + V136_SUBSCRIPTION_DB_CACHE: 배포 후 구독 스냅샷 복구 + nonblocking status + V134_AUTO_EXCHANGE_ENGINE: 회원 직접 종목등록 -> 거래소 직접 계산 -> 자동 FCM + V133_TV_OHLC_DIAGNOSTIC: COIN9 불일치 원인 판별용 TradingView TF별 OHLC 비교/내보내기
-# V132_US_NAME_AND_COMPARE_EXPORT: 미장 팝업 영문 종목명 보강 + COIN9 검증 JSON/CSV 다운로드
-# V131_SPLIT_ENTRY_TAJUM_LABELS: 회원 노출 유효 1/3~3/3 → 분할매수/분할매도 1~3차 타점 문구 통일
-# V130_COIN9_ALL_TF_TV_AUTO_COMPARE: 코인9종목 별꽃 전체 체인 TF 자동 비교 + 누적통계/대시보드 (전송/성과DB 영향 없음)
-# V127_SERVER_SIGNAL_ENGINE_BTC_PHASE1: Pine 기준 BTCUSDT 5m/15m 비교전용 서버 타점 엔진 추가 (전송/DB 영향 없음)
-# V126_TAJUM_APP_GROUP_PUSH_COOLDOWN_HOME3: 앱 동일 종목·방향·타점그룹 5분 푸시 중복 차단 + 홈 3종목 보강
-# V120_TAJUM_MARKET_CATEGORY_TIMEFRAME_FILTER: 실시간 시장현황 + 사용자 친화 종목표기 + 대분류/타점구분 + 알림 종목필터
-# V116_TAJUM_APP_REAL_FCM_PUSH: 앱 기기/관심종목 등록 + Telegram cadence와 동일한 실제 FCM 푸시
-# V114_APP_TELEGRAM_CADENCE_ALERT_API: 타점온 알림 이력을 실제 Telegram 노출 cadence(집중+유효1~3)와 일치
-# V113_APP_SYMBOL_DETAIL_API: 타점온 앱 종목 상세를 실제 수신 타점 DB와 연결
-# V112_APP_SYMBOL_API: 타점온 앱 종목 조회를 실제 서버 수신 종목과 연결
-# V109_VISIBLE_SELL_RESULT_FALLBACK: 실제 Telegram 매도 집중(stage0) 기준 결과카드 누락 보강 + V108 안정화 유지
-# V107_CADENCE_NAMEERROR_FIX: 알람 분석 _stats 복구 + episodes dict 처리 FIX + V106 결과알람 누락방지 유지
-# V106_PERFORMANCE_RESULT_RETRY: SWING/LONG/LIFE 결과 이미지 누락 방지용 delivery replay + 기존 UI 유지
-# V104_ADMIN_UI_HIERARCHY_NAV: 큰/작은 메뉴 색상 분리 + 접힌 상태에서도 세부메뉴명 노출 + 클릭 세부섹션 자동 펼침/강조 + 중복 관리자분석 메뉴 통합
-# V98_HIGHER_TREND_REGIME_RESEARCH
-# V97_SYMBOL_ENTRYPLAN_AND_EMPTY_TF: 종목별 5가지 매수방식 + 미완료 시간봉 조합 표시
-# V103_CADENCE_EPISODE_COOLDOWN: 전 단계 5분 + 종료 후 단타/스윙 자기봉, 장기/인생 60분 재집중
-# V96_ENTRY_PLAN_RESEARCH: 집중 포함/스킵 3·5분할 + 집중 단독 성과연구
-# V95_CADENCE_RESEARCH: 3분 쿨타임 + 정시5분 + MAE/MFE 성과표
-# V94_RESEARCH_COLLECTION: SMA 단일화 + 관리자 유효1~5 + BB/MAE-MFE 연구 수집
-# V93_FIVE_MIN_CADENCE: 전 알람 5분 유효 쿨타임 + 시간봉별 집중 리셋 + 5분 주기 분석
-# V77_INDICATOR_HASHTAG_SCOPE: 해시태그는 매수/매도 알람방 전용 + 주요지표 제외
-# V92_DETAIL_UI: 단타 상세/예측 종목정렬/클릭 hover 강화
-# V62_PREDICTION_RESEARCH: 상위 시간봉 예측 연구용 지표 스냅샷 수집
-# app.py — V100 admin collapsible menu + V99 spot-symbol migration + unified webhook + BNC trade + TG UI
+# V147_ARCHITECTURE_CLEANUP_MEMBER_SPLIT_READY
+# - V146 WebSocket + local candle + 4 market workers + alert queue
+# - coin/stock continuous chains include internal 2h and 6h gates
+# - legacy TradingView comparison endpoints removed
+# - deleted Telegram room routes removed
+# - Tajum On member/FCM can be detached to a separate Render service with local fallback
+# - legacy /bnc and /tv automatic-trading compatibility block intentionally left byte-for-byte unchanged
 import os, json, logging, time, re, hmac, hashlib, math, threading, tempfile, gc
 import csv
 import io
@@ -37,6 +18,11 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 import requests
 
 from firebase_push import push_health, send_push_to_tokens, notification_delivery_profile
+
+try:
+    import tajumon_member_client as _tajum_member_client
+except Exception:
+    _tajum_member_client = None
 
 # 관리자 성과 분석 DB (기존 텔레그램/자동매매와 독립)
 from performance_store import (
@@ -209,14 +195,25 @@ def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
 def _auto_active_unique_symbols() -> list[str]:
     """Background provider: member watchlist -> one compute per unique market symbol.
 
-    Coins are always supported. KRX/US stocks are added automatically only when
-    KIS credentials are configured, so missing KIS keys can never break coin FCM.
+    V147 can obtain subscriptions from the detached member/FCM service. If that
+    service is not configured or temporarily unavailable, the proven local V145
+    DB/live-snapshot path remains as an automatic fallback.
     """
-    _auto_refresh_db_subscription_cache()
-    with _AUTO_SUB_LOCK:
-        values: set[str] = set(_AUTO_DB_SYMBOLS)
-        for symbols in _AUTO_SUBSCRIPTIONS.values():
-            values.update(symbols)
+    values: set[str] = set()
+    remote_used = False
+    if _tajum_member_client is not None and _tajum_member_client.configured():
+        try:
+            values.update(_tajum_member_client.active_symbols())
+            remote_used = True
+        except Exception as exc:
+            log.warning("V147 member service subscription fallback to local DB: %s", exc)
+
+    if not remote_used:
+        _auto_refresh_db_subscription_cache()
+        with _AUTO_SUB_LOCK:
+            values.update(_AUTO_DB_SYMBOLS)
+            for symbols in _AUTO_SUBSCRIPTIONS.values():
+                values.update(symbols)
 
     try:
         import kis_market_provider as _kis
@@ -244,14 +241,26 @@ def _auto_active_unique_symbols() -> list[str]:
 
 
 def _auto_subscription_status() -> dict[str, Any]:
-    # Status is intentionally cache-only: never perform DB/schema work in a request.
+    # Detached member service is the preferred source after migration. The local
+    # status remains available as fallback and for zero-downtime rollback.
+    remote_symbols: set[str] | None = None
+    member_service_status: dict[str, Any] = {"configured": False}
+    if _tajum_member_client is not None and _tajum_member_client.configured():
+        try:
+            remote_symbols = set(_tajum_member_client.active_symbols(cache_seconds=3.0))
+            member_service_status = {"configured": True, "ok": True, "symbol_count": len(remote_symbols)}
+        except Exception as exc:
+            member_service_status = {"configured": True, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     with _AUTO_SUB_LOCK:
         memory_values: set[str] = set()
         for symbols in _AUTO_SUBSCRIPTIONS.values():
             memory_values.update(symbols)
         db_values = set(_AUTO_DB_SYMBOLS)
         snapshot_sizes = {device_id: len(symbols) for device_id, symbols in _AUTO_SUBSCRIPTIONS.items()}
-    all_values = {str(x or '').strip().upper() for x in memory_values.union(db_values) if str(x or '').strip()}
+
+    local_values = {str(x or '').strip().upper() for x in memory_values.union(db_values) if str(x or '').strip()}
+    all_values = remote_symbols if remote_symbols is not None else local_values
     coins = {x for x in all_values if x.startswith('KRW-') or x.endswith('USDT')}
     korea = {x for x in all_values if x.isdigit() and len(x) == 6}
     us = {x for x in all_values if x not in coins and x not in korea and re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,14}', x)}
@@ -264,6 +273,8 @@ def _auto_subscription_status() -> dict[str, Any]:
         kis_status = {'configured': False, 'last_error': f'{type(exc).__name__}: {exc}'}
     active = set(coins) | ((korea | us) if kis_ready else set())
     return {
+        'subscription_source': 'member_service' if remote_symbols is not None else 'local_fallback',
+        'member_service': member_service_status,
         'snapshot_device_count': len(_AUTO_SUBSCRIPTIONS),
         'live_device_count': len(_AUTO_DEVICE_SNAPSHOTS),
         'snapshot_symbol_counts': snapshot_sizes,
@@ -280,7 +291,6 @@ def _auto_subscription_status() -> dict[str, Any]:
         'registered_us_symbol_count': len(us),
         'active_symbol_count': len(active),
         'active_symbols': sorted(active),
-        # Backward-compatible fields used by existing status screenshots/UI.
         'active_coin_symbol_count': len(coins),
         'active_coin_symbols': sorted(coins),
         'memory_coin_symbol_count': len({x for x in memory_values if x.startswith('KRW-') or x.endswith('USDT')}),
@@ -305,7 +315,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "v109-visible-sell-result-fallback")
+APP_VERSION  = os.getenv("APP_VERSION", "V147")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -331,7 +341,6 @@ def version():
         "performance_automation_enabled": os.getenv(
             "PERFORMANCE_AUTOMATION_ENABLED", "1"
         ).strip().lower() not in ("0", "false", "off", "no"),
-        "economic_calendar_feature": "removed",
         "ui_release": "V50_MASTER",
         "telegram_cadence_enabled": TELEGRAM_CADENCE_ENABLED,
         "telegram_cadence_mode": TELEGRAM_CADENCE_MODE,
@@ -343,332 +352,23 @@ def version():
 def whoami():
     return jsonify({"service": SERVICE_NAME})
 
-# === V130 서버형 타점 계산기: 코인 9종목 전체 TF TradingView ↔ Binance 자동 비교 ===
-# 중요: 기존 TradingView 회원알림 / Telegram / FCM / 성과DB 흐름과 완전히 분리되어 있다.
-# V130은 종목별 누적 통계 + 최신 상세 + 신호변화/불일치 이벤트만 메모리에 보관한다.
-# 검증 완료 전 회원용 알림으로 절대 전송하지 않는다.
+# === V147 production server-engine health ===
+# Old COIN9 TradingView↔Binance comparison/diagnostic endpoints were removed.
 @app.get("/server-engine/health")
 def server_engine_health():
     try:
-        from server_signal_engine import (
-            compare_key_configured,
-            comparison_retention_limit,
-            comparison_storage_mode,
-            supported_symbols,
-            TF_ORDER,
-            INTERNAL_ONLY_TFS,
-            COMPARE_WORKERS,
-            PINE_PAYLOAD_VERSION,
-        )
-        key_configured = compare_key_configured()
-        retention_limit = comparison_retention_limit()
-        storage_mode = comparison_storage_mode()
-        symbols = supported_symbols()
-        timeframes = list(TF_ORDER)
-        internal_tfs = list(INTERNAL_ONLY_TFS)
-        workers = COMPARE_WORKERS
-        pine_payload_version = PINE_PAYLOAD_VERSION
-    except Exception:
-        key_configured = False
-        retention_limit = 1000
-        storage_mode = "unknown"
-        symbols = {
-            "BTCUSDT": "Bitcoin", "ETHUSDT": "Ethereum", "SOLUSDT": "SOL",
-            "SUIUSDT": "SUI", "LINKUSDT": "ChainLink", "XRPUSDT": "XRP",
-            "DOGEUSDT": "Dogecoin", "ADAUSDT": "Cardano", "ONDOUSDT": "ONDO",
-        }
-        timeframes = ["1w", "1d", "12h", "6h", "4h", "2h", "1h", "30m", "15m", "5m"]
-        internal_tfs = ["2h"]
-        workers = 3
-        pine_payload_version = "V133_TF_OHLC"
-    return jsonify({
-        "ok": True,
-        "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
-        "symbol_count": len(symbols),
-        "symbols": symbols,
-        "signal_timeframes": timeframes,
-        "comparison_basis": "TradingView minute_close + Binance finalized lower-TF reconstruction for all 별꽃 chain TFs",
-        "delivery_enabled": False,
-        "telegram_enabled": False,
-        "fcm_enabled": False,
-        "database_write_enabled": False,
-        "compare_key_configured": key_configured,
-        "event_retention_limit": retention_limit,
-        "storage_mode": storage_mode,
-        "compare_workers": workers,
-        "expected_pine_payload_version": pine_payload_version,
-        "tv_tf_ohlc_diagnostic": True,
-        "internal_chain_timeframes": internal_tfs,
-        "delivery_mode": "COMPARE_ONLY_NO_TELEGRAM_NO_FCM_NO_DB",
-    })
-
-# V129 주소 호환 유지: BTC 수동 계산 확인용.
-@app.get("/server-engine/phase1/btc")
-def server_engine_phase1_btc():
-    try:
-        from server_signal_engine import evaluate_phase1_btc
-        result = evaluate_phase1_btc()
-        return jsonify(result), (200 if result.get("ok") else 502)
-    except Exception as exc:
-        log.exception("Server signal engine BTC manual evaluate failed")
+        import server_signal_engine as signal_engine
         return jsonify({
-            "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
-            "delivery_enabled": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }), 500
-
-@app.get("/server-engine/evaluate/<symbol>")
-def server_engine_evaluate_symbol(symbol):
-    try:
-        from server_signal_engine import evaluate_symbol
-        result = evaluate_symbol(symbol)
-        return jsonify(result), (200 if result.get("ok") else 502)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
+            "ok": True,
+            "mode": "production_signal_engine",
+            "tradingview_compare": "removed",
+            "coin_chain": list(signal_engine.TF_ORDER),
+            "coin_internal_chain_timeframes": sorted(signal_engine.INTERNAL_ONLY_TFS),
+            "note": "2h and 6h participate in continuous chain evaluation",
+        }), 200
     except Exception as exc:
-        log.exception("Server signal engine symbol evaluate failed: %s", symbol)
+        log.exception("Production signal engine health failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
-
-@app.post("/server-engine/compare/tradingview")
-def server_engine_compare_tradingview():
-    try:
-        from server_signal_engine import compare_key_matches, enqueue_tradingview_snapshot
-
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            raw = (request.get_data(as_text=True) or "").strip()
-            payload = json.loads(raw) if raw else None
-        if not isinstance(payload, dict):
-            return jsonify({"ok": False, "error": "valid JSON body required"}), 400
-
-        provided_key = request.headers.get("X-Server-Engine-Key") or payload.get("compare_key")
-        if not compare_key_matches(provided_key):
-            return jsonify({"ok": False, "error": "invalid compare key"}), 403
-
-        result = enqueue_tradingview_snapshot(payload)
-        return jsonify(result), 202
-    except ValueError as exc:
-        return jsonify({
-            "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
-            "error": str(exc),
-        }), 400
-    except Exception as exc:
-        log.exception("Server signal engine TradingView compare failed")
-        return jsonify({
-            "ok": False,
-            "phase": "COIN9_ALL_TF_TV_AUTO_COMPARE_V133_TV_OHLC_DIAGNOSTIC",
-            "error": f"{type(exc).__name__}: {exc}",
-        }), 500
-
-@app.get("/server-engine/compare/latest")
-def server_engine_compare_latest():
-    try:
-        from server_signal_engine import comparison_latest
-        symbol = (request.args.get("symbol") or "").strip() or None
-        return jsonify(comparison_latest(symbol))
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        log.exception("Server signal engine latest compare failed")
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
-
-@app.get("/server-engine/compare/summary")
-def server_engine_compare_summary():
-    try:
-        from server_signal_engine import comparison_summary
-        return jsonify(comparison_summary())
-    except Exception as exc:
-        log.exception("Server signal engine compare summary failed")
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
-
-@app.get("/server-engine/compare/events")
-def server_engine_compare_events():
-    try:
-        from server_signal_engine import comparison_events
-        symbol = (request.args.get("symbol") or "").strip() or None
-        try:
-            limit = int(request.args.get("limit") or 100)
-        except Exception:
-            limit = 100
-        return jsonify(comparison_events(symbol=symbol, limit=limit))
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        log.exception("Server signal engine compare events failed")
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
-
-@app.get("/server-engine/compare/export.json")
-def server_engine_compare_export_json():
-    """Download a diagnostic bundle that can be attached directly to ChatGPT."""
-    try:
-        from server_signal_engine import comparison_summary, comparison_latest, comparison_events, supported_symbols
-        symbols = supported_symbols()
-        latest_by_symbol = {}
-        for symbol in symbols:
-            latest_by_symbol[symbol] = comparison_latest(symbol)
-        payload = {
-            "export_version": "V133_TV_OHLC_DIAGNOSTIC_EXPORT",
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "summary": comparison_summary(),
-            "latest_by_symbol": latest_by_symbol,
-            "events": comparison_events(limit=500),
-            "note": "V133 MISMATCH events include TradingView and server TF OHLC, OHLC diffs, indicator diffs, and an automatic root_cause_hint.",
-        }
-        text = json.dumps(payload, ensure_ascii=False, indent=2)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        return Response(
-            text,
-            mimetype="application/json; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="tajum_coin9_compare_{stamp}.json"'},
-        )
-    except Exception as exc:
-        log.exception("Server signal engine JSON export failed")
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
-
-
-@app.get("/server-engine/compare/events.csv")
-def server_engine_compare_events_csv():
-    """Download recent state-change/mismatch/error events as a spreadsheet-friendly CSV."""
-    try:
-        from server_signal_engine import comparison_events
-        rows = comparison_events(limit=500).get("events") or []
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow([
-            "event", "symbol", "display_name", "pine_minute_close_utc", "received_at_utc",
-            "tv_buy_tf", "server_buy_tf", "tv_sell_tf", "server_sell_tf",
-            "signal_match", "mean_abs_indicator_diff", "mismatch_timeframes",
-            "root_cause_hint", "ohlc_same_timeframes", "ohlc_diff_timeframes", "max_ohlc_diff_bps", "error",
-        ])
-        for row in rows:
-            tv_buy = row.get("tv_buy") or {}
-            sv_buy = row.get("server_buy") or {}
-            tv_sell = row.get("tv_sell") or {}
-            sv_sell = row.get("server_sell") or {}
-            mismatch_tfs = row.get("mismatch_timeframes") or {}
-            ohlc_same_tfs = []
-            ohlc_diff_tfs = []
-            max_ohlc_bps = None
-            for tf_name, tf_detail in mismatch_tfs.items():
-                ohlc = (tf_detail or {}).get("ohlc_diagnostic") or {}
-                if not ohlc.get("available"):
-                    continue
-                if ohlc.get("match"):
-                    ohlc_same_tfs.append(tf_name)
-                else:
-                    ohlc_diff_tfs.append(tf_name)
-                bps = ohlc.get("max_abs_diff_bps")
-                if bps is not None:
-                    max_ohlc_bps = max(float(bps), float(max_ohlc_bps or 0.0))
-            writer.writerow([
-                row.get("event", ""), row.get("symbol", ""), row.get("display_name", ""),
-                row.get("pine_minute_close_utc", ""), row.get("received_at_utc", ""),
-                tv_buy.get("max_timeframe") or "", sv_buy.get("max_timeframe") or "",
-                tv_sell.get("max_timeframe") or "", sv_sell.get("max_timeframe") or "",
-                row.get("signal_match", ""), row.get("mean_abs_indicator_diff", ""),
-                ";".join(sorted(mismatch_tfs.keys())), row.get("root_cause_hint", ""),
-                ";".join(sorted(ohlc_same_tfs)), ";".join(sorted(ohlc_diff_tfs)),
-                "" if max_ohlc_bps is None else max_ohlc_bps, row.get("error", ""),
-            ])
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        return Response(
-            output.getvalue(),
-            mimetype="text/csv; charset=utf-8-sig",
-            headers={"Content-Disposition": f'attachment; filename="tajum_coin9_events_{stamp}.csv"'},
-        )
-    except Exception as exc:
-        log.exception("Server signal engine CSV export failed")
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
-
-
-@app.get("/server-engine/compare/dashboard")
-def server_engine_compare_dashboard():
-    try:
-        from server_signal_engine import comparison_summary, comparison_events
-        summary = comparison_summary()
-        events = comparison_events(limit=80).get("events") or []
-
-        def pct(v):
-            return "-" if v is None else f"{float(v):.3f}%"
-
-        def num(v, digits=5):
-            return "-" if v is None else f"{float(v):.{digits}f}"
-
-        symbol_rows = []
-        for symbol, row in (summary.get("per_symbol") or {}).items():
-            buy = row.get("latest_buy") or {}
-            sell = row.get("latest_sell") or {}
-            buy_txt = buy.get("max_timeframe") if buy.get("chain_ok") else "-"
-            sell_txt = sell.get("max_timeframe") if sell.get("chain_ok") else "-"
-            status = "✅" if row.get("sample_count", 0) > 0 and row.get("error_count", 0) == 0 else ("⚠" if row.get("error_count", 0) else "대기")
-            symbol_rows.append({
-                **row,
-                "status": status,
-                "buy_txt": buy_txt,
-                "sell_txt": sell_txt,
-                "signal_match_text": pct(row.get("signal_match_rate_pct")),
-                "condition_match_text": pct(row.get("condition_match_rate_pct")),
-                "diff_text": num(row.get("mean_abs_indicator_diff_avg"), 5),
-            })
-
-        tf_rows = []
-        for tf, row in (summary.get("per_timeframe") or {}).items():
-            tf_rows.append({
-                "tf": tf + ("*" if row.get("internal_chain_only") else ""),
-                "samples": row.get("samples", 0),
-                "condition_match_text": pct(row.get("condition_match_rate_pct")),
-                "condition_match_rate_pct": row.get("condition_match_rate_pct"),
-                "diff_text": num(row.get("mean_abs_indicator_diff_avg"), 5),
-                "borderline_hits": row.get("borderline_hits", 0),
-                "borderline_mismatch_hits": row.get("borderline_mismatch_hits", 0),
-                "tv_ohlc_samples": row.get("tv_ohlc_samples", 0),
-                "ohlc_match_text": pct(row.get("ohlc_match_rate_pct")),
-                "ohlc_match_rate_pct": row.get("ohlc_match_rate_pct"),
-                "mismatch_ohlc_same": row.get("condition_mismatch_ohlc_same", 0),
-                "mismatch_ohlc_diff": row.get("condition_mismatch_ohlc_diff", 0),
-                "ohlc_diff_bps_text": num(row.get("ohlc_max_abs_diff_bps_avg"), 5),
-            })
-
-        return render_template_string(r'''<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>타점온 서버엔진 COIN9 V133 OHLC 진단</title>
-<style>
-body{margin:0;background:#0f1115;color:#e8eaf0;font-family:Arial,"Noto Sans KR",sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px}
-h1{font-size:24px;margin:0 0 6px}.sub{color:#9aa3b2;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px;margin-bottom:18px}
-.card{background:#171b22;border:1px solid #29303b;border-radius:12px;padding:14px}.k{color:#9aa3b2;font-size:12px}.v{font-size:23px;font-weight:700;margin-top:5px}
-table{width:100%;border-collapse:collapse;background:#171b22;margin:0 0 18px}th,td{padding:9px 10px;border-bottom:1px solid #29303b;text-align:right;font-size:13px}th{color:#aeb7c6;background:#1d222b;position:sticky;top:0}th:first-child,td:first-child{text-align:left}.ok{color:#5fe08b}.warn{color:#ffd166}.bad{color:#ff6b6b}.muted{color:#8f98a8}.section{font-size:18px;margin:20px 0 8px}.event{background:#171b22;border:1px solid #29303b;border-radius:10px;padding:10px 12px;margin:6px 0;font-size:13px}.event b{margin-right:8px}a{color:#8ab4ff}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}table{display:block;overflow:auto}}
-</style></head><body><div class="wrap">
-<h1>🧪 타점온 COIN9 서버엔진 검증 V133 · TV OHLC 진단</h1>
-<div class="sub">1분마다 TradingView ↔ Binance 재구성 비교 · TF별 OHLC 직접 대조 · 자동 60초 새로고침 · 2h* = 내부 체인 전용</div>
-<div class="cards">
-<div class="card"><div class="k">활성 종목</div><div class="v">{{s.active_symbol_count}} / {{s.configured_symbol_count}}</div></div>
-<div class="card"><div class="k">전체 비교</div><div class="v">{{s.sample_count}}</div></div>
-<div class="card"><div class="k">최종 신호 일치</div><div class="v ok">{{pct(s.signal_match_rate_pct)}}</div></div>
-<div class="card"><div class="k">조건 일치</div><div class="v ok">{{pct(s.condition_match_rate_pct)}}</div></div>
-<div class="card"><div class="k">오류</div><div class="v {{'bad' if s.error_count else 'ok'}}">{{s.error_count}}</div></div>
-<div class="card"><div class="k">불일치</div><div class="v {{'bad' if s.mismatch_count else 'ok'}}">{{s.mismatch_count}}</div></div>
-<div class="card"><div class="k">TF 불일치 · OHLC 동일</div><div class="v warn">{{s.condition_mismatch_ohlc_same_count}}</div></div>
-<div class="card"><div class="k">TF 불일치 · OHLC 차이</div><div class="v {{'bad' if s.condition_mismatch_ohlc_diff_count else 'ok'}}">{{s.condition_mismatch_ohlc_diff_count}}</div></div>
-</div>
-<div class="section">종목별 검증</div>
-<table><thead><tr><th>종목</th><th>상태</th><th>샘플</th><th>신호일치</th><th>조건일치</th><th>평균 지표오차</th><th>BUY 현재</th><th>SELL 현재</th><th>BUY 신호샘플</th><th>SELL 신호샘플</th><th>상태변화</th><th>오류</th></tr></thead><tbody>
-{% for r in symbol_rows %}<tr><td>🪙 {{r.symbol}} [{{r.display_name}}]</td><td>{{r.status}}</td><td>{{r.sample_count}}</td><td class="{{'ok' if r.signal_match_rate_pct == 100 else ('bad' if r.signal_match_rate_pct is not none else '')}}">{{r.signal_match_text}}</td><td>{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.buy_txt}}</td><td>{{r.sell_txt}}</td><td>{{r.buy_signal_sample_count}}</td><td>{{r.sell_signal_sample_count}}</td><td>{{r.signal_transition_count}}</td><td class="{{'bad' if r.error_count else 'ok'}}">{{r.error_count}}</td></tr>{% endfor %}
-</tbody></table>
-<div class="section">전체 시간봉별 검증</div>
-<table><thead><tr><th>TF</th><th>샘플</th><th>조건일치</th><th>평균 지표오차</th><th>TV OHLC 샘플</th><th>OHLC 일치</th><th>불일치·OHLC 동일</th><th>불일치·OHLC 차이</th><th>평균 OHLC 최대차(bps)</th><th>임계값 근접</th><th>근접 불일치</th></tr></thead><tbody>
-{% for r in tf_rows %}<tr><td>{{r.tf}}</td><td>{{r.samples}}</td><td class="{{'ok' if r.condition_match_rate_pct == 100 else ('bad' if r.condition_match_rate_pct is not none else '')}}">{{r.condition_match_text}}</td><td>{{r.diff_text}}</td><td>{{r.tv_ohlc_samples}}</td><td class="{{'ok' if r.ohlc_match_rate_pct == 100 else ('bad' if r.ohlc_match_rate_pct is not none else '')}}">{{r.ohlc_match_text}}</td><td class="{{'warn' if r.mismatch_ohlc_same else 'ok'}}">{{r.mismatch_ohlc_same}}</td><td class="{{'bad' if r.mismatch_ohlc_diff else 'ok'}}">{{r.mismatch_ohlc_diff}}</td><td>{{r.ohlc_diff_bps_text}}</td><td>{{r.borderline_hits}}</td><td class="{{'bad' if r.borderline_mismatch_hits else 'ok'}}">{{r.borderline_mismatch_hits}}</td></tr>{% endfor %}
-</tbody></table>
-<div class="section">최근 신호 변화 / 불일치 / 오류</div>
-{% if events %}{% for e in events %}<div class="event"><b>{{e.event}}</b> {{e.symbol}} [{{e.display_name}}] · {{e.pine_minute_close_utc or e.received_at_utc}}{% if e.error %} · <span class="bad">{{e.error}}</span>{% endif %}{% if e.root_cause_hint %} · <span class="warn">{{e.root_cause_hint}}</span>{% endif %}{% if e.tv_buy %} · BUY TV={{e.tv_buy.max_timeframe or '-'}} / SV={{(e.server_buy or {}).get('max_timeframe') or '-'}} · SELL TV={{e.tv_sell.max_timeframe or '-'}} / SV={{(e.server_sell or {}).get('max_timeframe') or '-' }}{% endif %}</div>{% endfor %}{% else %}<div class="event muted">아직 기록할 신호 상태변화·불일치·오류가 없습니다.</div>{% endif %}
-<div class="sub">다운로드: <a href="/server-engine/compare/export.json">전체 진단 JSON</a> · <a href="/server-engine/compare/events.csv">이벤트 CSV</a> &nbsp; | &nbsp; JSON 보기: <a href="/server-engine/compare/summary">summary</a> · <a href="/server-engine/compare/latest">latest</a> · <a href="/server-engine/compare/events">events</a></div>
-</div></body></html>''', s=summary, symbol_rows=symbol_rows, tf_rows=tf_rows, events=events, pct=pct)
-    except Exception as exc:
-        log.exception("Server signal engine compare dashboard failed")
-        return f"dashboard error: {type(exc).__name__}: {exc}", 500
 
 # === Anti-spam settings (60s fixed) ===
 COOLDOWN_SEC      = 60
@@ -1304,19 +1004,9 @@ def build_route_map() -> Dict[str, str]:
         if val is not None:
             m[k] = val
     # 기존 라우트들
-    add_if("OS_SCALP", "OS_SCALP_CHAT_ID")
-    add_if("OS_SHORT", "OS_SHORT_CHAT_ID")
     add_if("OS_LONG",  "OS_LONG_CHAT_ID")
     add_if("OB_LONG",  "OB_LONG_CHAT_ID")
-    add_if("OB_SHORT", "OB_SHORT_CHAT_ID")
     add_if("AUX_4INDEX", "MAIN_INDICATOR_CHAT_ID")
-    add_if("OS_SWINGA", "OS_SWINGA_CHAT_ID")
-    add_if("OB_SWINGA", "OB_SWINGA_CHAT_ID")
-    add_if("OS_SWINGB", "OS_SWINGB_CHAT_ID")
-    add_if("OB_SWINGB", "OB_SWINGB_CHAT_ID")
-    add_if("OS_SCALP_KRW", "KRW_SCALP")
-    add_if("OS_SHORT_KRW", "KRW_SHORT")
-    add_if("OS_SWING_KRW", "KRW_SWING")
     add_if("OS_LONG_KRW",  "KRW_LONG")
     # ===== 빵돌이 별꽃 타점 / BD 8개 그룹 =====
     # Render 환경변수명 권장:
@@ -3169,6 +2859,14 @@ def app_market_status():
 def app_device_register():
     """Register one Tajum On installation and its currently enabled watch symbols."""
     data = request.get_json(silent=True, force=True) or {}
+    if _tajum_member_client is not None and _tajum_member_client.configured():
+        try:
+            body, status_code = _tajum_member_client.proxy("POST", "/app/device/register", json_body=data)
+            if status_code < 500:
+                _ensure_auto_exchange_engine_started()
+            return jsonify(body), status_code
+        except Exception as exc:
+            log.exception("V147 member service device/register proxy failed; local fallback used")
     device_id = str(data.get("device_id", "") or "").strip()
     fcm_token = str(data.get("fcm_token", "") or "").strip()
     platform = str(data.get("platform", "android") or "android").strip()
@@ -3244,43 +2942,18 @@ def app_device_register():
 
 @app.get("/app/push/health")
 def app_push_health():
+    if _tajum_member_client is not None and _tajum_member_client.configured():
+        try:
+            body, status_code = _tajum_member_client.proxy("GET", "/app/push/health")
+            return jsonify(body), status_code
+        except Exception:
+            log.exception("V147 member service push/health proxy failed; local fallback used")
     try:
         devices = app_device_summary()
     except Exception:
         log.exception("TajumOn push device summary failed")
         devices = {"database": "error", "device_count": 0, "push_enabled_count": 0}
     return jsonify({"ok": True, "firebase": push_health(), "devices": devices}), 200
-
-
-@app.post("/app/push/test")
-def app_push_test():
-    """Protected manual test endpoint. Disabled unless APP_PUSH_TEST_SECRET is configured."""
-    expected = os.getenv("APP_PUSH_TEST_SECRET", "").strip()
-    provided = request.headers.get("X-App-Push-Secret", "").strip()
-    if not expected or not hmac.compare_digest(provided, expected):
-        return jsonify({"ok": False, "error": "forbidden"}), 403
-    data = request.get_json(silent=True, force=True) or {}
-    symbol = _clean_symbol_code(data.get("symbol", ""))
-    tokens = app_device_tokens_for_symbol(symbol or None, 500)
-    title = str(data.get("title", "타점온 서버 푸시 테스트") or "타점온 서버 푸시 테스트")
-    body = str(data.get("body", "Render → Firebase → 타점온 연결 테스트입니다.") or "")
-    try:
-        result = send_push_to_tokens(
-            tokens,
-            title,
-            body,
-            {"symbol": symbol, "source": "render_test", "route": "alerts"},
-        )
-        for failed in result.get("failed_tokens", []):
-            remove_app_device_token(failed)
-        public_result = {
-            key: value for key, value in result.items()
-            if key not in {"failed_tokens", "successful_tokens"}
-        }
-        return jsonify({"ok": True, "symbol": symbol or None, "result": public_result}), 200
-    except Exception as exc:
-        log.exception("TajumOn manual push test failed")
-        return jsonify({"ok": False, "error": type(exc).__name__}), 500
 
 
 @app.get("/app/alerts/recent")
@@ -3290,6 +2963,13 @@ def app_recent_alerts():
     Only cadence pushes that Firebase reported as successfully delivered to this
     installation are returned. Retention is hard-limited to 300 items and 30 days.
     """
+    if _tajum_member_client is not None and _tajum_member_client.configured():
+        try:
+            body, status_code = _tajum_member_client.proxy("GET", "/app/alerts/recent", params=request.args)
+            _ensure_auto_exchange_engine_started()
+            return jsonify(body), status_code
+        except Exception:
+            log.exception("V147 member service alerts/recent proxy failed; local fallback used")
     device_id = request.args.get("device_id", "").strip()
     if not device_id:
         return jsonify({"ok": False, "error": "empty_device_id"}), 400
@@ -7939,6 +7619,32 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         payload = _cadence_push_parts(route, msg, symbol, cadence_reason)
         if not payload:
             return
+
+        # V147 detached member/FCM service. Core keeps cadence/signal interpretation;
+        # member service owns recipient lookup, cooldown, Firebase delivery and history.
+        if _tajum_member_client is not None and _tajum_member_client.configured():
+            try:
+                market_type = "COIN" if str(payload.get("market", "")).upper() == "COIN" else "STOCK"
+                group_key = str(payload.get("group_key", "") or "").strip().upper()
+                payload["group_timeframes"] = list(
+                    ENTRY_GROUP_TIMEFRAMES.get(market_type, {}).get(
+                        group_key, [str(payload.get("timeframe", "") or "")]
+                    )
+                )
+                result = _tajum_member_client.fanout(
+                    payload, str(source or "AUTO").upper(), TELEGRAM_VALID_COOLDOWN_MINUTES
+                )
+                total_success = int(result.get("success", 0) or 0)
+                total_failure = int(result.get("failure", 0) or 0)
+                _record_fcm_source_trace(source, payload, total_success, total_failure)
+                log.info(
+                    "V147 remote member FCM source=%s symbol=%s success=%s failure=%s",
+                    str(source or "AUTO").upper(), payload.get("symbol"), total_success, total_failure,
+                )
+                return
+            except Exception:
+                log.exception("V147 remote member FCM failed; local fallback used symbol=%s", payload.get("symbol"))
+
         try:
             devices = app_devices_for_symbol(payload["symbol"], 500)
         except Exception:
@@ -8132,11 +7838,11 @@ def _ensure_auto_exchange_engine_started() -> bool:
                 return False
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V145 automatic market engine ensure pid=%s started=%s", pid, started)
+            log.info("V147 automatic market engine ensure pid=%s started=%s", pid, started)
             return started
         except Exception:
             _AUTO_ENGINE_STARTED = False
-            log.exception("V145 automatic market engine start failed pid=%s", pid)
+            log.exception("V147 automatic market engine start failed pid=%s", pid)
             return False
 
 @app.get("/server-engine/auto/status")
@@ -8148,8 +7854,8 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V145",
-            "mode": "member_watchlist -> unique market symbol compute (Upbit/Binance/KIS) -> FCM_fanout",
+            "version": "V147",
+            "mode": "unique watchlist -> market WebSocket -> local candles -> 4 market workers -> alert queue -> FCM (REST warmup/fallback)",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_symbols"],
             "subscription": subscription,
@@ -8157,8 +7863,57 @@ def server_engine_auto_status():
             "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V145 auto status failed")
+        log.exception("V147 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+@app.get("/server-engine/auto/dashboard")
+def server_engine_auto_dashboard():
+    """Human-readable V146 runtime dashboard; the JSON /auto/status endpoint remains unchanged."""
+    try:
+        _ensure_auto_exchange_engine_started()
+        from auto_exchange_engine import status as auto_engine_status
+        st = auto_engine_status()
+        sub = _auto_subscription_status()
+        streams = st.get("streams") or {}
+        workers = st.get("market_workers") or {}
+        q = st.get("alert_queue") or {}
+        cards = []
+        labels = {"BINANCE":"Binance USDT","UPBIT":"Upbit KRW","KIS_KR":"국장 KIS","KIS_US":"미장 KIS"}
+        for key in ("BINANCE","UPBIT","KIS_KR","KIS_US"):
+            ws = streams.get(key) or {}
+            wk = workers.get(key) or {}
+            healthy = bool(ws.get("connected")) or ws.get("mode") == "REST_FALLBACK"
+            dot = "🟢" if healthy else "🟡"
+            cards.append(f"""
+            <div class='card'><h3>{dot} {labels[key]}</h3>
+            <div>등록종목 <b>{wk.get('symbols',0)}</b></div>
+            <div>데이터모드 <b>{ws.get('mode','-')}</b></div>
+            <div>WebSocket <b>{'연결' if ws.get('connected') else 'REST fallback'}</b></div>
+            <div>마지막데이터 <b>{ws.get('last_message_at') or '-'}</b></div>
+            <div>계산성공 <b>{wk.get('success',0)}</b> / 오류 <b>{wk.get('error',0)}</b></div>
+            <div class='err'>{ws.get('last_error') or wk.get('last_error') or ''}</div></div>""")
+        html = f"""<!doctype html><meta charset='utf-8'><meta http-equiv='refresh' content='10'>
+        <title>타점ON V147 서버상태</title>
+        <style>body{{font-family:Arial,sans-serif;background:#f5f6f8;margin:24px;color:#111}}
+        .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}
+        .card{{background:white;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0001}}
+        h1{{margin-bottom:4px}} .sub{{color:#666;margin-bottom:18px}} .err{{color:#b00020;font-size:12px;margin-top:8px;word-break:break-all}}
+        .big{{font-size:22px;font-weight:700}}</style>
+        <h1>타점ON V147 서버 상태</h1>
+        <div class='sub'>WebSocket 주 공급원 · REST warm-up/fallback · 2h/6h 연속체인 포함</div>
+        <div class='grid'>{''.join(cards)}
+        <div class='card'><h3>📨 알림 Queue</h3><div>대기 <b>{q.get('pending',0)}</b></div>
+        <div>성공 <b>{q.get('success',0)}</b></div><div>실패 <b>{q.get('failure',0)}</b></div>
+        <div>재시도 <b>{q.get('retry',0)}</b></div><div>중복차단 <b>{q.get('duplicate_blocked',0)}</b></div>
+        <div>Redis <b>{'ON' if q.get('redis_enabled') else '메모리 fallback'}</b></div></div>
+        <div class='card'><h3>👥 구독</h3><div class='big'>고유종목 {sub.get('active_symbol_count',0)}</div>
+        <div>국장 {sub.get('registered_korea_symbol_count',0)} · 미장 {sub.get('registered_us_symbol_count',0)} · 코인 {sub.get('registered_coin_symbol_count',0)}</div>
+        <div>기기 {sub.get('db_device_count',0)}</div></div></div>"""
+        return Response(html, mimetype="text/html")
+    except Exception as exc:
+        log.exception("V147 dashboard failed")
+        return Response(f"dashboard error: {type(exc).__name__}: {exc}", status=500, mimetype="text/plain")
 
 # Do NOT start the daemon at module-import time. Gunicorn may import in the parent
 # process before forking; the child would inherit flags but not the thread. The

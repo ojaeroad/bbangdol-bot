@@ -1,4 +1,4 @@
-"""Tajum On V145 KIS market-data provider.
+"""Tajum On V146 KIS market-data provider.
 
 Purpose
 -------
@@ -22,7 +22,7 @@ KIS_OVERSEAS_PAGES                                  default 4
 KIS_RATE_LIMIT_COOLDOWN_SEC                         default 1.5
 KIS_OVERSEAS_MINUTE_CACHE_TTL_SEC                  default 75
 
-V145 notes
+V146 notes
 ----------
 - Follows the official KIS domestic minute pagination stop rule: stop when the
   page is shorter than 120 rows or the oldest time reaches 09:00.
@@ -48,6 +48,7 @@ import threading
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -365,6 +366,71 @@ def aggregate(rows: list[dict[str, Any]], minutes: int) -> list[dict[str, Any]]:
         out.append(cur)
     return out
 
+
+
+def aggregate_stock_session(
+    rows: list[dict[str, Any]],
+    minutes: int,
+    market: str,
+) -> list[dict[str, Any]]:
+    """Aggregate stock intraday candles from the actual exchange session open.
+
+    KRX buckets start at 09:00 Asia/Seoul.
+    US buckets start at 09:30 America/New_York (DST-aware).
+
+    This is important for internal 2h/6h chain gates. Generic epoch/UTC buckets can
+    create partial first bars for US stocks because the US regular session opens at :30.
+    """
+    market = str(market or "").upper()
+    if market in {"KOREA", "KIS_KR", "KR"}:
+        tz = ZoneInfo("Asia/Seoul")
+        open_hour, open_minute = 9, 0
+    else:
+        tz = ZoneInfo("America/New_York")
+        open_hour, open_minute = 9, 30
+
+    out: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    cur_bucket: int | None = None
+
+    for row in sorted(rows, key=lambda x: int(x["open_time"])):
+        ts_ms = int(row["open_time"])
+        local = datetime.fromtimestamp(ts_ms / 1000, timezone.utc).astimezone(tz)
+        session_open = local.replace(
+            hour=open_hour, minute=open_minute, second=0, microsecond=0
+        )
+        elapsed = int((local - session_open).total_seconds() // 60)
+        if elapsed < 0:
+            # Pre-market rows are not part of the regular-session chain.
+            continue
+        bucket_local = session_open + timedelta(
+            minutes=(elapsed // int(minutes)) * int(minutes)
+        )
+        bucket = _ms(bucket_local.astimezone(timezone.utc))
+
+        if cur is None or bucket != cur_bucket:
+            if cur is not None:
+                out.append(cur)
+            cur_bucket = bucket
+            cur = {
+                "open_time": bucket,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row.get("volume", 0.0)),
+                "close_time": int(row.get("close_time", row["open_time"])),
+            }
+        else:
+            cur["high"] = max(float(cur["high"]), float(row["high"]))
+            cur["low"] = min(float(cur["low"]), float(row["low"]))
+            cur["close"] = float(row["close"])
+            cur["volume"] = float(cur["volume"]) + float(row.get("volume", 0.0))
+            cur["close_time"] = int(row.get("close_time", row["open_time"]))
+
+    if cur is not None:
+        out.append(cur)
+    return out
 
 def _day_aggregate(rows: list[dict[str, Any]], days: int) -> list[dict[str, Any]]:
     if days <= 1:
@@ -850,11 +916,30 @@ def rows(symbol: str, timeframe: str) -> tuple[str, list[dict[str, Any]]]:
     _status_update(last_symbol=symbol)
     domestic = bool(re.fullmatch(r"\d{6}", symbol))
     market = "KOREA" if domestic else "US"
-    if timeframe in {"30m", "1h", "4h"}:
-        minutes = {"30m": 30, "1h": 60, "4h": 240}[timeframe]
+    if timeframe in {"5m", "15m", "30m", "1h", "2h", "4h", "6h"}:
+        minutes = {
+            "5m": 5, "15m": 15, "30m": 30, "1h": 60,
+            "2h": 120, "4h": 240, "6h": 360,
+        }[timeframe]
         if domestic:
-            return market, aggregate(domestic_minutes(symbol), minutes)
-        return market, overseas_minutes(symbol, minutes)
+            return market, aggregate_stock_session(
+                domestic_minutes(symbol), minutes, "KOREA"
+            )
+
+        # US cold-start keeps only three REST source families:
+        # 5m -> 5m/15m/30m, 60m -> 1h/2h/6h, native 240m -> 4h.
+        # All derived bars are aligned from the 09:30 New York regular-session open.
+        if timeframe in {"5m", "15m", "30m"}:
+            base_5m = overseas_minutes(symbol, 5)
+            if timeframe == "5m":
+                return market, base_5m
+            return market, aggregate_stock_session(base_5m, minutes, "US")
+        if timeframe in {"1h", "2h", "6h"}:
+            base_60m = overseas_minutes(symbol, 60)
+            if timeframe == "1h":
+                return market, base_60m
+            return market, aggregate_stock_session(base_60m, minutes, "US")
+        return market, overseas_minutes(symbol, 240)
     if timeframe in {"1d", "3d", "1w"}:
         daily = domestic_daily(symbol) if domestic else overseas_daily(symbol)
         if timeframe == "1d":

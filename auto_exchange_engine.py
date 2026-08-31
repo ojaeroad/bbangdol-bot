@@ -1,4 +1,4 @@
-"""Tajum On V145 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V146 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -24,7 +24,9 @@ import kis_market_provider as kis
 
 log = logging.getLogger("bbangdol-bot.auto-engine")
 
-STOCK_TF_ORDER = ("1w", "3d", "1d", "4h", "1h", "30m")
+STOCK_TF_ORDER = ("1w", "3d", "1d", "6h", "4h", "2h", "1h", "30m", "15m", "5m")
+STOCK_MAX_CANDIDATES = frozenset(("1w","3d","1d","4h","1h","30m"))
+STOCK_INTERNAL_CHAIN_TFS = frozenset(("6h","2h","15m","5m"))
 STOCK_MIN_BARS = 31
 
 AUTO_INTERVAL_SEC = max(30, min(int(os.getenv("TAJUM_AUTO_ENGINE_INTERVAL_SEC", "60") or 60), 300))
@@ -311,7 +313,7 @@ def _evaluate_binance(symbol: str) -> dict[str, Any]:
     return {
         "exchange": "BINANCE",
         "symbol": symbol,
-        "price": float(core["comparison_price_1m"]),
+        "price": float(core["price_1m"]),
         **core,
     }
 
@@ -329,8 +331,10 @@ def _stock_route_for_tf(timeframe: str, *, is_ob: bool) -> str:
 
 def _stock_chain_signal(metrics_by_tf: dict[str, dict[str, Any]], *, is_ob: bool) -> dict[str, Any]:
     key = "ob_basic" if is_ob else "os_basic"
-    # Descending order. A candidate requires every lower stock timeframe down to 30m.
+    # Descending order. A candidate requires every lower stock timeframe down to 5m.
     for i, tf in enumerate(STOCK_TF_ORDER):
+        if tf not in STOCK_MAX_CANDIDATES:
+            continue
         required = STOCK_TF_ORDER[i:]
         if any(req not in metrics_by_tf for req in required):
             continue
@@ -347,7 +351,6 @@ def _stock_chain_signal(metrics_by_tf: dict[str, dict[str, Any]], *, is_ob: bool
 def _evaluate_kis_stock(symbol: str) -> dict[str, Any]:
     if not kis.configured():
         raise RuntimeError("KIS_NOT_CONFIGURED: set KIS_APP_KEY/KIS_APP_SECRET")
-
     evaluation_time_ms = int(datetime.now(timezone.utc).timestamp() // 60 * 60 * 1000)
     metrics: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
@@ -356,68 +359,48 @@ def _evaluate_kis_stock(symbol: str) -> dict[str, Any]:
 
     def add_metric(tf: str, rows: list[dict[str, Any]]) -> None:
         if len(rows) < STOCK_MIN_BARS:
-            skipped.append(tf)
-            warnings.append(f"{symbol} {tf}: not enough KIS candles ({len(rows)})")
-            return
+            skipped.append(tf); warnings.append(f"{symbol} {tf}: not enough KIS candles ({len(rows)})"); return
         try:
             metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=evaluation_time_ms)
         except RuntimeError as exc:
             if "warm-up incomplete" in str(exc) or "not enough" in str(exc).lower():
-                skipped.append(tf)
-                warnings.append(f"{symbol} {tf}: {exc}")
-                return
+                skipped.append(tf); warnings.append(f"{symbol} {tf}: {exc}"); return
             raise
 
     if market == "KOREA":
-        # V145: fetch the expensive KRX 1-minute warm-up ONCE per symbol/cycle,
-        # then derive 30m/1h/4h locally. V144 called domestic_minutes() once per
-        # timeframe; during market hours that refreshed the current session tail
-        # three separate times and multiplied KIS traffic.
         minute_rows = kis.domestic_minutes(symbol)
-        add_metric("30m", kis.aggregate(minute_rows, 30))
-        add_metric("1h", kis.aggregate(minute_rows, 60))
-        add_metric("4h", kis.aggregate(minute_rows, 240))
-
-        # Daily history is also fetched once and reused for 1d/3d/1w.
+        for tf, mins in (
+            ("5m",5),("15m",15),("30m",30),("1h",60),
+            ("2h",120),("4h",240),("6h",360)
+        ):
+            add_metric(tf, kis.aggregate_stock_session(minute_rows, mins, "KOREA"))
         daily = kis.domestic_daily(symbol)
-        add_metric("1d", daily)
-        add_metric("3d", kis._day_aggregate(daily, 3))
-        add_metric("1w", kis._day_aggregate(daily, 5))
     else:
-        # Keep KIS-native 30/60/240-minute bars for US stocks so candle anchoring
-        # remains identical to the exchange/KIS definition. Provider-level caching
-        # and the global KIS pacer control request volume.
-        for tf in ("30m", "1h", "4h"):
-            try:
-                _, rows = kis.rows(symbol, tf)
-                add_metric(tf, rows)
-            except RuntimeError as exc:
-                if "warm-up incomplete" in str(exc) or "not enough" in str(exc).lower():
-                    skipped.append(tf)
-                    warnings.append(f"{symbol} {tf}: {exc}")
-                    continue
-                raise
+        # US cold-start uses only three source families while preserving exchange
+        # session alignment: 5m -> 5/15/30m, 60m -> 1h/2h/6h, native 240m -> 4h.
+        base_5m = kis.overseas_minutes(symbol, 5)
+        add_metric("5m", base_5m)
+        add_metric("15m", kis.aggregate_stock_session(base_5m, 15, "US"))
+        add_metric("30m", kis.aggregate_stock_session(base_5m, 30, "US"))
 
-        # One daily fetch, reused locally for all long stock timeframes.
+        hourly = kis.overseas_minutes(symbol, 60)
+        add_metric("1h", hourly)
+        add_metric("2h", kis.aggregate_stock_session(hourly, 120, "US"))
+        add_metric("4h", kis.overseas_minutes(symbol, 240))
+        add_metric("6h", kis.aggregate_stock_session(hourly, 360, "US"))
         daily = kis.overseas_daily(symbol)
-        add_metric("1d", daily)
-        add_metric("3d", kis._day_aggregate(daily, 3))
-        add_metric("1w", kis._day_aggregate(daily, 5))
 
+    add_metric("1d", daily)
+    add_metric("3d", kis._day_aggregate(daily, 3))
+    add_metric("1w", kis._day_aggregate(daily, 5))
     _, price = kis.current_price(symbol)
-    buy = _stock_chain_signal(metrics, is_ob=False)
-    sell = _stock_chain_signal(metrics, is_ob=True)
     return {
         "exchange": "KIS_KR" if market == "KOREA" else "KIS_US",
-        "market": market,
-        "symbol": symbol,
-        "price": float(price),
-        "evaluation_time_ms": evaluation_time_ms,
-        "timeframes": metrics,
-        "buy": buy,
-        "sell": sell,
-        "warnings": warnings,
-        "skipped_timeframes": skipped,
+        "market": market, "symbol": symbol, "price": float(price),
+        "evaluation_time_ms": evaluation_time_ms, "timeframes": metrics,
+        "buy": _stock_chain_signal(metrics, is_ob=False),
+        "sell": _stock_chain_signal(metrics, is_ob=True),
+        "warnings": warnings, "skipped_timeframes": skipped,
     }
 
 def _event_from_chain(result: dict[str, Any], side_key: str) -> dict[str, Any] | None:
@@ -464,132 +447,221 @@ def _market_name_for_symbol(symbol: str) -> str:
     return "KIS_US"
 
 
-def _evaluate_one_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
-    if symbol.startswith("KRW-"):
-        return symbol, _evaluate_upbit(symbol)
-    if symbol.endswith("USDT"):
-        return symbol, _evaluate_binance(symbol)
-    if symbol.isdigit() and len(symbol) == 6:
-        return symbol, _evaluate_kis_stock(symbol)
-    if symbol and symbol.replace(".", "").replace("-", "").isalnum():
-        return symbol, _evaluate_kis_stock(symbol)
-    raise ValueError(f"unsupported automatic market symbol: {symbol}")
 
+from alert_queue import AlertQueue
+from market_stream_engine import MarketStreamHub, classify as _classify_market
+from prediction_engine import PredictionEngine
 
-def _run_loop(
-    subscription_provider: Callable[[], list[str]],
-    signal_callback: Callable[[dict[str, Any]], None],
-) -> None:
-    _set_status(running=True, worker_pid=os.getpid(), worker_thread_alive=True, worker_started_at=datetime.now(timezone.utc).isoformat(), worker_last_heartbeat=datetime.now(timezone.utc).isoformat(), worker_last_exception=None)
-    executor = ThreadPoolExecutor(max_workers=AUTO_WORKERS, thread_name_prefix="tajum-market-calc")
+# V146 uses four independent market worker loops. The stable V146 REST evaluators remain
+# available as warm-up / gap-fill / fallback. WebSocket-owned candle series take priority.
+_V146_STARTED = False
+_V146_PID = 0
+_V146_LOCK = threading.Lock()
+_STREAM_HUB: MarketStreamHub | None = None
+_ALERT_QUEUE: AlertQueue | None = None
+_PREDICTION = PredictionEngine()
+_MARKET_THREADS: dict[str, threading.Thread] = {}
+_MARKET_STATUS_LOCK = threading.Lock()
+_MARKET_STATUS: dict[str, dict[str, Any]] = {
+    m: {"cycles":0,"running":False,"symbols":0,"success":0,"error":0,
+        "in_progress":False,"current_total":0,"current_completed":0,
+        "current_success":0,"current_error":0,
+        "last_started_at":None,"last_finished_at":None,"last_error":None,
+        "last_duration_sec":None}
+    for m in ("BINANCE","UPBIT","KIS_KR","KIS_US")
+}
+_SEEDED: set[tuple[str,str]] = set()
+_SEED_LOCK = threading.Lock()
+
+V146_INTERVAL = max(15, min(int(os.getenv("TAJUM_V146_EVAL_INTERVAL_SEC","60") or 60), 300))
+SHARD_COUNT = max(1, int(os.getenv("TAJUM_WORKER_SHARD_COUNT","1") or 1))
+SHARD_INDEX = max(0, int(os.getenv("TAJUM_WORKER_SHARD_INDEX","0") or 0)) % SHARD_COUNT
+
+def _owned(symbol: str) -> bool:
+    if SHARD_COUNT <= 1: return True
+    import hashlib
+    n = int(hashlib.sha1(symbol.encode()).hexdigest()[:8], 16)
+    return (n % SHARD_COUNT) == SHARD_INDEX
+
+def _seed_symbol(symbol: str, market: str) -> None:
+    if _STREAM_HUB is None: return
+    key = (market, symbol)
+    with _SEED_LOCK:
+        if key in _SEEDED: return
+    try:
+        if market == "BINANCE":
+            v133.SUPPORTED_SYMBOLS.setdefault(symbol, symbol)
+            for tf in v133.TF_ORDER:
+                rows = v133._fetch_klines(symbol, tf, limit=min(v133.KLINE_LIMIT, 300))
+                _STREAM_HUB.seed(symbol, market, tf, rows)
+        elif market == "UPBIT":
+            for tf in v133.TF_ORDER:
+                _STREAM_HUB.seed(symbol, market, tf, _upbit_rows(symbol, tf))
+        else:
+            for tf in STOCK_TF_ORDER:
+                _, rows = kis.rows(symbol, tf)
+                _STREAM_HUB.seed(symbol, market, tf, rows)
+        with _SEED_LOCK:
+            _SEEDED.add(key)
+    except Exception:
+        # REST evaluator below still works even if a seed is temporarily incomplete.
+        log.exception("V146 warm-up seed failed market=%s symbol=%s", market, symbol)
+
+def _metric_result_from_book(symbol: str, market: str) -> dict[str, Any] | None:
+    if _STREAM_HUB is None: return None
+    _seed_symbol(symbol, market)
+    eval_ms = int(datetime.now(timezone.utc).timestamp() // 60 * 60 * 1000)
+    metrics = {}
+    warnings, skipped = [], []
+    tf_order = v133.TF_ORDER if market in {"BINANCE","UPBIT"} else STOCK_TF_ORDER
+    for tf in tf_order:
+        rows = _STREAM_HUB.rows(symbol, tf, 320)
+        if len(rows) < 31:
+            skipped.append(tf); warnings.append(f"{symbol} {tf}: WS candle warm-up {len(rows)}")
+            continue
+        try:
+            metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=eval_ms)
+        except RuntimeError as exc:
+            skipped.append(tf); warnings.append(f"{symbol} {tf}: {exc}")
+    price_age = 172800 if market in {"KIS_KR","KIS_US"} else 180
+    price = _STREAM_HUB.last_price(symbol, max_age_sec=price_age)
+    if price is None:
+        return None
+    if market in {"BINANCE","UPBIT"}:
+        buy = _chain_signal_available(symbol, metrics, is_ob=False, price=price)
+        sell = _chain_signal_available(symbol, metrics, is_ob=True, price=price)
+    else:
+        buy = _stock_chain_signal(metrics, is_ob=False)
+        sell = _stock_chain_signal(metrics, is_ob=True)
+    return {
+        "exchange": market, "market": "KOREA" if market=="KIS_KR" else ("US" if market=="KIS_US" else market),
+        "symbol": symbol, "price": float(price), "evaluation_time_ms": eval_ms,
+        "timeframes": metrics, "buy": buy, "sell": sell,
+        "warnings": warnings, "skipped_timeframes": skipped, "data_source": "WEBSOCKET",
+    }
+
+def _evaluate_market_symbol(symbol: str, market: str) -> dict[str, Any]:
+    # WebSocket path is primary once fresh data is flowing. REST is gap-fill/fallback.
+    if _STREAM_HUB is not None and _STREAM_HUB.healthy(market):
+        result = _metric_result_from_book(symbol, market)
+        if result is not None:
+            return result
+    if market == "BINANCE": return _evaluate_binance(symbol)
+    if market == "UPBIT": return _evaluate_upbit(symbol)
+    return _evaluate_kis_stock(symbol)
+
+def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) -> None:
     while True:
         started = datetime.now(timezone.utc)
-        _set_status(worker_last_heartbeat=started.isoformat(), worker_thread_alive=True)
-        errors: list[str] = []
-        warnings: list[str] = []
-        skipped_by_symbol: dict[str, list[str]] = {}
-        success = 0
-        symbols: list[str] = []
-        try:
-            raw_symbols = subscription_provider() or []
-            symbols = list(dict.fromkeys(
-                str(x or "").strip().upper()
-                for x in raw_symbols
-                if str(x or "").strip()
-            ))[:MAX_SYMBOLS_PER_CYCLE]
-
-            with _status_lock:
-                _status["cycles_started"] = int(_status.get("cycles_started", 0)) + 1
-                _status["cycle_in_progress"] = True
-                _status["current_cycle_total"] = len(symbols)
-                _status["current_cycle_completed"] = 0
-                _status["current_cycle_success"] = 0
-                _status["current_cycle_error"] = 0
-                _status["current_symbols_in_flight"] = list(symbols[:AUTO_WORKERS])
-                _status["last_cycle_started_at"] = started.isoformat()
-
-            future_map = {executor.submit(_evaluate_one_symbol, symbol): symbol for symbol in symbols}
-            for future in as_completed(future_map):
-                symbol = future_map[future]
-                try:
-                    _, result = future.result()
-                    success += 1
-                    exchange = str(result.get("exchange") or _market_name_for_symbol(symbol))
-                    with _status_lock:
-                        bucket = dict(_status.get("market_success") or {})
-                        bucket[exchange] = int(bucket.get(exchange, 0) or 0) + 1
-                        _status["market_success"] = bucket
-                    result_warnings = [str(x) for x in (result.get("warnings") or []) if str(x)]
-                    if result_warnings:
-                        warnings.extend(result_warnings)
-                    skipped = [str(x) for x in (result.get("skipped_timeframes") or []) if str(x)]
-                    if skipped:
-                        skipped_by_symbol[symbol] = skipped
-                    for side in ("buy", "sell"):
-                        event = _event_from_chain(result, side)
-                        if event:
-                            signal_callback(event)
-                except Exception as exc:
-                    msg = f"{symbol}: {type(exc).__name__}: {exc}"
-                    errors.append(msg)
-                    exchange = _market_name_for_symbol(symbol)
-                    with _status_lock:
-                        bucket = dict(_status.get("market_error") or {})
-                        bucket[exchange] = int(bucket.get(exchange, 0) or 0) + 1
-                        _status["market_error"] = bucket
-                    log.exception("Auto engine symbol failed %s", symbol)
-                finally:
-                    now = datetime.now(timezone.utc).isoformat()
-                    with _status_lock:
-                        completed = int(_status.get("current_cycle_completed", 0)) + 1
-                        _status["current_cycle_completed"] = completed
-                        _status["current_cycle_success"] = success
-                        _status["current_cycle_error"] = len(errors)
-                        _status["last_processed_symbol"] = symbol
-                        _status["last_result_at"] = now
-                        # Lightweight visibility only; exact futures state is not needed.
-                        remaining = [s for f, s in future_map.items() if not f.done()]
-                        _status["current_symbols_in_flight"] = remaining[:AUTO_WORKERS]
-        except Exception as exc:
-            errors.append(f"cycle: {type(exc).__name__}: {exc}")
-            _set_status(worker_last_exception=f"{type(exc).__name__}: {exc}")
-            log.exception("Auto engine cycle failed")
+        symbols = [s.upper() for s in (subscription_provider() or []) if _classify_market(s) == market and _owned(s.upper())]
+        symbols = list(dict.fromkeys(symbols))
+        with _MARKET_STATUS_LOCK:
+            _MARKET_STATUS[market].update(
+                running=True, symbols=len(symbols), in_progress=True,
+                current_total=len(symbols), current_completed=0,
+                current_success=0, current_error=0,
+                last_started_at=started.isoformat()
+            )
+        success = error = 0
+        last_error = None
+        for symbol in symbols:
+            try:
+                result = _evaluate_market_symbol(symbol, market)
+                success += 1
+                with _MARKET_STATUS_LOCK:
+                    _MARKET_STATUS[market]["current_success"] = success
+                for side in ("buy","sell"):
+                    event = _event_from_chain(result, side)
+                    if event and _ALERT_QUEUE is not None:
+                        event["evaluation_time_ms"] = result.get("evaluation_time_ms")
+                        pred = _PREDICTION.predict({"result":result,"event":event})
+                        if pred is not None: event["prediction"] = pred
+                        _ALERT_QUEUE.enqueue(event)
+            except Exception as exc:
+                error += 1
+                with _MARKET_STATUS_LOCK:
+                    _MARKET_STATUS[market]["current_error"] = error
+                last_error = f"{symbol}: {type(exc).__name__}: {exc}"
+                log.exception("V146 market worker failed market=%s symbol=%s", market, symbol)
+            finally:
+                with _MARKET_STATUS_LOCK:
+                    _MARKET_STATUS[market]["current_completed"] = int(_MARKET_STATUS[market].get("current_completed", 0)) + 1
         finished = datetime.now(timezone.utc)
-        with _status_lock:
-            _status["cycles"] = int(_status.get("cycles", 0)) + 1
-            _status["cycle_in_progress"] = False
-            _status["current_symbols_in_flight"] = []
-            _status["last_cycle_finished_at"] = finished.isoformat()
-            _status["last_symbol_count"] = len(symbols)
-            _status["last_success_count"] = success
-            _status["last_error_count"] = len(errors)
-            _status["last_errors"] = errors[-20:]
-            _status["last_warnings"] = warnings[-50:]
-            _status["last_skipped_timeframes"] = dict(skipped_by_symbol)
-        elapsed = (finished - started).total_seconds()
-        time.sleep(max(1.0, AUTO_INTERVAL_SEC - elapsed))
+        with _MARKET_STATUS_LOCK:
+            st = _MARKET_STATUS[market]
+            st["cycles"] += 1
+            st["success"] += success
+            st["error"] += error
+            st["in_progress"] = False
+            st["current_total"] = len(symbols)
+            st["current_completed"] = len(symbols)
+            st["current_success"] = success
+            st["current_error"] = error
+            st["last_error"] = last_error
+            st["last_finished_at"] = finished.isoformat()
+            st["last_duration_sec"] = round((finished-started).total_seconds(),3)
+        elapsed = (finished-started).total_seconds()
+        time.sleep(max(1.0, V146_INTERVAL-elapsed))
 
 def start(subscription_provider: Callable[[], list[str]], signal_callback: Callable[[dict[str, Any]], None]) -> bool:
-    # Gunicorn imports app.py before/around worker fork. A daemon thread created in
-    # the parent process does not survive the fork, while module globals may still
-    # say "started" in the child. Track PID + actual thread liveness so each live
-    # worker can recover the engine safely.
-    global _started, _started_pid, _worker_thread
+    global _V146_STARTED, _V146_PID, _STREAM_HUB, _ALERT_QUEUE
     pid = os.getpid()
-    with _start_lock:
-        if _started_pid != pid:
-            _started = False
-            _worker_thread = None
-            _started_pid = pid
-        if _started and _worker_thread is not None and _worker_thread.is_alive():
+    with _V146_LOCK:
+        if _V146_STARTED and _V146_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
             return False
-        _started = True
-        _worker_thread = threading.Thread(
-            target=_run_loop,
-            args=(subscription_provider, signal_callback),
-            name="tajum-auto-market-engine",
-            daemon=True,
-        )
-        _worker_thread.start()
-        _set_status(worker_pid=pid, worker_thread_alive=True, worker_started_at=datetime.now(timezone.utc).isoformat())
+        _V146_STARTED = True; _V146_PID = pid
+        _STREAM_HUB = MarketStreamHub(subscription_provider)
+        _STREAM_HUB.start()
+        _ALERT_QUEUE = AlertQueue(signal_callback)
+        _ALERT_QUEUE.start()
+        for market in ("BINANCE","UPBIT","KIS_KR","KIS_US"):
+            t = threading.Thread(target=_market_loop, args=(market,subscription_provider),
+                                 name=f"tajum-worker-{market.lower()}", daemon=True)
+            _MARKET_THREADS[market] = t
+            t.start()
         return True
+
+def status() -> dict[str, Any]:
+    with _MARKET_STATUS_LOCK:
+        markets = {k:dict(v) for k,v in _MARKET_STATUS.items()}
+    total_symbols = sum(int(x.get("symbols",0)) for x in markets.values())
+    total_cycles = sum(int(x.get("cycles",0)) for x in markets.values())
+    current_total = sum(int(x.get("current_total",0)) for x in markets.values())
+    current_completed = sum(int(x.get("current_completed",0)) for x in markets.values())
+    current_success = sum(int(x.get("current_success",0)) for x in markets.values())
+    current_error = sum(int(x.get("current_error",0)) for x in markets.values())
+    lifetime_success = sum(int(x.get("success",0)) for x in markets.values())
+    lifetime_error = sum(int(x.get("error",0)) for x in markets.values())
+    streams = _STREAM_HUB.status() if _STREAM_HUB else {}
+    queue_status = _ALERT_QUEUE.status() if _ALERT_QUEUE else {}
+    # Backward-compatible keys remain so existing screenshots/status checks still work.
+    return {
+        "running": _V146_STARTED,
+        "worker_pid": _V146_PID or None,
+        "worker_thread_alive": all(t.is_alive() for t in _MARKET_THREADS.values()) if _MARKET_THREADS else False,
+        "workers": 4,
+        "worker_model": "4_market_workers + websocket_stream_threads + alert_queue",
+        "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
+        "cycles": total_cycles, "cycles_started": total_cycles + sum(1 for x in markets.values() if x.get("in_progress")),
+        "cycle_in_progress": any(bool(x.get("in_progress")) for x in markets.values()),
+        "current_cycle_total": current_total,
+        "current_cycle_completed": current_completed,
+        "current_cycle_success": current_success,
+        "current_cycle_error": current_error,
+        "last_symbol_count": total_symbols,
+        "last_success_count": lifetime_success,
+        "last_error_count": lifetime_error,
+        "last_errors": [x["last_error"] for x in markets.values() if x.get("last_error")][-20:],
+        "market_workers": markets,
+        "streams": streams,
+        "alert_queue": queue_status,
+        "prediction_engine": _PREDICTION.status(),
+        "chain": {
+            "coin_order": list(v133.TF_ORDER),
+            "coin_internal_only": sorted(v133.INTERNAL_ONLY_TFS),
+            "stock_order": list(STOCK_TF_ORDER),
+            "stock_internal_only": sorted(STOCK_INTERNAL_CHAIN_TFS),
+            "note": "stock and coin chains include mandatory 2h/6h plus stock 15m/5m continuity gates",
+        },
+        "kis": kis.status(),
+    }

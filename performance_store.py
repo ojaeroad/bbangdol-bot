@@ -2109,3 +2109,29 @@ def page_visit_summary() -> dict[str, int]:
     except Exception:
         log.exception("Performance page visit summary failed")
         return {"total_views": 0, "today_views": 0, "total_visitors": 0, "today_visitors": 0}
+
+
+def app_active_symbols() -> list[str]:
+    """Return unique enabled Tajum On watch symbols for the detached member/FCM service.
+
+    This query is intentionally small and independent from performance-analysis reads.
+    """
+    if not PERFORMANCE_DATABASE_URL:
+        return []
+    ensure_schema()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT enabled_symbols
+            FROM tajum_app_devices
+            WHERE notifications_enabled=TRUE
+              AND cardinality(enabled_symbols) > 0
+            """
+        ).fetchall()
+    symbols: set[str] = set()
+    for row in rows:
+        for raw in (row[0] or []):
+            symbol = canonical_performance_symbol(raw)
+            if symbol:
+                symbols.add(symbol)
+    return sorted(symbols)
