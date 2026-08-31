@@ -1,4 +1,4 @@
-"""Tajum On V148 real-time market stream hub.
+"""Tajum On V149 real-time market stream hub.
 
 Primary market-data paths
 -------------------------
@@ -10,7 +10,7 @@ Why one KIS socket?
 -------------------
 KIS official samples subscribe domestic + overseas real-time data on one session.
 V147 opened KR and US KIS sockets concurrently with the same approval key; on the
-live server KIS_US repeatedly ended with BrokenPipe. V148 follows the official
+live server KIS_US repeatedly ended with BrokenPipe. V149 follows the official
 single-session pattern and keeps the *calculation workers* separated.
 
 REST is still the warm-up / gap-fill / fallback source. WebSocket loss must never
@@ -158,6 +158,10 @@ class MarketStreamHub:
                 self._threads["KIS_US"] = t
             t.start()
 
+    def stop(self) -> None:
+        """Signal all market stream loops to exit during Gunicorn/Render shutdown."""
+        self._stop.set()
+
     def seed(self, symbol: str, market: str, timeframe: str, rows: list[dict[str, Any]]) -> None:
         self.book.seed(symbol, market, timeframe, rows)
 
@@ -213,7 +217,7 @@ class MarketStreamHub:
         while not self._stop.is_set():
             symbols = self._symbols("BINANCE")
             if not symbols:
-                time.sleep(2)
+                self._stop.wait(2)
                 continue
             params = [f"{s.lower()}@kline_1m" for s in symbols]
             try:
@@ -260,7 +264,7 @@ class MarketStreamHub:
                     last_error=f"{type(exc).__name__}: {exc}",
                 )
                 self._inc("BINANCE", "reconnects")
-                time.sleep(2)
+                self._stop.wait(2)
 
     # -----------------------------------------------------------------
     # Upbit
@@ -273,7 +277,7 @@ class MarketStreamHub:
         while not self._stop.is_set():
             symbols = self._symbols("UPBIT")
             if not symbols:
-                time.sleep(2)
+                self._stop.wait(2)
                 continue
             try:
                 ws = websocket.create_connection(UPBIT_WS, timeout=20, enable_multithread=True)
@@ -327,7 +331,7 @@ class MarketStreamHub:
                     last_error=f"{type(exc).__name__}: {exc}",
                 )
                 self._inc("UPBIT", "reconnects")
-                time.sleep(2)
+                self._stop.wait(2)
 
     # -----------------------------------------------------------------
     # KIS shared transport
@@ -555,7 +559,7 @@ class MarketStreamHub:
         while not self._stop.is_set():
             plan, overflow = self._kis_subscription_plan()
             if not plan:
-                time.sleep(2)
+                self._stop.wait(2)
                 continue
 
             signature = tuple(plan)
@@ -644,4 +648,4 @@ class MarketStreamHub:
                         last_error=f"{type(exc).__name__}: {exc}",
                     )
                     self._inc(market, "reconnects")
-                time.sleep(delay)
+                self._stop.wait(delay)

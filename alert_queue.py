@@ -1,4 +1,4 @@
-"""Tajum On V146 durable-ish alert queue with optional Redis.
+"""Tajum On V149 durable-ish alert queue with optional Redis.
 
 The queue protects the signal->FCM handoff from short CPU/network stalls and performs
 deduplication before calling the existing app.py FCM callback.
@@ -86,6 +86,16 @@ class AlertQueue:
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="tajum-alert-queue", daemon=True)
         self._thread.start()
+
+    def stop(self, drain_timeout: float = 1.5) -> None:
+        """Stop accepting background work during a graceful process shutdown."""
+        self._running = False
+        deadline = time.monotonic() + max(0.0, float(drain_timeout))
+        while self.q.qsize() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.2)
 
     def _loop(self) -> None:
         while self._running:

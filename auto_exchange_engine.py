@@ -1,4 +1,4 @@
-"""Tajum On V148 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V149 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -10,6 +10,7 @@ available in app.py as validation/fallback paths.
 from __future__ import annotations
 
 import os
+import atexit
 import time
 import math
 import threading
@@ -453,11 +454,13 @@ from alert_queue import AlertQueue
 from market_stream_engine import MarketStreamHub, classify as _classify_market
 from prediction_engine import PredictionEngine
 
-# V148 uses four independent market calculation workers. REST evaluators remain
+# V149 uses four independent market calculation workers. REST evaluators remain
 # available as warm-up / gap-fill / fallback. WebSocket-owned candle series take priority.
-_V148_STARTED = False
-_V148_PID = 0
-_V148_LOCK = threading.Lock()
+_V149_STARTED = False
+_V149_PID = 0
+_V149_LOCK = threading.Lock()
+_V149_STOP_EVENT = threading.Event()
+_V149_ATEXIT_REGISTERED = False
 _STREAM_HUB: MarketStreamHub | None = None
 _ALERT_QUEUE: AlertQueue | None = None
 _PREDICTION = PredictionEngine()
@@ -476,9 +479,9 @@ _SEED_LOCK = threading.Lock()
 _STOCK_REFRESH_LOCK = threading.Lock()
 _STOCK_LAST_REFRESH: dict[tuple[str, str], float] = {}
 
-V148_INTERVAL = max(
+V149_INTERVAL = max(
     15,
-    min(int(os.getenv("TAJUM_V148_EVAL_INTERVAL_SEC", "60") or 60), 300),
+    min(int(os.getenv("TAJUM_V149_EVAL_INTERVAL_SEC", "60") or 60), 300),
 )
 STOCK_REST_REFRESH_SEC = max(
     45,
@@ -574,7 +577,7 @@ def _seed_symbol(symbol: str, market: str) -> None:
 
     V147 seeded stock history only when WebSocket was already healthy, which meant a
     failed/quiet KIS stream kept calling REST forever and never populated CandleBook.
-    V148 always seeds stock history exactly once first.
+    V149 always seeds stock history exactly once first.
     """
     if _STREAM_HUB is None:
         return
@@ -604,7 +607,7 @@ def _seed_symbol(symbol: str, market: str) -> None:
 
     except Exception:
         # REST evaluator below is still available if initial warm-up fails.
-        log.exception("V148 warm-up seed failed market=%s symbol=%s", market, symbol)
+        log.exception("V149 warm-up seed failed market=%s symbol=%s", market, symbol)
 
 
 def _refresh_stock_book_if_due(symbol: str, market: str, *, force: bool = False) -> bool:
@@ -707,7 +710,7 @@ def _evaluate_market_symbol(symbol: str, market: str) -> dict[str, Any]:
             try:
                 _refresh_stock_book_if_due(symbol, market)
             except Exception:
-                log.exception("V148 stock REST fallback refresh failed market=%s symbol=%s", market, symbol)
+                log.exception("V149 stock REST fallback refresh failed market=%s symbol=%s", market, symbol)
 
         result = _metric_result_from_book(symbol, market)
         if result is not None:
@@ -718,7 +721,7 @@ def _evaluate_market_symbol(symbol: str, market: str) -> dict[str, Any]:
 
 
 def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) -> None:
-    while True:
+    while not _V149_STOP_EVENT.is_set():
         started = datetime.now(timezone.utc)
         symbols = [s.upper() for s in (subscription_provider() or []) if _classify_market(s) == market and _owned(s.upper())]
 
@@ -728,13 +731,13 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
             with _MARKET_STATUS_LOCK:
                 us_cycles = int(_MARKET_STATUS["KIS_US"].get("cycles", 0) or 0)
             if us_cycles == 0:
-                time.sleep(2.0)
+                _V149_STOP_EVENT.wait(2.0)
                 continue
         if market == "KIS_US" and not _stock_market_is_open("KIS_US") and _stock_market_is_open("KIS_KR"):
             with _MARKET_STATUS_LOCK:
                 kr_cycles = int(_MARKET_STATUS["KIS_KR"].get("cycles", 0) or 0)
             if kr_cycles == 0:
-                time.sleep(2.0)
+                _V149_STOP_EVENT.wait(2.0)
                 continue
         symbols = list(dict.fromkeys(symbols))
         with _MARKET_STATUS_LOCK:
@@ -764,7 +767,7 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
                 with _MARKET_STATUS_LOCK:
                     _MARKET_STATUS[market]["current_error"] = error
                 last_error = f"{symbol}: {type(exc).__name__}: {exc}"
-                log.exception("V148 market worker failed market=%s symbol=%s", market, symbol)
+                log.exception("V149 market worker failed market=%s symbol=%s", market, symbol)
             finally:
                 with _MARKET_STATUS_LOCK:
                     _MARKET_STATUS[market]["current_completed"] = int(_MARKET_STATUS[market].get("current_completed", 0)) + 1
@@ -783,24 +786,56 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
             st["last_finished_at"] = finished.isoformat()
             st["last_duration_sec"] = round((finished-started).total_seconds(),3)
         elapsed = (finished-started).total_seconds()
-        time.sleep(max(1.0, V148_INTERVAL-elapsed))
+        _V149_STOP_EVENT.wait(max(1.0, V149_INTERVAL-elapsed))
+
+def stop() -> None:
+    """Best-effort graceful shutdown for Render/Gunicorn worker replacement."""
+    global _V149_STARTED
+    _V149_STOP_EVENT.set()
+    try:
+        if _STREAM_HUB is not None:
+            _STREAM_HUB.stop()
+    except Exception:
+        log.exception("V149 stream shutdown failed")
+    try:
+        if _ALERT_QUEUE is not None:
+            _ALERT_QUEUE.stop(drain_timeout=1.5)
+    except Exception:
+        log.exception("V149 alert queue shutdown failed")
+    for thread in list(_MARKET_THREADS.values()):
+        try:
+            if thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=0.4)
+        except Exception:
+            pass
+    _V149_STARTED = False
+
 
 def start(subscription_provider: Callable[[], list[str]], signal_callback: Callable[[dict[str, Any]], None]) -> bool:
-    global _V148_STARTED, _V148_PID, _STREAM_HUB, _ALERT_QUEUE
+    global _V149_STARTED, _V149_PID, _STREAM_HUB, _ALERT_QUEUE, _V149_ATEXIT_REGISTERED
     pid = os.getpid()
-    with _V148_LOCK:
-        if _V148_STARTED and _V148_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
+    with _V149_LOCK:
+        if _V149_STARTED and _V149_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
             return False
-        _V148_STARTED = True; _V148_PID = pid
+        _V149_STOP_EVENT.clear()
+        _V149_STARTED = True
+        _V149_PID = pid
         _STREAM_HUB = MarketStreamHub(subscription_provider)
         _STREAM_HUB.start()
         _ALERT_QUEUE = AlertQueue(signal_callback)
         _ALERT_QUEUE.start()
         for market in ("BINANCE","UPBIT","KIS_KR","KIS_US"):
-            t = threading.Thread(target=_market_loop, args=(market,subscription_provider),
-                                 name=f"tajum-worker-{market.lower()}", daemon=True)
-            _MARKET_THREADS[market] = t
-            t.start()
+            thread = threading.Thread(
+                target=_market_loop,
+                args=(market,subscription_provider),
+                name=f"tajum-worker-{market.lower()}",
+                daemon=True,
+            )
+            _MARKET_THREADS[market] = thread
+            thread.start()
+        if not _V149_ATEXIT_REGISTERED:
+            atexit.register(stop)
+            _V149_ATEXIT_REGISTERED = True
         return True
 
 def status() -> dict[str, Any]:
@@ -818,8 +853,9 @@ def status() -> dict[str, Any]:
     queue_status = _ALERT_QUEUE.status() if _ALERT_QUEUE else {}
     # Backward-compatible keys remain so existing screenshots/status checks still work.
     return {
-        "running": _V148_STARTED,
-        "worker_pid": _V148_PID or None,
+        "running": _V149_STARTED,
+        "shutdown_requested": _V149_STOP_EVENT.is_set(),
+        "worker_pid": _V149_PID or None,
         "worker_thread_alive": all(t.is_alive() for t in _MARKET_THREADS.values()) if _MARKET_THREADS else False,
         "workers": 4,
         "worker_model": "4_market_workers + 2_crypto_ws + 1_shared_kis_ws + alert_queue",
@@ -843,7 +879,7 @@ def status() -> dict[str, Any]:
             "coin_internal_only": sorted(v133.INTERNAL_ONLY_TFS),
             "stock_order": list(STOCK_TF_ORDER),
             "stock_internal_only": sorted(STOCK_INTERNAL_CHAIN_TFS),
-            "note": "V148: stock/coin mandatory chains preserved; KIS KR+US share one transport socket but calculate in separate workers",
+            "note": "V149: stock/coin mandatory chains preserved; KIS KR+US share one transport socket but calculate in separate workers",
         },
         "kis": kis.status(),
     }

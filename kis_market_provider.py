@@ -1,4 +1,4 @@
-"""Tajum On V148 KIS market-data provider.
+"""Tajum On V149 KIS market-data provider.
 
 Purpose
 -------
@@ -22,7 +22,7 @@ KIS_OVERSEAS_PAGES                                  default 4
 KIS_RATE_LIMIT_COOLDOWN_SEC                         default 1.5
 KIS_OVERSEAS_MINUTE_CACHE_TTL_SEC                  default 75
 
-V148 notes
+V149 notes
 ----------
 - Follows the official KIS domestic minute pagination stop rule: stop when the
   page is shorter than 120 rows or the oldest time reaches 09:00.
@@ -54,6 +54,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+import kis_token_store as _token_store
 
 KIS_APP_KEY = os.getenv("KIS_APP_KEY", "").strip()
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "").strip()
@@ -103,6 +105,8 @@ _status: dict[str, Any] = {
     "domestic_warmup_days": 0,
     "domestic_target": "31x_session_aligned_6h",
     "overseas_page_plan": {"5m": 2, "60m": 2, "240m": 1},
+    "auth_retry_count": 0,
+    "token_memory_reuse_count": 0,
 }
 
 
@@ -112,7 +116,9 @@ def configured() -> bool:
 
 def status() -> dict[str, Any]:
     with _status_lock:
-        return dict(_status)
+        out = dict(_status)
+    out["access_token"] = _token_store.status()
+    return out
 
 
 def _status_update(**kwargs: Any) -> None:
@@ -143,59 +149,124 @@ def _apply_global_backoff(seconds: float) -> None:
             _rate_blocked_until = target
 
 
+def _issue_access_token_once() -> tuple[str, int]:
+    """Perform one real KIS /oauth2/tokenP issuance.
+
+    Do not call directly from request code. `_access_token()` serializes/reuses it.
+    """
+    _rate_guard()
+    resp = requests.post(
+        f"{KIS_BASE_URL}/oauth2/tokenP",
+        headers={"content-type": "application/json"},
+        json={
+            "grant_type": "client_credentials",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET,
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    token = str(body.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError(f"KIS token missing: {body}")
+    expires = int(body.get("expires_in") or 86400)
+    return token, max(300, expires)
+
+
 def _access_token() -> str:
+    """Return one valid access token across Render restarts/deploys.
+
+    Fast path is process memory. Cold process start asks kis_token_store, which reuses
+    the still-valid PostgreSQL copy before considering a new KIS token issuance.
+    """
     global _token_value, _token_expiry
     if not configured():
         raise RuntimeError("KIS credentials missing: set KIS_APP_KEY and KIS_APP_SECRET")
     now = time.time()
     with _token_lock:
-        if _token_value and now < _token_expiry - 120:
+        if _token_value and now < _token_expiry - 900:
+            with _status_lock:
+                _status["token_memory_reuse_count"] = int(
+                    _status.get("token_memory_reuse_count", 0) or 0
+                ) + 1
             return _token_value
-        _rate_guard()
-        resp = requests.post(
-            f"{KIS_BASE_URL}/oauth2/tokenP",
-            headers={"content-type": "application/json"},
-            json={
-                "grant_type": "client_credentials",
-                "appkey": KIS_APP_KEY,
-                "appsecret": KIS_APP_SECRET,
-            },
-            timeout=HTTP_TIMEOUT,
+
+        token, expiry_epoch, _source = _token_store.get_or_issue(
+            app_key=KIS_APP_KEY,
+            env=KIS_ENV,
+            issuer=_issue_access_token_once,
         )
-        resp.raise_for_status()
-        body = resp.json()
-        token = str(body.get("access_token") or "").strip()
-        if not token:
-            raise RuntimeError(f"KIS token missing: {body}")
-        expires = int(body.get("expires_in") or 86400)
         _token_value = token
-        _token_expiry = now + max(300, expires)
+        _token_expiry = float(expiry_epoch)
         return token
 
 
-def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") -> tuple[dict[str, Any], dict[str, str]]:
-    """KIS GET with one shared pacer and bounded, classified retries.
+def _invalidate_access_token(token_used: str, reason: str) -> None:
+    """Clear only the token that produced an authentication failure."""
+    global _token_value, _token_expiry
+    with _token_lock:
+        if token_used and _token_value == token_used:
+            _token_value = ""
+            _token_expiry = 0.0
+    _token_store.invalidate(
+        app_key=KIS_APP_KEY,
+        env=KIS_ENV,
+        token=token_used,
+        reason=reason,
+    )
 
-    Important:
-    - KIS may return EGW00201 (per-second request limit) inside an HTTP 500 body.
-      Detect that business code before treating the response as a generic 500.
-    - A rate-limit event slows *all* worker threads, not just the failing request.
-    - Generic HTTP 500 is retried once only. 502/503/504 and network timeouts are
-      retried at most twice. Permanent business errors fail immediately.
+
+def _looks_like_auth_error(
+    *,
+    status_code: int,
+    body: dict[str, Any] | None,
+    response_text: str = "",
+) -> bool:
+    if status_code in {401, 403}:
+        return True
+    body = body or {}
+    msg_cd = str(body.get("msg_cd") or "").upper()
+    msg1 = str(body.get("msg1") or body.get("message") or "")
+    text = f"{msg_cd} {msg1} {response_text}".lower()
+
+    # KIS gateway token errors have changed codes over time. Match only when the
+    # message is clearly authentication/token related, avoiding false refreshes for
+    # ordinary business errors.
+    token_terms = ("token", "토큰", "authorization", "인증")
+    invalid_terms = ("expired", "invalid", "만료", "유효하지", "기간", "오류")
+    return any(x in text for x in token_terms) and any(x in text for x in invalid_terms)
+
+
+def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") -> tuple[dict[str, Any], dict[str, str]]:
+    """KIS GET with shared pacing, bounded retries, and one safe auth refresh.
+
+    V149 rules
+    ----------
+    - Access token is reused from PostgreSQL across Render restarts.
+    - An actual KIS authentication failure invalidates only the token used.
+    - At most ONE forced token refresh is attempted for a request.
+    - Rate-limit/network/gateway retry behavior remains bounded.
     """
     if not configured():
         raise RuntimeError("KIS_NOT_CONFIGURED")
 
     last_exc: Exception | None = None
-    for attempt in range(3):
+    auth_refreshed = False
+    attempt = 0
+
+    # Up to 3 transport attempts + at most one dedicated auth retry.
+    while attempt < 4:
+        attempt += 1
         _rate_guard()
         with _status_lock:
             _status["request_count"] = int(_status.get("request_count", 0) or 0) + 1
             _status["last_request_at"] = datetime.now(timezone.utc).isoformat()
 
+        token_used = _access_token()
         headers = {
             "content-type": "application/json; charset=utf-8",
-            "authorization": f"Bearer {_access_token()}",
+            "authorization": f"Bearer {token_used}",
             "appkey": KIS_APP_KEY,
             "appsecret": KIS_APP_SECRET,
             "tr_id": tr_id,
@@ -205,9 +276,13 @@ def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") ->
             headers["tr_cont"] = tr_cont
 
         try:
-            resp = requests.get(f"{KIS_BASE_URL}{path}", headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            resp = requests.get(
+                f"{KIS_BASE_URL}{path}",
+                headers=headers,
+                params=params,
+                timeout=HTTP_TIMEOUT,
+            )
 
-            # KIS frequently embeds the real business error in JSON even when HTTP=500.
             body: dict[str, Any] | None = None
             try:
                 parsed = resp.json()
@@ -220,41 +295,75 @@ def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") ->
             msg1 = str((body or {}).get("msg1") or (body or {}).get("message") or "")
             rt_cd = str((body or {}).get("rt_cd", ""))
 
+            # Refresh only on a real auth/token failure, once.
+            if _looks_like_auth_error(
+                status_code=int(resp.status_code),
+                body=body,
+                response_text=resp.text[:300],
+            ):
+                last_exc = RuntimeError(
+                    f"KIS auth error {msg_cd}: {msg1 or resp.status_code}"
+                )
+                if not auth_refreshed:
+                    auth_refreshed = True
+                    _invalidate_access_token(
+                        token_used,
+                        reason=msg_cd or f"http_{resp.status_code}",
+                    )
+                    with _status_lock:
+                        _status["auth_retry_count"] = int(
+                            _status.get("auth_retry_count", 0) or 0
+                        ) + 1
+                    continue
+                raise last_exc
+
             # EGW00201 = KIS per-second transaction limit.
             if msg_cd == "EGW00201":
                 with _status_lock:
                     _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
-                delay = RATE_LIMIT_COOLDOWN_SEC * (attempt + 1)
+                retry_no = min(attempt, 3)
+                delay = RATE_LIMIT_COOLDOWN_SEC * retry_no
                 _apply_global_backoff(delay)
                 last_exc = RuntimeError(f"KIS {msg_cd}: {msg1 or 'rate limit'}")
-                if attempt < 2:
+                if attempt < 3:
                     with _status_lock:
-                        _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                        _status["transient_retry_count"] = int(
+                            _status.get("transient_retry_count", 0) or 0
+                        ) + 1
                     continue
                 raise last_exc
 
             if resp.status_code == 429:
                 with _status_lock:
                     _status["rate_limit_count"] = int(_status.get("rate_limit_count", 0) or 0) + 1
-                delay = RATE_LIMIT_COOLDOWN_SEC * (attempt + 1)
+                retry_no = min(attempt, 3)
+                delay = RATE_LIMIT_COOLDOWN_SEC * retry_no
                 _apply_global_backoff(delay)
-                last_exc = requests.HTTPError(f"429 Client Error: {resp.text[:240]}", response=resp)
-                if attempt < 2:
+                last_exc = requests.HTTPError(
+                    f"429 Client Error: {resp.text[:240]}",
+                    response=resp,
+                )
+                if attempt < 3:
                     with _status_lock:
-                        _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
+                        _status["transient_retry_count"] = int(
+                            _status.get("transient_retry_count", 0) or 0
+                        ) + 1
                     continue
                 raise last_exc
 
             if resp.status_code in {500, 502, 503, 504}:
                 last_exc = requests.HTTPError(
-                    f"{resp.status_code} Server Error: {resp.text[:240]}", response=resp
+                    f"{resp.status_code} Server Error: {resp.text[:240]}",
+                    response=resp,
                 )
-                # Plain 500s are often bad historical cursor points; retry once only.
-                max_retry_attempt = 1 if resp.status_code == 500 else 2
-                if attempt < max_retry_attempt:
+                # Plain 500 is often a bad historical cursor; one retry only.
+                max_attempt = 2 if resp.status_code == 500 else 3
+                if attempt < max_attempt:
                     with _status_lock:
-                        _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
-                    _apply_global_backoff(0.7 * (attempt + 1))
+                        _status["transient_retry_count"] = int(
+                            _status.get("transient_retry_count", 0) or 0
+                        ) + 1
+                    _apply_global_backoff(0.7 * attempt)
                     continue
                 raise last_exc
 
@@ -262,7 +371,9 @@ def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") ->
             if body is None:
                 parsed = resp.json()
                 if not isinstance(parsed, dict):
-                    raise RuntimeError(f"KIS non-object response: {type(parsed).__name__}")
+                    raise RuntimeError(
+                        f"KIS non-object response: {type(parsed).__name__}"
+                    )
                 body = parsed
 
             rt_cd = str(body.get("rt_cd", "0"))
@@ -275,20 +386,29 @@ def _get(path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = "") ->
                 _status["success_count"] = int(_status.get("success_count", 0) or 0) + 1
                 _status["last_success_at"] = datetime.now(timezone.utc).isoformat()
                 _status["last_error"] = None
-            return body, {str(k).lower(): str(v) for k, v in resp.headers.items()}
+            return body, {
+                str(k).lower(): str(v)
+                for k, v in resp.headers.items()
+            }
 
         except Exception as exc:
             last_exc = exc
-            if isinstance(exc, (requests.ConnectionError, requests.Timeout)) and attempt < 2:
+            if isinstance(exc, (requests.ConnectionError, requests.Timeout)) and attempt < 3:
                 with _status_lock:
-                    _status["transient_retry_count"] = int(_status.get("transient_retry_count", 0) or 0) + 1
-                _apply_global_backoff(0.7 * (attempt + 1))
+                    _status["transient_retry_count"] = int(
+                        _status.get("transient_retry_count", 0) or 0
+                    ) + 1
+                _apply_global_backoff(0.7 * attempt)
                 continue
             break
 
     with _status_lock:
         _status["error_count"] = int(_status.get("error_count", 0) or 0) + 1
-        _status["last_error"] = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown"
+        _status["last_error"] = (
+            f"{type(last_exc).__name__}: {last_exc}"
+            if last_exc
+            else "unknown"
+        )
     if last_exc:
         raise last_exc
     raise RuntimeError("KIS request failed")
@@ -712,7 +832,7 @@ def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
 def resolve_us_exchange(symbol: str) -> str:
     """Resolve NAS/NYS/AMS once per symbol.
 
-    V148 serializes cold resolution because the KIS shared-WebSocket thread and the
+    V149 serializes cold resolution because the KIS shared-WebSocket thread and the
     KIS_US calculation worker can start at the same time. Without this lock both
     paths could issue duplicate search-info calls for the same ticker.
     """

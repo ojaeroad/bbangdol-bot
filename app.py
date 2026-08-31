@@ -1,4 +1,4 @@
-# V148_KIS_WS_WARMUP_STABILITY
+# V149_KIS_WS_WARMUP_STABILITY
 # - V146 WebSocket + local candle + 4 market workers + alert queue
 # - coin/stock continuous chains include internal 2h and 6h gates
 # - legacy TradingView comparison endpoints removed
@@ -195,7 +195,7 @@ def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
 def _auto_active_unique_symbols() -> list[str]:
     """Background provider: member watchlist -> one compute per unique market symbol.
 
-    V148 can obtain subscriptions from the detached member/FCM service. If that
+    V149 can obtain subscriptions from the detached member/FCM service. If that
     service is not configured or temporarily unavailable, the proven local V145
     DB/live-snapshot path remains as an automatic fallback.
     """
@@ -206,7 +206,7 @@ def _auto_active_unique_symbols() -> list[str]:
             values.update(_tajum_member_client.active_symbols())
             remote_used = True
         except Exception as exc:
-            log.warning("V148 member service subscription fallback to local DB: %s", exc)
+            log.warning("V149 member service subscription fallback to local DB: %s", exc)
 
     if not remote_used:
         _auto_refresh_db_subscription_cache()
@@ -315,7 +315,7 @@ log = logging.getLogger("bbangdol-bot")
 start_performance_automation()
 
 # ---- Version / Service markers (for live check) ----
-APP_VERSION  = os.getenv("APP_VERSION", "V148")
+APP_VERSION  = os.getenv("APP_VERSION", "V149")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -352,7 +352,7 @@ def version():
 def whoami():
     return jsonify({"service": SERVICE_NAME})
 
-# === V148 production server-engine health ===
+# === V149 production server-engine health ===
 # Old COIN9 TradingView↔Binance comparison/diagnostic endpoints were removed.
 @app.get("/server-engine/health")
 def server_engine_health():
@@ -2866,7 +2866,7 @@ def app_device_register():
                 _ensure_auto_exchange_engine_started()
             return jsonify(body), status_code
         except Exception as exc:
-            log.exception("V148 member service device/register proxy failed; local fallback used")
+            log.exception("V149 member service device/register proxy failed; local fallback used")
     device_id = str(data.get("device_id", "") or "").strip()
     fcm_token = str(data.get("fcm_token", "") or "").strip()
     platform = str(data.get("platform", "android") or "android").strip()
@@ -2947,7 +2947,7 @@ def app_push_health():
             body, status_code = _tajum_member_client.proxy("GET", "/app/push/health")
             return jsonify(body), status_code
         except Exception:
-            log.exception("V148 member service push/health proxy failed; local fallback used")
+            log.exception("V149 member service push/health proxy failed; local fallback used")
     try:
         devices = app_device_summary()
     except Exception:
@@ -2969,7 +2969,7 @@ def app_recent_alerts():
             _ensure_auto_exchange_engine_started()
             return jsonify(body), status_code
         except Exception:
-            log.exception("V148 member service alerts/recent proxy failed; local fallback used")
+            log.exception("V149 member service alerts/recent proxy failed; local fallback used")
     device_id = request.args.get("device_id", "").strip()
     if not device_id:
         return jsonify({"ok": False, "error": "empty_device_id"}), 400
@@ -7620,7 +7620,7 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         if not payload:
             return
 
-        # V148 detached member/FCM service. Core keeps cadence/signal interpretation;
+        # V149 detached member/FCM service. Core keeps cadence/signal interpretation;
         # member service owns recipient lookup, cooldown, Firebase delivery and history.
         if _tajum_member_client is not None and _tajum_member_client.configured():
             try:
@@ -7638,12 +7638,12 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
                 total_failure = int(result.get("failure", 0) or 0)
                 _record_fcm_source_trace(source, payload, total_success, total_failure)
                 log.info(
-                    "V148 remote member FCM source=%s symbol=%s success=%s failure=%s",
+                    "V149 remote member FCM source=%s symbol=%s success=%s failure=%s",
                     str(source or "AUTO").upper(), payload.get("symbol"), total_success, total_failure,
                 )
                 return
             except Exception:
-                log.exception("V148 remote member FCM failed; local fallback used symbol=%s", payload.get("symbol"))
+                log.exception("V149 remote member FCM failed; local fallback used symbol=%s", payload.get("symbol"))
 
         try:
             devices = app_devices_for_symbol(payload["symbol"], 500)
@@ -7838,11 +7838,11 @@ def _ensure_auto_exchange_engine_started() -> bool:
                 return False
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V148 automatic market engine ensure pid=%s started=%s", pid, started)
+            log.info("V149 automatic market engine ensure pid=%s started=%s", pid, started)
             return started
         except Exception:
             _AUTO_ENGINE_STARTED = False
-            log.exception("V148 automatic market engine start failed pid=%s", pid)
+            log.exception("V149 automatic market engine start failed pid=%s", pid)
             return False
 
 @app.get("/server-engine/auto/status")
@@ -7854,7 +7854,7 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": "V148",
+            "version": "V149",
             "mode": "unique watchlist -> market WebSocket -> local candles -> 4 market workers -> alert queue -> FCM (REST warmup/fallback)",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_symbols"],
@@ -7863,13 +7863,13 @@ def server_engine_auto_status():
             "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V148 auto status failed")
+        log.exception("V149 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 
 @app.get("/server-engine/auto/dashboard")
 def server_engine_auto_dashboard():
-    """Human-readable V148 runtime dashboard; the JSON /auto/status endpoint remains unchanged."""
+    """Human-readable V149 runtime dashboard; the JSON /auto/status endpoint remains unchanged."""
     try:
         _ensure_auto_exchange_engine_started()
         from auto_exchange_engine import status as auto_engine_status
@@ -7894,13 +7894,13 @@ def server_engine_auto_dashboard():
             <div>계산성공 <b>{wk.get('success',0)}</b> / 오류 <b>{wk.get('error',0)}</b></div>
             <div class='err'>{ws.get('last_error') or wk.get('last_error') or ''}</div></div>""")
         html = f"""<!doctype html><meta charset='utf-8'><meta http-equiv='refresh' content='10'>
-        <title>타점ON V148 서버상태</title>
+        <title>타점ON V149 서버상태</title>
         <style>body{{font-family:Arial,sans-serif;background:#f5f6f8;margin:24px;color:#111}}
         .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}
         .card{{background:white;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0001}}
         h1{{margin-bottom:4px}} .sub{{color:#666;margin-bottom:18px}} .err{{color:#b00020;font-size:12px;margin-top:8px;word-break:break-all}}
         .big{{font-size:22px;font-weight:700}}</style>
-        <h1>타점ON V148 서버 상태</h1>
+        <h1>타점ON V149 서버 상태</h1>
         <div class='sub'>WebSocket 주 공급원 · REST warm-up/fallback · 2h/6h 연속체인 포함</div>
         <div class='grid'>{''.join(cards)}
         <div class='card'><h3>📨 알림 Queue</h3><div>대기 <b>{q.get('pending',0)}</b></div>
@@ -7912,7 +7912,7 @@ def server_engine_auto_dashboard():
         <div>기기 {sub.get('db_device_count',0)}</div></div></div>"""
         return Response(html, mimetype="text/html")
     except Exception as exc:
-        log.exception("V148 dashboard failed")
+        log.exception("V149 dashboard failed")
         return Response(f"dashboard error: {type(exc).__name__}: {exc}", status=500, mimetype="text/plain")
 
 # Do NOT start the daemon at module-import time. Gunicorn may import in the parent
