@@ -1,4 +1,4 @@
-"""Tajum On V146 automatic market signal engine (Binance/Upbit + KIS Korea/US).
+"""Tajum On V148 automatic market signal engine (Binance/Upbit + KIS Korea/US).
 
 Final operating path:
   member watchlist -> unique active exchange symbols -> one calculation per symbol
@@ -16,6 +16,7 @@ import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 import requests
@@ -452,11 +453,11 @@ from alert_queue import AlertQueue
 from market_stream_engine import MarketStreamHub, classify as _classify_market
 from prediction_engine import PredictionEngine
 
-# V146 uses four independent market worker loops. The stable V146 REST evaluators remain
+# V148 uses four independent market calculation workers. REST evaluators remain
 # available as warm-up / gap-fill / fallback. WebSocket-owned candle series take priority.
-_V146_STARTED = False
-_V146_PID = 0
-_V146_LOCK = threading.Lock()
+_V148_STARTED = False
+_V148_PID = 0
+_V148_LOCK = threading.Lock()
 _STREAM_HUB: MarketStreamHub | None = None
 _ALERT_QUEUE: AlertQueue | None = None
 _PREDICTION = PredictionEngine()
@@ -472,88 +473,269 @@ _MARKET_STATUS: dict[str, dict[str, Any]] = {
 }
 _SEEDED: set[tuple[str,str]] = set()
 _SEED_LOCK = threading.Lock()
+_STOCK_REFRESH_LOCK = threading.Lock()
+_STOCK_LAST_REFRESH: dict[tuple[str, str], float] = {}
 
-V146_INTERVAL = max(15, min(int(os.getenv("TAJUM_V146_EVAL_INTERVAL_SEC","60") or 60), 300))
+V148_INTERVAL = max(
+    15,
+    min(int(os.getenv("TAJUM_V148_EVAL_INTERVAL_SEC", "60") or 60), 300),
+)
+STOCK_REST_REFRESH_SEC = max(
+    45,
+    min(int(os.getenv("TAJUM_STOCK_REST_FALLBACK_REFRESH_SEC", "75") or 75), 300),
+)
 SHARD_COUNT = max(1, int(os.getenv("TAJUM_WORKER_SHARD_COUNT","1") or 1))
 SHARD_INDEX = max(0, int(os.getenv("TAJUM_WORKER_SHARD_INDEX","0") or 0)) % SHARD_COUNT
 
+KST = ZoneInfo("Asia/Seoul")
+NY = ZoneInfo("America/New_York")
+
+
 def _owned(symbol: str) -> bool:
-    if SHARD_COUNT <= 1: return True
+    if SHARD_COUNT <= 1:
+        return True
     import hashlib
     n = int(hashlib.sha1(symbol.encode()).hexdigest()[:8], 16)
     return (n % SHARD_COUNT) == SHARD_INDEX
 
+
+def _stock_market_is_open(market: str, now_utc: datetime | None = None) -> bool:
+    """Regular-session gate used only for REST refresh policy.
+
+    Holidays are intentionally not guessed here. On an exchange holiday, REST refresh
+    may run a few harmless times; the WebSocket/REST fallback remains safe.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if market == "KIS_KR":
+        local = now_utc.astimezone(KST)
+        if local.weekday() >= 5:
+            return False
+        hm = local.hour * 60 + local.minute
+        return 9 * 60 <= hm <= 15 * 60 + 30
+    if market == "KIS_US":
+        local = now_utc.astimezone(NY)
+        if local.weekday() >= 5:
+            return False
+        hm = local.hour * 60 + local.minute
+        return 9 * 60 + 30 <= hm <= 16 * 60
+    return True
+
+
+def _stock_seed_rows(symbol: str, market: str) -> dict[str, list[dict[str, Any]]]:
+    """Fetch each KIS source family only once and derive every internal TF locally."""
+    if market == "KIS_KR":
+        minute_rows = kis.domestic_minutes(symbol)
+        daily = kis.domestic_daily(symbol)
+        return {
+            "1w": kis._day_aggregate(daily, 5),
+            "3d": kis._day_aggregate(daily, 3),
+            "1d": daily,
+            "6h": kis.aggregate_stock_session(minute_rows, 360, "KOREA"),
+            "4h": kis.aggregate_stock_session(minute_rows, 240, "KOREA"),
+            "2h": kis.aggregate_stock_session(minute_rows, 120, "KOREA"),
+            "1h": kis.aggregate_stock_session(minute_rows, 60, "KOREA"),
+            "30m": kis.aggregate_stock_session(minute_rows, 30, "KOREA"),
+            "15m": kis.aggregate_stock_session(minute_rows, 15, "KOREA"),
+            "5m": kis.aggregate_stock_session(minute_rows, 5, "KOREA"),
+        }
+
+    # US: 5m source -> 5/15/30m, 60m source -> 1/2/6h, native 240m -> 4h.
+    excd = kis.resolve_us_exchange(symbol)
+    base_5m = kis.overseas_minutes(symbol, 5, exchange=excd)
+    base_60m = kis.overseas_minutes(symbol, 60, exchange=excd)
+    base_240m = kis.overseas_minutes(symbol, 240, exchange=excd)
+    daily = kis.overseas_daily(symbol, exchange=excd)
+    return {
+        "1w": kis._day_aggregate(daily, 5),
+        "3d": kis._day_aggregate(daily, 3),
+        "1d": daily,
+        "6h": kis.aggregate_stock_session(base_60m, 360, "US"),
+        "4h": base_240m,
+        "2h": kis.aggregate_stock_session(base_60m, 120, "US"),
+        "1h": base_60m,
+        "30m": kis.aggregate_stock_session(base_5m, 30, "US"),
+        "15m": kis.aggregate_stock_session(base_5m, 15, "US"),
+        "5m": base_5m,
+    }
+
+
+def _write_stock_book(symbol: str, market: str, rows_by_tf: dict[str, list[dict[str, Any]]]) -> None:
+    if _STREAM_HUB is None:
+        return
+    # Seed high -> low so the freshest 5m close becomes CandleBook.last_price.
+    for tf in STOCK_TF_ORDER:
+        rows = rows_by_tf.get(tf) or []
+        if rows:
+            _STREAM_HUB.seed(symbol, market, tf, rows)
+
+
 def _seed_symbol(symbol: str, market: str) -> None:
-    if _STREAM_HUB is None: return
+    """Initial warm-up.
+
+    V147 seeded stock history only when WebSocket was already healthy, which meant a
+    failed/quiet KIS stream kept calling REST forever and never populated CandleBook.
+    V148 always seeds stock history exactly once first.
+    """
+    if _STREAM_HUB is None:
+        return
     key = (market, symbol)
     with _SEED_LOCK:
-        if key in _SEEDED: return
+        if key in _SEEDED:
+            return
+
     try:
         if market == "BINANCE":
             v133.SUPPORTED_SYMBOLS.setdefault(symbol, symbol)
             for tf in v133.TF_ORDER:
                 rows = v133._fetch_klines(symbol, tf, limit=min(v133.KLINE_LIMIT, 300))
                 _STREAM_HUB.seed(symbol, market, tf, rows)
+
         elif market == "UPBIT":
             for tf in v133.TF_ORDER:
                 _STREAM_HUB.seed(symbol, market, tf, _upbit_rows(symbol, tf))
+
         else:
-            for tf in STOCK_TF_ORDER:
-                _, rows = kis.rows(symbol, tf)
-                _STREAM_HUB.seed(symbol, market, tf, rows)
+            _write_stock_book(symbol, market, _stock_seed_rows(symbol, market))
+            with _STOCK_REFRESH_LOCK:
+                _STOCK_LAST_REFRESH[key] = time.monotonic()
+
         with _SEED_LOCK:
             _SEEDED.add(key)
+
     except Exception:
-        # REST evaluator below still works even if a seed is temporarily incomplete.
-        log.exception("V146 warm-up seed failed market=%s symbol=%s", market, symbol)
+        # REST evaluator below is still available if initial warm-up fails.
+        log.exception("V148 warm-up seed failed market=%s symbol=%s", market, symbol)
+
+
+def _refresh_stock_book_if_due(symbol: str, market: str, *, force: bool = False) -> bool:
+    """Refresh KIS REST-backed CandleBook only while live WebSocket is unavailable.
+
+    Closed markets reuse their already-seeded book and generate *zero* repeated REST
+    refresh traffic. Open markets refresh at a bounded cadence (default 75 sec).
+    """
+    if _STREAM_HUB is None:
+        return False
+    key = (market, symbol)
+    now = time.monotonic()
+    with _STOCK_REFRESH_LOCK:
+        last = float(_STOCK_LAST_REFRESH.get(key, 0.0) or 0.0)
+        if not force and now - last < STOCK_REST_REFRESH_SEC:
+            return False
+
+    rows_by_tf = _stock_seed_rows(symbol, market)
+    _write_stock_book(symbol, market, rows_by_tf)
+    with _STOCK_REFRESH_LOCK:
+        _STOCK_LAST_REFRESH[key] = time.monotonic()
+    return True
+
 
 def _metric_result_from_book(symbol: str, market: str) -> dict[str, Any] | None:
-    if _STREAM_HUB is None: return None
+    if _STREAM_HUB is None:
+        return None
     _seed_symbol(symbol, market)
     eval_ms = int(datetime.now(timezone.utc).timestamp() // 60 * 60 * 1000)
-    metrics = {}
-    warnings, skipped = [], []
+    metrics: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    skipped: list[str] = []
     tf_order = v133.TF_ORDER if market in {"BINANCE","UPBIT"} else STOCK_TF_ORDER
+
     for tf in tf_order:
         rows = _STREAM_HUB.rows(symbol, tf, 320)
         if len(rows) < 31:
-            skipped.append(tf); warnings.append(f"{symbol} {tf}: WS candle warm-up {len(rows)}")
+            skipped.append(tf)
+            warnings.append(f"{symbol} {tf}: candle warm-up {len(rows)}")
             continue
         try:
             metrics[tf] = v133._latest_metric(rows, evaluation_time_ms=eval_ms)
         except RuntimeError as exc:
-            skipped.append(tf); warnings.append(f"{symbol} {tf}: {exc}")
+            skipped.append(tf)
+            warnings.append(f"{symbol} {tf}: {exc}")
+
     price_age = 172800 if market in {"KIS_KR","KIS_US"} else 180
     price = _STREAM_HUB.last_price(symbol, max_age_sec=price_age)
     if price is None:
         return None
+
     if market in {"BINANCE","UPBIT"}:
         buy = _chain_signal_available(symbol, metrics, is_ob=False, price=price)
         sell = _chain_signal_available(symbol, metrics, is_ob=True, price=price)
     else:
         buy = _stock_chain_signal(metrics, is_ob=False)
         sell = _stock_chain_signal(metrics, is_ob=True)
+
+    source = "WEBSOCKET" if _STREAM_HUB.healthy(market) else "REST_SEEDED_CANDLEBOOK"
     return {
-        "exchange": market, "market": "KOREA" if market=="KIS_KR" else ("US" if market=="KIS_US" else market),
-        "symbol": symbol, "price": float(price), "evaluation_time_ms": eval_ms,
-        "timeframes": metrics, "buy": buy, "sell": sell,
-        "warnings": warnings, "skipped_timeframes": skipped, "data_source": "WEBSOCKET",
+        "exchange": market,
+        "market": "KOREA" if market == "KIS_KR" else ("US" if market == "KIS_US" else market),
+        "symbol": symbol,
+        "price": float(price),
+        "evaluation_time_ms": eval_ms,
+        "timeframes": metrics,
+        "buy": buy,
+        "sell": sell,
+        "warnings": warnings,
+        "skipped_timeframes": skipped,
+        "data_source": source,
     }
 
+
 def _evaluate_market_symbol(symbol: str, market: str) -> dict[str, Any]:
-    # WebSocket path is primary once fresh data is flowing. REST is gap-fill/fallback.
-    if _STREAM_HUB is not None and _STREAM_HUB.healthy(market):
+    # Crypto behavior remains unchanged.
+    if market == "BINANCE":
+        if _STREAM_HUB is not None and _STREAM_HUB.healthy(market):
+            result = _metric_result_from_book(symbol, market)
+            if result is not None:
+                return result
+        return _evaluate_binance(symbol)
+
+    if market == "UPBIT":
+        if _STREAM_HUB is not None and _STREAM_HUB.healthy(market):
+            result = _metric_result_from_book(symbol, market)
+            if result is not None:
+                return result
+        return _evaluate_upbit(symbol)
+
+    # Stocks: seed once regardless of WS state.
+    _seed_symbol(symbol, market)
+
+    if _STREAM_HUB is not None:
+        ws_fresh = _STREAM_HUB.healthy(market)
+
+        # During the live regular session, REST refreshes only when WS is unavailable.
+        # Outside session, the seeded book is reused without recurring KIS calls.
+        if not ws_fresh and _stock_market_is_open(market):
+            try:
+                _refresh_stock_book_if_due(symbol, market)
+            except Exception:
+                log.exception("V148 stock REST fallback refresh failed market=%s symbol=%s", market, symbol)
+
         result = _metric_result_from_book(symbol, market)
         if result is not None:
             return result
-    if market == "BINANCE": return _evaluate_binance(symbol)
-    if market == "UPBIT": return _evaluate_upbit(symbol)
+
+    # Last-resort compatibility fallback.
     return _evaluate_kis_stock(symbol)
+
 
 def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) -> None:
     while True:
         started = datetime.now(timezone.utc)
         symbols = [s.upper() for s in (subscription_provider() or []) if _classify_market(s) == market and _owned(s.upper())]
+
+        # KIS REST warm-up shares one global rate guard. At process start, give the
+        # currently-open stock market first priority so live alerts recover quickly.
+        if market == "KIS_KR" and not _stock_market_is_open("KIS_KR") and _stock_market_is_open("KIS_US"):
+            with _MARKET_STATUS_LOCK:
+                us_cycles = int(_MARKET_STATUS["KIS_US"].get("cycles", 0) or 0)
+            if us_cycles == 0:
+                time.sleep(2.0)
+                continue
+        if market == "KIS_US" and not _stock_market_is_open("KIS_US") and _stock_market_is_open("KIS_KR"):
+            with _MARKET_STATUS_LOCK:
+                kr_cycles = int(_MARKET_STATUS["KIS_KR"].get("cycles", 0) or 0)
+            if kr_cycles == 0:
+                time.sleep(2.0)
+                continue
         symbols = list(dict.fromkeys(symbols))
         with _MARKET_STATUS_LOCK:
             _MARKET_STATUS[market].update(
@@ -582,7 +764,7 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
                 with _MARKET_STATUS_LOCK:
                     _MARKET_STATUS[market]["current_error"] = error
                 last_error = f"{symbol}: {type(exc).__name__}: {exc}"
-                log.exception("V146 market worker failed market=%s symbol=%s", market, symbol)
+                log.exception("V148 market worker failed market=%s symbol=%s", market, symbol)
             finally:
                 with _MARKET_STATUS_LOCK:
                     _MARKET_STATUS[market]["current_completed"] = int(_MARKET_STATUS[market].get("current_completed", 0)) + 1
@@ -601,15 +783,15 @@ def _market_loop(market: str, subscription_provider: Callable[[], list[str]]) ->
             st["last_finished_at"] = finished.isoformat()
             st["last_duration_sec"] = round((finished-started).total_seconds(),3)
         elapsed = (finished-started).total_seconds()
-        time.sleep(max(1.0, V146_INTERVAL-elapsed))
+        time.sleep(max(1.0, V148_INTERVAL-elapsed))
 
 def start(subscription_provider: Callable[[], list[str]], signal_callback: Callable[[dict[str, Any]], None]) -> bool:
-    global _V146_STARTED, _V146_PID, _STREAM_HUB, _ALERT_QUEUE
+    global _V148_STARTED, _V148_PID, _STREAM_HUB, _ALERT_QUEUE
     pid = os.getpid()
-    with _V146_LOCK:
-        if _V146_STARTED and _V146_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
+    with _V148_LOCK:
+        if _V148_STARTED and _V148_PID == pid and any(t.is_alive() for t in _MARKET_THREADS.values()):
             return False
-        _V146_STARTED = True; _V146_PID = pid
+        _V148_STARTED = True; _V148_PID = pid
         _STREAM_HUB = MarketStreamHub(subscription_provider)
         _STREAM_HUB.start()
         _ALERT_QUEUE = AlertQueue(signal_callback)
@@ -636,11 +818,11 @@ def status() -> dict[str, Any]:
     queue_status = _ALERT_QUEUE.status() if _ALERT_QUEUE else {}
     # Backward-compatible keys remain so existing screenshots/status checks still work.
     return {
-        "running": _V146_STARTED,
-        "worker_pid": _V146_PID or None,
+        "running": _V148_STARTED,
+        "worker_pid": _V148_PID or None,
         "worker_thread_alive": all(t.is_alive() for t in _MARKET_THREADS.values()) if _MARKET_THREADS else False,
         "workers": 4,
-        "worker_model": "4_market_workers + websocket_stream_threads + alert_queue",
+        "worker_model": "4_market_workers + 2_crypto_ws + 1_shared_kis_ws + alert_queue",
         "shard_count": SHARD_COUNT, "shard_index": SHARD_INDEX,
         "cycles": total_cycles, "cycles_started": total_cycles + sum(1 for x in markets.values() if x.get("in_progress")),
         "cycle_in_progress": any(bool(x.get("in_progress")) for x in markets.values()),
@@ -661,7 +843,7 @@ def status() -> dict[str, Any]:
             "coin_internal_only": sorted(v133.INTERNAL_ONLY_TFS),
             "stock_order": list(STOCK_TF_ORDER),
             "stock_internal_only": sorted(STOCK_INTERNAL_CHAIN_TFS),
-            "note": "stock and coin chains include mandatory 2h/6h plus stock 15m/5m continuity gates",
+            "note": "V148: stock/coin mandatory chains preserved; KIS KR+US share one transport socket but calculate in separate workers",
         },
         "kis": kis.status(),
     }

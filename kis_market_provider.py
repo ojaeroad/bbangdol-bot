@@ -1,4 +1,4 @@
-"""Tajum On V146 KIS market-data provider.
+"""Tajum On V148 KIS market-data provider.
 
 Purpose
 -------
@@ -22,13 +22,13 @@ KIS_OVERSEAS_PAGES                                  default 4
 KIS_RATE_LIMIT_COOLDOWN_SEC                         default 1.5
 KIS_OVERSEAS_MINUTE_CACHE_TTL_SEC                  default 75
 
-V146 notes
+V148 notes
 ----------
 - Follows the official KIS domestic minute pagination stop rule: stop when the
   page is shorter than 120 rows or the oldest time reaches 09:00.
 - Reuses the oldest time as the next cursor (dedup handles overlap) instead of
   subtracting one minute, which caused 09:20-era 500 responses on some days.
-- Stops domestic 1m warm-up as soon as enough aggregated 4h bars exist.
+- Stops domestic 1m warm-up as soon as >=31 session-aligned 6h bars exist.
 - Retries only transient gateway/rate-limit errors; invalid historical points are
   isolated without repeatedly hammering KIS.
 
@@ -82,6 +82,7 @@ _http_lock = threading.Lock()
 _last_http_at = 0.0
 _rate_blocked_until = 0.0
 _us_exchange_cache: dict[str, str] = {}
+_us_exchange_lock = threading.Lock()
 _status_lock = threading.Lock()
 _status: dict[str, Any] = {
     "configured": bool(KIS_APP_KEY and KIS_APP_SECRET),
@@ -100,6 +101,8 @@ _status: dict[str, Any] = {
     "cache_hit_count": 0,
     "domestic_warmup_calls": 0,
     "domestic_warmup_days": 0,
+    "domestic_target": "31x_session_aligned_6h",
+    "overseas_page_plan": {"5m": 2, "60m": 2, "240m": 1},
 }
 
 
@@ -671,15 +674,18 @@ def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
             # Do not discard valid cached history if the latest session probe fails.
             pass
 
-    # Cold/incomplete cache: walk backward only until the signal warm-up target is met.
-    if len(aggregate([all_rows[k] for k in sorted(all_rows)], 240)) < 35:
+    # Cold/incomplete cache: 31 bars are the exact minimum needed by RSI14 +
+    # Stoch(20,12). The longest intraday internal chain TF is 6h, therefore stop
+    # as soon as 31 *session-aligned* 6h bars exist. This avoids needless extra days.
+    current_rows_for_target = [all_rows[k] for k in sorted(all_rows)]
+    if len(aggregate_stock_session(current_rows_for_target, 360, "KOREA")) < 31:
         cursor_day = _previous_weekday(latest_business_day)
         sessions_with_data = 0
         calendar_scans = 0
         max_calendar_scans = DOMESTIC_HISTORY_DAYS * 2
         while sessions_with_data < DOMESTIC_HISTORY_DAYS and calendar_scans < max_calendar_scans:
             current_rows = [all_rows[k] for k in sorted(all_rows)]
-            if len(aggregate(current_rows, 240)) >= 35:
+            if len(aggregate_stock_session(current_rows, 360, "KOREA")) >= 31:
                 break
             calendar_scans += 1
             if cursor_day.weekday() >= 5:
@@ -704,31 +710,51 @@ def domestic_minutes(symbol: str) -> list[dict[str, Any]]:
 
 
 def resolve_us_exchange(symbol: str) -> str:
+    """Resolve NAS/NYS/AMS once per symbol.
+
+    V148 serializes cold resolution because the KIS shared-WebSocket thread and the
+    KIS_US calculation worker can start at the same time. Without this lock both
+    paths could issue duplicate search-info calls for the same ticker.
+    """
     symbol = symbol.upper().strip()
     cached = _us_exchange_cache.get(symbol)
     if cached:
         return cached
-    # Product basic info API resolves market without requiring a pre-built US master.
-    for product_type, excd in (("512", "NAS"), ("513", "NYS"), ("529", "AMS")):
-        try:
-            body, _ = _get(
-                "/uapi/overseas-price/v1/quotations/search-info",
-                "CTPF1702R",
-                {"PRDT_TYPE_CD": product_type, "PDNO": symbol},
-            )
-            output = body.get("output") or {}
-            if isinstance(output, list):
-                output = output[0] if output else {}
-            # KIS may return rt_cd=0 with an empty record, so require a recognizable code/name.
-            text = " ".join(str(v or "") for v in output.values()).upper() if isinstance(output, dict) else ""
-            if symbol in text or any(str(output.get(k) or "").strip() for k in ("prdt_name", "prdt_name120", "ovrs_item_name", "hts_eng_isnm")):
-                _us_exchange_cache[symbol] = excd
-                return excd
-        except Exception:
-            continue
-    # Common default for the user's current tech-heavy watchlist; price lookup will fail visibly if wrong.
-    _us_exchange_cache[symbol] = "NAS"
-    return "NAS"
+
+    with _us_exchange_lock:
+        cached = _us_exchange_cache.get(symbol)
+        if cached:
+            return cached
+
+        # Product basic info API resolves market without a pre-built US master.
+        for product_type, excd in (("512", "NAS"), ("513", "NYS"), ("529", "AMS")):
+            try:
+                body, _ = _get(
+                    "/uapi/overseas-price/v1/quotations/search-info",
+                    "CTPF1702R",
+                    {"PRDT_TYPE_CD": product_type, "PDNO": symbol},
+                )
+                output = body.get("output") or {}
+                if isinstance(output, list):
+                    output = output[0] if output else {}
+                text = (
+                    " ".join(str(v or "") for v in output.values()).upper()
+                    if isinstance(output, dict)
+                    else ""
+                )
+                if symbol in text or any(
+                    str(output.get(k) or "").strip()
+                    for k in ("prdt_name", "prdt_name120", "ovrs_item_name", "hts_eng_isnm")
+                ):
+                    _us_exchange_cache[symbol] = excd
+                    return excd
+            except Exception:
+                continue
+
+        # Safe compatibility default for unknown tickers. A wrong exchange is still
+        # visible via REST/WS error status rather than silently generating signals.
+        _us_exchange_cache[symbol] = "NAS"
+        return "NAS"
 
 
 def overseas_current_price(symbol: str, exchange: str | None = None) -> float:
@@ -768,7 +794,14 @@ def overseas_minutes(symbol: str, minutes: int, exchange: str | None = None) -> 
     all_rows: dict[int, dict[str, Any]] = {}
     keyb = ""
     next_flag = ""
-    for page in range(OVERSEAS_PAGES):
+    # Minimum pages needed for 31-bar signal warm-up:
+    # 5m source -> 30m derived: 31*6=186 five-minute bars => 2x120 pages.
+    # 60m source -> 6h derived: 31*6=186 hourly bars => 2x120 pages.
+    # 240m source -> 4h native: 31 bars => 1x120 page.
+    page_plan = {5: 2, 60: 2, 240: 1}
+    page_limit = min(OVERSEAS_PAGES, page_plan.get(int(minutes), OVERSEAS_PAGES))
+    page_limit = max(1, int(page_limit))
+    for page in range(page_limit):
         body, headers = _get(
             "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
             "HHDFS76950200",
@@ -795,7 +828,12 @@ def overseas_minutes(symbol: str, minutes: int, exchange: str | None = None) -> 
             if len(ds) != 8:
                 continue
             try:
-                dt = datetime.strptime(ds + hs, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                # KIS overseas XYMD/XHMS are exchange-local date/time.
+                # NAS/NYS/AMS all use New York local time for this US stock path.
+                local_dt = datetime.strptime(ds + hs, "%Y%m%d%H%M%S").replace(
+                    tzinfo=ZoneInfo("America/New_York")
+                )
+                dt = local_dt.astimezone(timezone.utc)
                 close = _num(item.get("last") or item.get("clos"))
                 row = {
                     "open_time": _ms(dt),
