@@ -192,6 +192,17 @@ CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_symbol_pair_time
 CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_unmatched
     ON performance_prediction_snapshots(symbol, target_timeframe, first_target_at);
 
+-- V99: TF expansion research snapshot extensions.
+-- Existing rows remain valid: legacy rows are treated as BUY/LOW and strategy=1Q.
+ALTER TABLE performance_prediction_snapshots
+    ADD COLUMN IF NOT EXISTS direction VARCHAR(10);
+ALTER TABLE performance_prediction_snapshots
+    ADD COLUMN IF NOT EXISTS all_timeframes JSONB;
+ALTER TABLE performance_prediction_snapshots
+    ADD COLUMN IF NOT EXISTS metrics_schema_version INTEGER;
+CREATE INDEX IF NOT EXISTS idx_prediction_snapshot_direction_pair_time
+    ON performance_prediction_snapshots(direction, source_timeframe, target_timeframe, snapshot_at);
+
 
 CREATE TABLE IF NOT EXISTS performance_cadence_stage_events (
     id BIGSERIAL PRIMARY KEY,
@@ -645,48 +656,66 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
             if kd is not None: out[prefix + f"_k_delta_{n}"] = kd
             if dd is not None: out[prefix + f"_d_delta_{n}"] = dd
 
-    # Moving average research: V94 uses SMA only (20/60/200).
-    # Old EMA keys already stored in JSONB are preserved for backward compatibility,
-    # but new grouping/research intentionally ignores EMA to avoid duplicated features.
+    # Moving-average research: V99 canonical research set is 20/60/120/200.
+    # (The lecture master set is 5/20/60/120/200/365; 5/365 are intentionally
+    # not added to this hot-path yet. Raw JSONB remains forward-compatible.)
     price = _metric_float(_metric_first(src, "price", "close", "close_price"))
-    if price is not None: out["price"] = price
-    for family in ("sma",):
-        ma20 = _metric_float(_metric_first(src, family + "20", family + "_20"))
-        ma60 = _metric_float(_metric_first(src, family + "60", family + "_60"))
-        if ma20 is not None: out[family + "20"] = ma20
-        if ma60 is not None: out[family + "60"] = ma60
-        if ma20 is not None and ma60 is not None:
-            out[family + "_gap_pct"] = _pct_gap(ma20, ma60)
-            out.setdefault(family + "_state", "GOLDEN" if ma20 >= ma60 else "DEAD")
-        cross = _normalize_cross(_metric_first(src, family + "_cross", family + "_cross_now"))
-        if cross is not None: out[family + "_cross"] = cross
-        bars = _metric_float(_metric_first(src, family + "_bars_since_cross", family + "_cross_bars"))
-        if bars is not None: out[family + "_bars_since_cross"] = int(max(0, bars))
-        for n in (1, 3):
-            s20 = _metric_float(_metric_first(src, family + f"20_delta_{n}", family + f"_20_delta_{n}"))
-            s60 = _metric_float(_metric_first(src, family + f"60_delta_{n}", family + f"_60_delta_{n}"))
-            if s20 is not None: out[family + f"20_delta_{n}"] = s20
-            if s60 is not None: out[family + f"60_delta_{n}"] = s60
-        if price is not None:
-            if ma20 is not None:
-                out["price_vs_" + family + "20"] = _price_position(price, ma20)
-                out["price_gap_" + family + "20_pct"] = _pct_gap(price, ma20)
-            if ma60 is not None:
-                out["price_vs_" + family + "60"] = _price_position(price, ma60)
-                out["price_gap_" + family + "60_pct"] = _pct_gap(price, ma60)
+    if price is not None:
+        out["price"] = price
 
-    sma200 = _metric_float(_metric_first(src, "sma200", "sma_200"))
-    if sma200 is not None:
-        out["sma200"] = sma200
-        if price is not None:
-            out["price_vs_sma200"] = _price_position(price, sma200)
-            out["price_gap_sma200_pct"] = _pct_gap(price, sma200)
-    for n in (1, 3):
-        dv = _metric_float(_metric_first(src, f"sma200_delta_{n}", f"sma_200_delta_{n}"))
-        if dv is not None:
-            out[f"sma200_delta_{n}"] = dv
-    s20 = _metric_float(out.get("sma20")); s60 = _metric_float(out.get("sma60")); s200 = _metric_float(out.get("sma200"))
-    if s20 is not None and s60 is not None and s200 is not None:
+    ma_values: dict[int, float | None] = {}
+    for period in (5, 20, 60, 120, 200, 365):
+        ma = _metric_float(_metric_first(src, f"sma{period}", f"sma_{period}"))
+        ma_values[period] = ma
+        if ma is not None:
+            out[f"sma{period}"] = ma
+            if price is not None:
+                out[f"price_vs_sma{period}"] = _price_position(price, ma)
+                out[f"price_gap_sma{period}_pct"] = _pct_gap(price, ma)
+        for n in (1, 3):
+            dv = _metric_float(_metric_first(src, f"sma{period}_delta_{n}", f"sma_{period}_delta_{n}"))
+            if dv is not None:
+                out[f"sma{period}_delta_{n}"] = dv
+
+    s5, s20, s60, s120, s200, s365 = (
+        ma_values.get(5), ma_values.get(20), ma_values.get(60),
+        ma_values.get(120), ma_values.get(200), ma_values.get(365),
+    )
+    if s20 is not None and s60 is not None:
+        out["sma_gap_pct"] = _pct_gap(s20, s60)  # legacy canonical alias
+        out["sma20_60_gap_pct"] = _pct_gap(s20, s60)
+        out.setdefault("sma_state", "GOLDEN" if s20 >= s60 else "DEAD")
+    if s60 is not None and s120 is not None:
+        out["sma60_120_gap_pct"] = _pct_gap(s60, s120)
+    if s20 is not None and s120 is not None:
+        out["sma20_120_gap_pct"] = _pct_gap(s20, s120)
+    if s5 is not None and s20 is not None:
+        out["sma5_20_gap_pct"] = _pct_gap(s5, s20)
+    if s120 is not None and s200 is not None:
+        out["sma120_200_gap_pct"] = _pct_gap(s120, s200)
+    if s200 is not None and s365 is not None:
+        out["sma200_365_gap_pct"] = _pct_gap(s200, s365)
+    if price not in (None, 0) and all(v is not None for v in (s20, s60, s120)):
+        hi = max(float(s20), float(s60), float(s120))
+        lo = min(float(s20), float(s60), float(s120))
+        out["sma20_60_120_cluster_pct"] = round((hi - lo) / abs(float(price)) * 100.0, 6)
+
+    cross = _normalize_cross(_metric_first(src, "sma_cross", "sma_cross_now"))
+    if cross is not None:
+        out["sma_cross"] = cross
+    bars = _metric_float(_metric_first(src, "sma_bars_since_cross", "sma_cross_bars"))
+    if bars is not None:
+        out["sma_bars_since_cross"] = int(max(0, bars))
+
+    # Alignment remains backward-compatible while adding the lecture-relevant 120MA.
+    if all(v is not None for v in (s20, s60, s120, s200)):
+        if s20 > s60 > s120 > s200:
+            out["sma_alignment"] = "BULL"
+        elif s20 < s60 < s120 < s200:
+            out["sma_alignment"] = "BEAR"
+        else:
+            out["sma_alignment"] = "MIXED"
+    elif all(v is not None for v in (s20, s60, s200)):
         if s20 > s60 > s200:
             out["sma_alignment"] = "BULL"
         elif s20 < s60 < s200:
@@ -715,7 +744,7 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
         v = _metric_float(_metric_first(src, key))
         if v is not None: out[key] = v
 
-    out["metrics_schema_version"] = 94
+    out["metrics_schema_version"] = max(99, int(_metric_float(src.get("metrics_schema_version")) or 0))
     return out
 
 
@@ -742,10 +771,16 @@ def _prediction_hash(payload: dict[str, Any]) -> str:
     source_tf = str(payload.get("source_timeframe", "")).strip()
     target_tf = str(payload.get("target_timeframe", "")).strip()
     signal_time = str(payload.get("signal_time", "")).strip()
-    return hashlib.sha256(f"{symbol}|{source_tf}|{target_tf}|{signal_time}".encode("utf-8")).hexdigest()
+    strategy = str(payload.get("strategy", "1Q") or "1Q").strip().upper()
+    direction = str(payload.get("direction", "LOW") or "LOW").strip().upper()
+    return hashlib.sha256(
+        f"{strategy}|{direction}|{symbol}|{source_tf}|{target_tf}|{signal_time}".encode("utf-8")
+    ).hexdigest()
 
 
 def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
+    # Historical event name is kept for webhook compatibility; strategy/direction
+    # inside the payload distinguish STARFLOWER vs 1Q and BUY(LOW) vs SELL(HIGH).
     if str(payload.get("event_type", "")).strip().upper() != "PREDICTION_SNAPSHOT_1Q":
         return False
     payload = _canonicalize_payload_symbol(payload)
@@ -755,6 +790,13 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
     target_tf = str(payload.get("target_timeframe", "")).strip()
     if not symbol or not source_tf or not target_tf:
         raise ValueError("prediction snapshot missing symbol/source_timeframe/target_timeframe")
+
+    strategy = str(payload.get("strategy", "1Q") or "1Q").strip().upper()
+    if strategy not in {"1Q", "STARFLOWER"}:
+        strategy = "1Q"
+    direction = str(payload.get("direction", "LOW") or "LOW").strip().upper()
+    if direction not in {"LOW", "HIGH"}:
+        direction = "LOW"
 
     try:
         signal_price = Decimal(str(payload.get("signal_price"))) if payload.get("signal_price") is not None else None
@@ -768,8 +810,23 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
     except Exception:
         pass
 
+    all_timeframes_raw = payload.get("all_timeframes") or {}
+    all_timeframes: dict[str, Any] = {}
+    if isinstance(all_timeframes_raw, dict):
+        for tf, metrics in all_timeframes_raw.items():
+            if isinstance(metrics, dict):
+                all_timeframes[str(tf)] = normalize_prediction_metrics(metrics)
+
+    metrics_schema_version = 99
+    try:
+        metrics_schema_version = max(99, int(payload.get("metrics_schema_version") or 0))
+    except Exception:
+        pass
+
     ensure_schema()
     params = {
+        "strategy": strategy,
+        "direction": direction,
         "exchange": str(payload.get("exchange", "")).strip() or None,
         "raw_exchange": str(payload.get("raw_exchange", "")).strip() or None,
         "symbol": symbol,
@@ -779,6 +836,8 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
         "snapshot_at": snapshot_at,
         "source_metrics": Jsonb(normalize_prediction_metrics(payload.get("source_metrics") or {})),
         "target_metrics": Jsonb(normalize_prediction_metrics(payload.get("target_metrics") or {})),
+        "all_timeframes": Jsonb(all_timeframes) if all_timeframes else None,
+        "metrics_schema_version": metrics_schema_version,
         "raw_payload": Jsonb(payload),
         "snapshot_hash": _prediction_hash(payload),
     }
@@ -786,13 +845,15 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
         row = conn.execute(
             """
             INSERT INTO performance_prediction_snapshots(
-                strategy, exchange, raw_exchange, symbol,
+                strategy, direction, exchange, raw_exchange, symbol,
                 source_timeframe, target_timeframe, signal_price, snapshot_at,
-                source_metrics, target_metrics, raw_payload, snapshot_hash
+                source_metrics, target_metrics, all_timeframes, metrics_schema_version,
+                raw_payload, snapshot_hash
             ) VALUES (
-                '1Q', %(exchange)s, %(raw_exchange)s, %(symbol)s,
+                %(strategy)s, %(direction)s, %(exchange)s, %(raw_exchange)s, %(symbol)s,
                 %(source_tf)s, %(target_tf)s, %(signal_price)s, %(snapshot_at)s,
-                %(source_metrics)s, %(target_metrics)s, %(raw_payload)s, %(snapshot_hash)s
+                %(source_metrics)s, %(target_metrics)s, %(all_timeframes)s, %(metrics_schema_version)s,
+                %(raw_payload)s, %(snapshot_hash)s
             )
             ON CONFLICT (snapshot_hash) DO NOTHING
             RETURNING id
@@ -800,9 +861,10 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
             params,
         ).fetchone()
     if row:
-        log.info("Prediction snapshot saved id=%s symbol=%s %s->%s", row[0], symbol, source_tf, target_tf)
-        # V94: keep confirmed 5m candles long enough to calculate MAE/MFE later.
-        # This does not increase Telegram alerts; Pine already sends 5m candle payloads.
+        log.info(
+            "Prediction snapshot saved id=%s strategy=%s direction=%s symbol=%s %s->%s all_tf=%s",
+            row[0], strategy, direction, symbol, source_tf, target_tf, bool(all_timeframes),
+        )
         try:
             target_m = _tf_minutes_for_prediction(target_tf)
             if target_m > 0:
@@ -821,7 +883,6 @@ def save_prediction_snapshot(payload: dict[str, Any]) -> bool:
         return True
     return False
 
-
 def save_prediction_snapshot_safely(payload: dict[str, Any]) -> None:
     try:
         save_prediction_snapshot(payload)
@@ -836,9 +897,16 @@ def queue_prediction_snapshot_save(payload: dict[str, Any]) -> None:
     _submit_db_save(save_prediction_snapshot_safely, snapshot)
 
 
-def _link_prediction_target_signal(symbol: str, timeframe: Optional[str], signal_id: int, signal_at: datetime) -> None:
+def _link_prediction_target_signal(
+    symbol: str,
+    timeframe: Optional[str],
+    signal_id: int,
+    signal_at: datetime,
+    signal_type: str = "LOW",
+) -> None:
     if not symbol or not timeframe:
         return
+    direction = "HIGH" if str(signal_type or "").upper() == "HIGH" else "LOW"
     ensure_schema()
     with _connect() as conn:
         conn.execute(
@@ -852,10 +920,11 @@ def _link_prediction_target_signal(symbol: str, timeframe: Optional[str], signal
                 )
             WHERE symbol=%s
               AND target_timeframe=%s
+              AND COALESCE(direction, 'LOW')=%s
               AND first_target_at IS NULL
               AND snapshot_at <= %s
             """,
-            (signal_id, signal_at, signal_at, symbol, timeframe, signal_at),
+            (signal_id, signal_at, signal_at, symbol, timeframe, direction, signal_at),
         )
 
 
@@ -915,7 +984,9 @@ def prediction_research_summary(limit: int = 100, category_key: str | None = Non
     if not PERFORMANCE_DATABASE_URL:
         return {"ok": False, "database": "not_configured", "count": 0, "pairs": [], "recent": [], "patterns": [], "category_key": category}
 
-    where_sql = _prediction_market_where(category)
+    # Existing /performance prediction UI is BUY research. SELL snapshots are now
+    # collected too, but kept out of this legacy summary until a dedicated SELL tab is added.
+    where_sql = f"({_prediction_market_where(category)}) AND COALESCE(direction, 'LOW')='LOW'"
     target_minutes_sql = """CASE target_timeframe
         WHEN '5m' THEN 5 WHEN '15m' THEN 15 WHEN '30m' THEN 30
         WHEN '1h' THEN 60 WHEN '2h' THEN 120 WHEN '4h' THEN 240
@@ -1083,8 +1154,10 @@ def save_signal(payload: dict[str, Any]) -> bool:
     with _connect() as conn:
         inserted = conn.execute(sql, params).fetchone()
     if inserted:
+        _link_prediction_target_signal(
+            symbol, timeframe, int(inserted[0]), received_at, row["signal_type"]
+        )
         if row["signal_type"] == "LOW":
-            _link_prediction_target_signal(symbol, timeframe, int(inserted[0]), received_at)
             need_1m, need_5m = _collection_requirements(route)
             if need_1m or need_5m:
                 with _connect() as conn:
