@@ -623,9 +623,14 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
         v = _metric_bool(_metric_first(src, "rsi_above_50", "rsi_gt_50"))
         if v is not None: out["rsi_above_50"] = v
 
-    # Stochastic 5,3,3 and 20,12,12: K/D levels, spread, cross, zone, slope deltas.
+    # Stochastic research:
+    # 5,3,3   = 막내
+    # 10,6,6  = 중간 Stoch (research-only, production signal logic unchanged)
+    # 20,12,12 = 큰형
+    # K/D levels, spread, cross, zone, slope deltas.
     for prefix, aliases in (
         ("stoch_5_3", ("stoch_5_3", "stoch5", "k5")),
+        ("stoch_10_6", ("stoch_10_6", "stoch10", "k10")),
         ("stoch_20_12", ("stoch_20_12", "stoch20", "k20")),
     ):
         k_keys = [f"{a}_k" for a in aliases] + [prefix + "_value"]
@@ -744,7 +749,22 @@ def normalize_prediction_metrics(metrics: Any) -> dict[str, Any]:
         v = _metric_float(_metric_first(src, key))
         if v is not None: out[key] = v
 
-    out["metrics_schema_version"] = max(99, int(_metric_float(src.get("metrics_schema_version")) or 0))
+    # V100:
+    # Stoch(10,6,6)가 실제 payload에 들어온 snapshot만
+    # schema 100 이상으로 정규화한다.
+    # 기존 V99 snapshot은 억지로 V100으로 승격하지 않는다.
+    has_stoch_10_6 = any(
+        str(key).startswith("stoch_10_6_")
+        for key in out.keys()
+    )
+
+    schema_floor = 100 if has_stoch_10_6 else 99
+
+    out["metrics_schema_version"] = max(
+        schema_floor,
+        int(_metric_float(src.get("metrics_schema_version")) or 0),
+    )
+
     return out
 
 
@@ -755,7 +775,11 @@ def _prediction_detail_signature(metrics: dict[str, Any]) -> str:
     rv = m.get("rsi_value")
     bits.append(f"RSI={rv:.1f}" if isinstance(rv, (int, float)) else f"RSI={m.get('rsi_dir','NA')}")
     bits.append(f"R50={'UP' if m.get('rsi_above_50') else 'DOWN'}" if m.get("rsi_above_50") is not None else "R50=NA")
-    for label, pfx in (("K5", "stoch_5_3"), ("K20", "stoch_20_12")):
+    for label, pfx in (
+        ("K5", "stoch_5_3"),
+        ("K10", "stoch_10_6"),
+        ("K20", "stoch_20_12"),
+    ):
         k, d = m.get(pfx + "_k"), m.get(pfx + "_d")
         if isinstance(k, (int, float)) and isinstance(d, (int, float)):
             bits.append(f"{label}={k:.1f}/{d:.1f}:{m.get(pfx+'_cross','NONE')}")
