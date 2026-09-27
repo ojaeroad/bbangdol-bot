@@ -18,6 +18,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 
 from firebase_push import notification_delivery_profile, push_health, send_push_to_tokens
+from performance_oos_shadow import build_manual_test_event
 from performance_store import (
     app_active_symbols,
     app_device_summary,
@@ -33,7 +34,7 @@ log = logging.getLogger("tajumon-member-service")
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
-SERVICE_VERSION = "V147_MEMBER_SERVICE_1"
+SERVICE_VERSION = "V155_MEMBER_SERVICE_SHADOW"
 INTERNAL_SECRET = os.getenv("TAJUM_MEMBER_INTERNAL_SECRET", "").strip()
 
 _GROUP_TIMEFRAMES = {
@@ -129,6 +130,7 @@ def device_register():
             sound_profile=str(data.get("sound_profile", "clear") or "clear").strip().lower(),
             vibration_enabled=bool(data.get("vibration_enabled", True)),
             enabled_signal_groups=groups,
+            shadow_test_enabled=bool(data.get("shadow_test_enabled", False)),
         )
         return jsonify({"ok": True, "persisted": True, "live_subscription": False, "member_service": True, **saved}), 200
     except ValueError as exc:
@@ -136,6 +138,67 @@ def device_register():
     except Exception as exc:
         log.exception("member device register failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+
+@app.post("/app/shadow/test")
+def shadow_test_push():
+    data = request.get_json(silent=True, force=True) or {}
+    device_id = str(data.get("device_id", "") or "").strip()
+    requested_symbol = _clean_symbol(data.get("symbol", ""))
+    if not device_id:
+        return jsonify({"ok": False, "error": "empty_device_id"}), 400
+
+    from datetime import datetime, timezone
+    if datetime.now(timezone.utc) >= datetime(2026, 10, 1, tzinfo=timezone.utc):
+        return jsonify({"ok": False, "error": "manual_shadow_test_closed_after_oos_start"}), 409
+
+    devices = [
+        item for item in app_devices_for_symbol(None, 500)
+        if str(item.get("device_id", "") or "").strip() == device_id
+        and bool(item.get("shadow_test_enabled", False))
+    ]
+    if not devices:
+        return jsonify({"ok": False, "error": "device_not_registered_as_shadow_test"}), 403
+
+    enabled_symbols = [str(x or "").strip().upper() for x in devices[0].get("enabled_symbols", [])]
+    symbol = requested_symbol if requested_symbol in enabled_symbols else (enabled_symbols[0] if enabled_symbols else "")
+    if not symbol:
+        return jsonify({"ok": False, "error": "device_has_no_enabled_symbol"}), 409
+
+    payload = build_manual_test_event(symbol)
+    title = f"🧪 상위TF 임박 후보 · {symbol}"
+    body = "30m → 1h · 매수 · Persistence ON · Target WIDEN · PREP TEST"
+    payload["title"] = title
+    payload["body"] = body
+
+    target = [item for item in devices if symbol in [str(x or '').strip().upper() for x in item.get('enabled_symbols', [])]]
+    if not target:
+        return jsonify({"ok": False, "error": "symbol_not_enabled_for_device"}), 409
+
+    success = failure = 0
+    failed_tokens: set[str] = set()
+    push_data = {key: str(value if value is not None else "") for key, value in payload.items()}
+    for item in target:
+        delivery = notification_delivery_profile(
+            str(item.get("sound_profile", "clear") or "clear").lower(),
+            bool(item.get("vibration_enabled", True)),
+        )
+        result = send_push_to_tokens(
+            [item["fcm_token"]],
+            title,
+            body,
+            push_data,
+            channel_id=delivery["channel_id"],
+            sound=delivery["sound"],
+            vibration_enabled=delivery["vibration_enabled"],
+        )
+        success += int(result.get("success", 0) or 0)
+        failure += int(result.get("failure", 0) or 0)
+        failed_tokens.update(result.get("failed_tokens", []))
+    for token in failed_tokens:
+        remove_app_device_token(token)
+    return jsonify({"ok": success > 0, "success": success, "failure": failure, "recipients": len(target), "symbol": symbol}), 200
 
 
 @app.get("/app/push/health")
@@ -223,6 +286,8 @@ def internal_push_fanout():
 
     try:
         devices = [d for d in app_devices_for_symbol(symbol, 500) if _device_allows_group(d, payload)]
+        if source == "OOS_SHADOW":
+            devices = [d for d in devices if bool(d.get("shadow_test_enabled", False))]
         if not devices:
             return jsonify({"ok": True, "success": 0, "failure": 0, "recipients": 0, "history": 0}), 200
 
@@ -232,9 +297,12 @@ def internal_push_fanout():
         if not isinstance(group_tfs, list) or not group_tfs:
             group_tfs = _GROUP_TIMEFRAMES.get(market_type, {}).get(group_key, [str(payload.get("timeframe", "") or "")])
         cooldown = max(1, min(int(data.get("cooldown_minutes", 5) or 5), 120))
-        devices, blocked = filter_app_devices_by_push_cooldown(
-            devices, symbol, str(payload.get("side", "") or ""), group_tfs, cooldown
-        )
+        if source == "OOS_SHADOW":
+            blocked = 0
+        else:
+            devices, blocked = filter_app_devices_by_push_cooldown(
+                devices, symbol, str(payload.get("side", "") or ""), group_tfs, cooldown
+            )
         if not devices:
             return jsonify({"ok": True, "success": 0, "failure": 0, "recipients": 0, "cooldown_blocked": blocked, "history": 0}), 200
 
@@ -254,6 +322,15 @@ def internal_push_fanout():
             )
         }
         push_data["source"] = source
+        if source == "OOS_SHADOW":
+            for key in (
+                "alert_kind", "event_type", "research_state", "phase",
+                "source_tf", "target_tf", "occurred_at", "context_class",
+                "target_cluster_transition", "gate_cluster_transition",
+                "gate_alignment", "master_version", "v15b_sha256", "v15c_sha256",
+                "persistence_on", "manual_test",
+            ):
+                push_data[key] = str(payload.get(key, "") or "")
 
         for (profile, vibration), group in groups.items():
             delivery = notification_delivery_profile(profile, vibration)
@@ -275,10 +352,11 @@ def internal_push_fanout():
             remove_app_device_token(token)
 
         deliveries = []
-        for device in devices:
-            if device.get("fcm_token") not in successful:
-                continue
-            deliveries.append({
+        if source != "OOS_SHADOW":
+            for device in devices:
+                if device.get("fcm_token") not in successful:
+                    continue
+                deliveries.append({
                 "device_id": device.get("device_id"),
                 "delivery_key": payload.get("delivery_key"),
                 "symbol": symbol,

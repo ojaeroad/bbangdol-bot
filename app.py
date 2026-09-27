@@ -1,4 +1,4 @@
-# V150_KIS_WS_WARMUP_STABILITY
+# V149_KIS_WS_WARMUP_STABILITY
 # - V146 WebSocket + local candle + 4 market workers + alert queue
 # - coin/stock continuous chains include internal 2h and 6h gates
 # - legacy TradingView comparison endpoints removed
@@ -18,6 +18,15 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 import requests
 
 from firebase_push import push_health, send_push_to_tokens, notification_delivery_profile
+
+from performance_oos_shadow import (
+    build_manual_test_event,
+    claim_pending_events as claim_oos_shadow_events,
+    mark_event_delivery as mark_oos_shadow_event_delivery,
+    register_prediction_snapshot_safely as register_oos_shadow_snapshot_safely,
+    scan_shadow_safely as scan_oos_shadow_safely,
+    status_summary as oos_shadow_status_summary,
+)
 
 try:
     import tajumon_member_client as _tajum_member_client
@@ -195,7 +204,7 @@ def _auto_refresh_db_subscription_cache(force: bool = False) -> None:
 def _auto_active_unique_symbols() -> list[str]:
     """Background provider: member watchlist -> one compute per unique market symbol.
 
-    V150 can obtain subscriptions from the detached member/FCM service. If that
+    V149 can obtain subscriptions from the detached member/FCM service. If that
     service is not configured or temporarily unavailable, the proven local V145
     DB/live-snapshot path remains as an automatic fallback.
     """
@@ -206,7 +215,7 @@ def _auto_active_unique_symbols() -> list[str]:
             values.update(_tajum_member_client.active_symbols())
             remote_used = True
         except Exception as exc:
-            log.warning("V150 member service subscription fallback to local DB: %s", exc)
+            log.warning("V149 member service subscription fallback to local DB: %s", exc)
 
     if not remote_used:
         _auto_refresh_db_subscription_cache()
@@ -314,15 +323,8 @@ log = logging.getLogger("bbangdol-bot")
 # 실패해도 기존 텔레그램 알람과 자동매매 요청에는 영향이 없다.
 start_performance_automation()
 
-# ---- Version / Service markers (automatic deploy identity) ----
-# V150 no longer depends on the manually maintained APP_VERSION environment value.
-# Render injects RENDER_GIT_COMMIT automatically for Git-backed deploys.
-SERVER_VERSION = "V150"
-DEPLOY_COMMIT = os.getenv("RENDER_GIT_COMMIT", "").strip()
-DEPLOY_COMMIT_SHORT = DEPLOY_COMMIT[:7] if DEPLOY_COMMIT else "local"
-DEPLOY_BRANCH = os.getenv("RENDER_GIT_BRANCH", "").strip() or "local"
-DISPLAY_VERSION = f"{SERVER_VERSION}-{DEPLOY_COMMIT_SHORT}"
-APP_VERSION = SERVER_VERSION
+# ---- Version / Service markers (for live check) ----
+APP_VERSION  = os.getenv("APP_VERSION", "V149")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "unknown")
 
 # === 성과운영센터 공식 명칭 ===
@@ -343,11 +345,7 @@ def ping():
 def version():
     return jsonify({
         "service": SERVICE_NAME,
-        "version": SERVER_VERSION,
-        "display_version": DISPLAY_VERSION,
-        "deploy_commit": DEPLOY_COMMIT_SHORT,
-        "deploy_branch": DEPLOY_BRANCH,
-        "app_version_env_ignored": bool(os.getenv("APP_VERSION", "").strip()),
+        "version": APP_VERSION,
         "member_notice_configured": bool(MEMBER_NOTICE_CHAT_ID),
         "performance_automation_enabled": os.getenv(
             "PERFORMANCE_AUTOMATION_ENABLED", "1"
@@ -363,7 +361,7 @@ def version():
 def whoami():
     return jsonify({"service": SERVICE_NAME})
 
-# === V150 production server-engine health ===
+# === V149 production server-engine health ===
 # Old COIN9 TradingView↔Binance comparison/diagnostic endpoints were removed.
 @app.get("/server-engine/health")
 def server_engine_health():
@@ -2875,15 +2873,17 @@ def app_device_register():
             body, status_code = _tajum_member_client.proxy("POST", "/app/device/register", json_body=data)
             if status_code < 500:
                 _ensure_auto_exchange_engine_started()
+                _ensure_oos_shadow_worker_started()
             return jsonify(body), status_code
         except Exception as exc:
-            log.exception("V150 member service device/register proxy failed; local fallback used")
+            log.exception("V149 member service device/register proxy failed; local fallback used")
     device_id = str(data.get("device_id", "") or "").strip()
     fcm_token = str(data.get("fcm_token", "") or "").strip()
     platform = str(data.get("platform", "android") or "android").strip()
     notifications_enabled = bool(data.get("notifications_enabled", True))
     sound_profile = str(data.get("sound_profile", "clear") or "clear").strip().lower()
     vibration_enabled = bool(data.get("vibration_enabled", True))
+    shadow_test_enabled = bool(data.get("shadow_test_enabled", False))
     raw_symbols = data.get("enabled_symbols", [])
     if isinstance(raw_symbols, str):
         raw_symbols = [part for part in raw_symbols.split(",") if part.strip()]
@@ -2918,12 +2918,14 @@ def app_device_register():
         vibration_enabled=vibration_enabled,
     )
     _ensure_auto_exchange_engine_started()
+    _ensure_oos_shadow_worker_started()
     persisted = True
     persist_error = ""
     saved: dict[str, Any] = {
         "device_id": device_id,
         "enabled_symbols": symbols,
         "notifications_enabled": notifications_enabled,
+        "shadow_test_enabled": shadow_test_enabled,
     }
     try:
         saved = upsert_app_device(
@@ -2935,6 +2937,7 @@ def app_device_register():
             sound_profile=sound_profile,
             vibration_enabled=vibration_enabled,
             enabled_signal_groups=signal_groups,
+            shadow_test_enabled=shadow_test_enabled,
         )
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -2958,7 +2961,7 @@ def app_push_health():
             body, status_code = _tajum_member_client.proxy("GET", "/app/push/health")
             return jsonify(body), status_code
         except Exception:
-            log.exception("V150 member service push/health proxy failed; local fallback used")
+            log.exception("V149 member service push/health proxy failed; local fallback used")
     try:
         devices = app_device_summary()
     except Exception:
@@ -2980,7 +2983,7 @@ def app_recent_alerts():
             _ensure_auto_exchange_engine_started()
             return jsonify(body), status_code
         except Exception:
-            log.exception("V150 member service alerts/recent proxy failed; local fallback used")
+            log.exception("V149 member service alerts/recent proxy failed; local fallback used")
     device_id = request.args.get("device_id", "").strip()
     if not device_id:
         return jsonify({"ok": False, "error": "empty_device_id"}), 400
@@ -7631,7 +7634,7 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
         if not payload:
             return
 
-        # V150 detached member/FCM service. Core keeps cadence/signal interpretation;
+        # V149 detached member/FCM service. Core keeps cadence/signal interpretation;
         # member service owns recipient lookup, cooldown, Firebase delivery and history.
         if _tajum_member_client is not None and _tajum_member_client.configured():
             try:
@@ -7649,12 +7652,12 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
                 total_failure = int(result.get("failure", 0) or 0)
                 _record_fcm_source_trace(source, payload, total_success, total_failure)
                 log.info(
-                    "V150 remote member FCM source=%s symbol=%s success=%s failure=%s",
+                    "V149 remote member FCM source=%s symbol=%s success=%s failure=%s",
                     str(source or "AUTO").upper(), payload.get("symbol"), total_success, total_failure,
                 )
                 return
             except Exception:
-                log.exception("V150 remote member FCM failed; local fallback used symbol=%s", payload.get("symbol"))
+                log.exception("V149 remote member FCM failed; local fallback used symbol=%s", payload.get("symbol"))
 
         try:
             devices = app_devices_for_symbol(payload["symbol"], 500)
@@ -7793,6 +7796,229 @@ def _send_cadence_push_background(route: str, msg: str, symbol: str, cadence_rea
 
 
 
+
+# --- V155 OOS Shadow research pipeline ---------------------------------------------
+_OOS_SHADOW_WORKER_STARTED = False
+_OOS_SHADOW_WORKER_PID = 0
+_OOS_SHADOW_WORKER_LOCK = threading.Lock()
+
+
+def _shadow_push_text(payload: dict[str, Any]) -> tuple[str, str]:
+    symbol = str(payload.get("symbol", "") or "").strip().upper()
+    state = str(payload.get("research_state", "") or "").strip().upper()
+    direction = str(payload.get("direction", "") or "").strip().upper()
+    source_tf = str(payload.get("source_tf", "") or "").strip()
+    target_tf = str(payload.get("target_tf", "") or "").strip()
+    transition = f"{source_tf} → {target_tf}" if source_tf and target_tf else source_tf or "상위TF"
+    side = "매수" if direction == "LOW" else "매도"
+
+    labels = {
+        "SOURCE_CONFIRMED": "SOURCE 확인",
+        "CONTEXT_BLOCK": "상위TF 차단",
+        "IMMINENT_CANDIDATE": "상위TF 임박 후보",
+        "TARGET_CONFIRMED": "TARGET 확인",
+        "CENSORED": "검증 중단",
+        "NO_TARGET_OBSERVED": "TARGET 미관측",
+    }
+    title = f"🧪 {labels.get(state, '상위TF Shadow')} · {symbol}"
+    bits = [transition, side]
+    if payload.get("persistence_on") is True:
+        bits.append("Persistence ON")
+    target_move = str(payload.get("target_cluster_transition", "") or "").strip().upper()
+    if target_move:
+        bits.append(f"Target {target_move}")
+    gate_move = str(payload.get("gate_cluster_transition", "") or "").strip().upper()
+    gate_align = str(payload.get("gate_alignment", "") or "").strip().upper()
+    if gate_move:
+        bits.append(f"2h Gate {gate_move}")
+    if gate_align:
+        bits.append(gate_align)
+    if bool(payload.get("manual_test")):
+        bits.append("PREP TEST")
+    return title, " · ".join(bit for bit in bits if bit)
+
+
+def _send_oos_shadow_payload(payload: dict[str, Any], only_device_id: str = "") -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "") or "").strip().upper()
+    if not symbol:
+        return {"success": 0, "failure": 0, "recipients": 0, "error": "empty_symbol"}
+
+    title, body = _shadow_push_text(payload)
+
+    if (
+        not str(only_device_id or "").strip()
+        and _tajum_member_client is not None
+        and _tajum_member_client.configured()
+    ):
+        try:
+            remote_payload = dict(payload)
+            remote_payload["title"] = title
+            remote_payload["body"] = body
+            result = _tajum_member_client.fanout(remote_payload, "OOS_SHADOW", 1)
+            return {
+                "success": int(result.get("success", 0) or 0),
+                "failure": int(result.get("failure", 0) or 0),
+                "recipients": int(result.get("recipients", 0) or 0),
+                "state": payload.get("research_state"),
+                "symbol": symbol,
+                "member_service": True,
+            }
+        except Exception:
+            log.exception("OOS Shadow remote member fanout failed; local fallback used symbol=%s", symbol)
+
+    try:
+        devices = app_devices_for_symbol(symbol, 500)
+    except Exception:
+        log.exception("OOS Shadow device lookup failed symbol=%s", symbol)
+        return {"success": 0, "failure": 0, "recipients": 0, "error": "device_lookup_failed"}
+
+    clean_device_id = str(only_device_id or "").strip()
+    devices = [
+        device for device in devices
+        if bool(device.get("shadow_test_enabled", False))
+        and (not clean_device_id or str(device.get("device_id", "") or "").strip() == clean_device_id)
+    ]
+    if not devices:
+        return {"success": 0, "failure": 0, "recipients": 0, "error": "no_shadow_test_recipient"}
+
+    grouped: dict[tuple[str, bool], list[dict[str, Any]]] = {}
+    for device in devices:
+        profile = str(device.get("sound_profile", "clear") or "clear").strip().lower()
+        vibration = bool(device.get("vibration_enabled", True))
+        grouped.setdefault((profile, vibration), []).append(device)
+
+    push_data = {
+        key: str(payload.get(key, "") or "")
+        for key in (
+            "alert_kind", "event_type", "research_state", "phase", "symbol",
+            "direction", "side", "source_tf", "target_tf", "timeframe",
+            "occurred_at", "context_class", "target_cluster_transition",
+            "gate_cluster_transition", "gate_alignment", "master_version",
+            "v15b_sha256", "v15c_sha256"
+        )
+    }
+    push_data["persistence_on"] = "1" if payload.get("persistence_on") is True else "0"
+    push_data["manual_test"] = "1" if bool(payload.get("manual_test")) else "0"
+    push_data["source"] = "OOS_SHADOW"
+
+    success = failure = 0
+    failed_tokens: set[str] = set()
+    for (profile, vibration), group in grouped.items():
+        delivery = notification_delivery_profile(profile, vibration)
+        result = send_push_to_tokens(
+            [item["fcm_token"] for item in group],
+            title,
+            body,
+            push_data,
+            channel_id=delivery["channel_id"],
+            sound=delivery["sound"],
+            vibration_enabled=delivery["vibration_enabled"],
+        )
+        success += int(result.get("success", 0) or 0)
+        failure += int(result.get("failure", 0) or 0)
+        failed_tokens.update(result.get("failed_tokens", []))
+
+    for token in failed_tokens:
+        remove_app_device_token(token)
+
+    return {
+        "success": success,
+        "failure": failure,
+        "recipients": len(devices),
+        "state": payload.get("research_state"),
+        "symbol": symbol,
+    }
+
+
+def _oos_shadow_worker_loop() -> None:
+    while True:
+        try:
+            scan_result = scan_oos_shadow_safely()
+            claimed = claim_oos_shadow_events(20)
+            for event in claimed:
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                result = _send_oos_shadow_payload(payload)
+                if int(result.get("success", 0) or 0) > 0:
+                    status = "DELIVERED"
+                elif result.get("error") == "no_shadow_test_recipient":
+                    status = "NO_RECIPIENT"
+                else:
+                    status = "ERROR"
+                mark_oos_shadow_event_delivery(int(event["id"]), status, result)
+            if any(int(value or 0) for value in scan_result.values()) or claimed:
+                log.info("OOS Shadow worker scan=%s claimed=%s", scan_result, len(claimed))
+        except Exception:
+            log.exception("OOS Shadow worker iteration failed")
+        time.sleep(15)
+
+
+def _ensure_oos_shadow_worker_started() -> bool:
+    global _OOS_SHADOW_WORKER_STARTED, _OOS_SHADOW_WORKER_PID
+    pid = os.getpid()
+    with _OOS_SHADOW_WORKER_LOCK:
+        if _OOS_SHADOW_WORKER_PID != pid:
+            _OOS_SHADOW_WORKER_STARTED = False
+            _OOS_SHADOW_WORKER_PID = pid
+        if _OOS_SHADOW_WORKER_STARTED:
+            return True
+        thread = threading.Thread(
+            target=_oos_shadow_worker_loop,
+            name="tajum-oos-shadow",
+            daemon=True,
+        )
+        thread.start()
+        _OOS_SHADOW_WORKER_STARTED = True
+        log.info("OOS Shadow worker started pid=%s", pid)
+        return True
+
+
+@app.get("/app/shadow/status")
+def app_shadow_status():
+    try:
+        _ensure_oos_shadow_worker_started()
+        return jsonify(oos_shadow_status_summary()), 200
+    except Exception as exc:
+        log.exception("OOS Shadow status failed")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+@app.post("/app/shadow/test")
+def app_shadow_test_push():
+    """PREP-only FCM transport test, restricted to a registered TEST app device."""
+    data = request.get_json(silent=True, force=True) or {}
+    if _tajum_member_client is not None and _tajum_member_client.configured():
+        try:
+            body, status_code = _tajum_member_client.proxy(
+                "POST", "/app/shadow/test", json_body=data
+            )
+            return jsonify(body), status_code
+        except Exception:
+            log.exception("OOS Shadow remote test push failed; local fallback used")
+    device_id = str(data.get("device_id", "") or "").strip()
+    requested_symbol = _clean_symbol_code(data.get("symbol", ""))
+    if not device_id:
+        return jsonify({"ok": False, "error": "empty_device_id"}), 400
+    if datetime.now(timezone.utc) >= datetime(2026, 10, 1, tzinfo=timezone.utc):
+        return jsonify({"ok": False, "error": "manual_shadow_test_closed_after_oos_start"}), 409
+
+    candidates = [
+        item for item in app_devices_for_symbol(None, 500)
+        if str(item.get("device_id", "") or "").strip() == device_id
+        and bool(item.get("shadow_test_enabled", False))
+    ]
+    if not candidates:
+        return jsonify({"ok": False, "error": "device_not_registered_as_shadow_test"}), 403
+
+    enabled_symbols = [str(x or "").strip().upper() for x in candidates[0].get("enabled_symbols", [])]
+    symbol = requested_symbol if requested_symbol in enabled_symbols else (enabled_symbols[0] if enabled_symbols else "")
+    if not symbol:
+        return jsonify({"ok": False, "error": "device_has_no_enabled_symbol"}), 409
+
+    payload = build_manual_test_event(symbol)
+    result = _send_oos_shadow_payload(payload, only_device_id=device_id)
+    return jsonify({"ok": int(result.get("success", 0) or 0) > 0, **result}), 200
+
+
 # --- V134 automatic exchange engine -------------------------------------------------
 _AUTO_ENGINE_STARTED = False
 _AUTO_ENGINE_PID = 0
@@ -7849,11 +8075,11 @@ def _ensure_auto_exchange_engine_started() -> bool:
                 return False
             started = start_auto_exchange_engine(_auto_active_unique_symbols, _auto_engine_signal_callback)
             _AUTO_ENGINE_STARTED = True
-            log.info("V150 automatic market engine ensure pid=%s started=%s", pid, started)
+            log.info("V149 automatic market engine ensure pid=%s started=%s", pid, started)
             return started
         except Exception:
             _AUTO_ENGINE_STARTED = False
-            log.exception("V150 automatic market engine start failed pid=%s", pid)
+            log.exception("V149 automatic market engine start failed pid=%s", pid)
             return False
 
 @app.get("/server-engine/auto/status")
@@ -7865,11 +8091,8 @@ def server_engine_auto_status():
         subscription = _auto_subscription_status()
         return jsonify({
             "ok": True,
-            "version": SERVER_VERSION,
-            "display_version": DISPLAY_VERSION,
-            "deploy_commit": DEPLOY_COMMIT_SHORT,
-            "deploy_branch": DEPLOY_BRANCH,
-            "mode": "unique watchlist -> provider-routed market WebSocket -> local candles -> 4 market workers -> alert queue -> FCM (REST warmup/fallback)",
+            "version": "V149",
+            "mode": "unique watchlist -> market WebSocket -> local candles -> 4 market workers -> alert queue -> FCM (REST warmup/fallback)",
             "tradingview_required": False,
             "active_unique_symbols": subscription["active_symbols"],
             "subscription": subscription,
@@ -7877,13 +8100,13 @@ def server_engine_auto_status():
             "fcm_source_trace": _fcm_source_trace_snapshot(),
         }), 200
     except Exception as exc:
-        log.exception("V150 auto status failed")
+        log.exception("V149 auto status failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
 
 @app.get("/server-engine/auto/dashboard")
 def server_engine_auto_dashboard():
-    """Human-readable V150 runtime dashboard; the JSON /auto/status endpoint remains unchanged."""
+    """Human-readable V149 runtime dashboard; the JSON /auto/status endpoint remains unchanged."""
     try:
         _ensure_auto_exchange_engine_started()
         from auto_exchange_engine import status as auto_engine_status
@@ -7908,13 +8131,13 @@ def server_engine_auto_dashboard():
             <div>계산성공 <b>{wk.get('success',0)}</b> / 오류 <b>{wk.get('error',0)}</b></div>
             <div class='err'>{ws.get('last_error') or wk.get('last_error') or ''}</div></div>""")
         html = f"""<!doctype html><meta charset='utf-8'><meta http-equiv='refresh' content='10'>
-        <title>타점ON V150 서버상태</title>
+        <title>타점ON V149 서버상태</title>
         <style>body{{font-family:Arial,sans-serif;background:#f5f6f8;margin:24px;color:#111}}
         .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}
         .card{{background:white;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0001}}
         h1{{margin-bottom:4px}} .sub{{color:#666;margin-bottom:18px}} .err{{color:#b00020;font-size:12px;margin-top:8px;word-break:break-all}}
         .big{{font-size:22px;font-weight:700}}</style>
-        <h1>타점ON V150 서버 상태</h1>
+        <h1>타점ON V149 서버 상태</h1>
         <div class='sub'>WebSocket 주 공급원 · REST warm-up/fallback · 2h/6h 연속체인 포함</div>
         <div class='grid'>{''.join(cards)}
         <div class='card'><h3>📨 알림 Queue</h3><div>대기 <b>{q.get('pending',0)}</b></div>
@@ -7926,7 +8149,7 @@ def server_engine_auto_dashboard():
         <div>기기 {sub.get('db_device_count',0)}</div></div></div>"""
         return Response(html, mimetype="text/html")
     except Exception as exc:
-        log.exception("V150 dashboard failed")
+        log.exception("V149 dashboard failed")
         return Response(f"dashboard error: {type(exc).__name__}: {exc}", status=500, mimetype="text/plain")
 
 # Do NOT start the daemon at module-import time. Gunicorn may import in the parent
@@ -7997,7 +8220,14 @@ def tv_webhook_legacy():
         return jsonify({"ok": True, "queued": event_type.lower()}), 200
     if event_type == "PREDICTION_SNAPSHOT_1Q":
         queue_prediction_snapshot_save(data)
-        return jsonify({"ok": True, "queued": "prediction_snapshot_1q"}), 200
+        _ensure_oos_shadow_worker_started()
+        threading.Thread(
+            target=register_oos_shadow_snapshot_safely,
+            args=(dict(data),),
+            name="tajum-shadow-source",
+            daemon=True,
+        ).start()
+        return jsonify({"ok": True, "queued": "prediction_snapshot_1q", "shadow": "queued"}), 200
     # 통계 저장은 별도 스레드에서 실행. 실패해도 기존 텔레그램 전송에는 영향 없음.
     queue_signal_save(data)
     route  = str(data.get("route", "")).strip()
@@ -8018,7 +8248,14 @@ def tv_webhook_new():
         return jsonify({"ok": True, "queued": event_type.lower()}), 200
     if event_type == "PREDICTION_SNAPSHOT_1Q":
         queue_prediction_snapshot_save(data)
-        return jsonify({"ok": True, "queued": "prediction_snapshot_1q"}), 200
+        _ensure_oos_shadow_worker_started()
+        threading.Thread(
+            target=register_oos_shadow_snapshot_safely,
+            args=(dict(data),),
+            name="tajum-shadow-source",
+            daemon=True,
+        ).start()
+        return jsonify({"ok": True, "queued": "prediction_snapshot_1q", "shadow": "queued"}), 200
     # /webhook 경로도 동일하게 원본 신호를 저장한다.
     queue_signal_save(data)
     route  = str(data.get("type", data.get("route", ""))).strip()

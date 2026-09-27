@@ -280,6 +280,8 @@ ALTER TABLE tajum_app_devices
     ADD COLUMN IF NOT EXISTS vibration_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE tajum_app_devices
     ADD COLUMN IF NOT EXISTS enabled_signal_groups JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE tajum_app_devices
+    ADD COLUMN IF NOT EXISTS shadow_test_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tajum_app_devices_fcm_token
     ON tajum_app_devices(fcm_token);
@@ -1499,7 +1501,8 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
         if canonical:
             rows = conn.execute(
                 """
-                SELECT device_id, fcm_token, sound_profile, vibration_enabled, enabled_signal_groups
+                SELECT device_id, fcm_token, sound_profile, vibration_enabled,
+                       enabled_signal_groups, shadow_test_enabled, enabled_symbols
                 FROM tajum_app_devices
                 WHERE notifications_enabled=TRUE
                   AND %s = ANY(enabled_symbols)
@@ -1511,7 +1514,8 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
         else:
             rows = conn.execute(
                 """
-                SELECT device_id, fcm_token, sound_profile, vibration_enabled, enabled_signal_groups
+                SELECT device_id, fcm_token, sound_profile, vibration_enabled,
+                       enabled_signal_groups, shadow_test_enabled, enabled_symbols
                 FROM tajum_app_devices
                 WHERE notifications_enabled=TRUE
                   AND cardinality(enabled_symbols) > 0
@@ -1527,6 +1531,8 @@ def app_devices_for_symbol(symbol: Optional[str] = None, limit: int = 500) -> li
             "sound_profile": str(row[2] or "clear").strip().lower() or "clear",
             "vibration_enabled": bool(row[3]),
             "enabled_signal_groups": row[4] if isinstance(row[4], dict) else {},
+            "shadow_test_enabled": bool(row[5]),
+            "enabled_symbols": list(row[6] or []),
         }
         for row in rows
         if row and str(row[0] or "").strip() and str(row[1] or "").strip()
@@ -1737,6 +1743,7 @@ def upsert_app_device(
     sound_profile: str = "clear",
     vibration_enabled: bool = True,
     enabled_signal_groups: Optional[dict[str, list[str]]] = None,
+    shadow_test_enabled: bool = False,
 ) -> dict[str, Any]:
     """Register or refresh one Tajum On installation for push delivery.
 
@@ -1758,6 +1765,7 @@ def upsert_app_device(
     if clean_sound_profile not in allowed_sound_profiles and not is_custom_sound:
         clean_sound_profile = "clear"
     clean_vibration_enabled = bool(vibration_enabled)
+    clean_shadow_test_enabled = bool(shadow_test_enabled)
     if not clean_device_id:
         raise ValueError("device_id is required")
     if not clean_token or len(clean_token) < 20:
@@ -1816,8 +1824,8 @@ def upsert_app_device(
             INSERT INTO tajum_app_devices(
                 device_id,user_uid,fcm_token,platform,enabled_symbols,
                 notifications_enabled,sound_profile,vibration_enabled,
-                enabled_signal_groups,created_at,updated_at,last_seen_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
+                enabled_signal_groups,shadow_test_enabled,created_at,updated_at,last_seen_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW(),NOW())
             ON CONFLICT (device_id) DO UPDATE SET
                 user_uid=COALESCE(EXCLUDED.user_uid,tajum_app_devices.user_uid),
                 fcm_token=EXCLUDED.fcm_token,
@@ -1827,6 +1835,7 @@ def upsert_app_device(
                 sound_profile=EXCLUDED.sound_profile,
                 vibration_enabled=EXCLUDED.vibration_enabled,
                 enabled_signal_groups=EXCLUDED.enabled_signal_groups,
+                shadow_test_enabled=EXCLUDED.shadow_test_enabled,
                 updated_at=NOW(),
                 last_seen_at=NOW()
             """,
@@ -1840,6 +1849,7 @@ def upsert_app_device(
                 clean_sound_profile,
                 clean_vibration_enabled,
                 Jsonb(clean_signal_groups),
+                clean_shadow_test_enabled,
             ),
         )
 
@@ -1864,6 +1874,7 @@ def upsert_app_device(
         "sound_profile": clean_sound_profile,
         "vibration_enabled": clean_vibration_enabled,
         "enabled_signal_groups": clean_signal_groups,
+        "shadow_test_enabled": clean_shadow_test_enabled,
     }
 
 
