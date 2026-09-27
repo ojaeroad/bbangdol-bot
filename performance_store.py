@@ -1962,6 +1962,27 @@ def save_candle(payload: dict[str, Any]) -> bool:
     interval = _candle_interval(payload)
     bar_time = _ms_to_datetime(payload.get("bar_time"))
     bar_close_time = _ms_to_datetime(payload.get("bar_close_time")) if payload.get("bar_close_time") else None
+
+    # TAJEOMON V15D-C: research-only inbound TradingView 1m heartbeat.
+    # This runs before the existing candle-watch retention filter.
+    # Failure must never affect the existing performance flow.
+    try:
+        from performance_oos_collector import record_oos_feed_event_safely
+
+        record_oos_feed_event_safely(
+            payload=payload,
+            symbol=symbol,
+            interval_minutes=interval,
+            bar_time=bar_time,
+            bar_close_time=bar_close_time,
+        )
+    except Exception:
+        log.exception(
+            "TAJEOMON OOS feed hook failed symbol=%s interval=%s",
+            symbol,
+            interval,
+        )
+
     values = {name: Decimal(str(payload.get(name))) for name in ("open", "high", "low", "close")}
     volume = Decimal(str(payload.get("volume", 0)))
     ensure_schema()
