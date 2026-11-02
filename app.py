@@ -750,7 +750,7 @@ def _decorate_asset_header(msg: str, symbol: str, route: str = "") -> str:
     left,right=_asset_header_frame(route)
     return f"{left}{tag}{right}\n{text}"
 
-def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool, str, str]:
+def _telegram_cadence_decision(route: str, msg: str, symbol: str, *, source_scope: str = "TELEGRAM") -> Tuple[bool, str, str]:
     """Telegram V103 운영 cadence.
 
     운영 단계: 집중(0) -> 유효1 -> 유효2 -> 유효3.
@@ -781,7 +781,10 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
     reset_minutes = _focus_reset_minutes(timeframe)
     reset_sec = reset_minutes * 60
     route_family = "1Q" if "_1Q" in route_key else ("STARFLOWER" if route_key.startswith("BD_") else route_key)
-    key = f"{sym}|{route_family}|{direction}|{timeframe}"
+    # Isolate AUTO member-app cadence from Telegram cadence; otherwise AUTO
+    # consumes stages before the TradingView webhook can send them.
+    scope = "AUTO" if source_scope == "AUTO" else "TELEGRAM"
+    key = f"{scope}|{sym}|{route_family}|{direction}|{timeframe}"
 
     def record_stage(stage: int, episode_started: float, visible: bool):
         price_match = re.search(r":\s*([0-9][0-9,]*(?:\.[0-9]+)?)", msg or "")
@@ -789,7 +792,8 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
             signal_price = float(price_match.group(1).replace(",", "")) if price_match else None
         except Exception:
             signal_price = None
-        queue_cadence_stage_event_save({
+        if scope == "TELEGRAM":
+            queue_cadence_stage_event_save({
             "route_family": route_family, "route": route_key, "symbol": sym,
             "direction": direction, "timeframe": timeframe, "stage": stage,
             "telegram_visible": visible, "signal_price": signal_price,
@@ -802,11 +806,11 @@ def _telegram_cadence_decision(route: str, msg: str, symbol: str) -> Tuple[bool,
         try:
             legacy_suffix = f"|{direction}|{timeframe}"
             for old_key in list(state):
-                if old_key != key and old_key.startswith(f"{sym}|") and old_key.endswith(legacy_suffix):
+                if old_key != key and old_key.startswith(f"{scope}|{sym}|") and old_key.endswith(legacy_suffix):
                     state.pop(old_key, None)
             opposite = "HIGH" if direction == "LOW" else "LOW"
             for old_key in list(state):
-                if old_key.startswith(f"{sym}|") and f"|{opposite}|{timeframe}" in old_key:
+                if old_key.startswith(f"{scope}|{sym}|") and f"|{opposite}|{timeframe}" in old_key:
                     state.pop(old_key, None)
 
             prev = state.get(key)
@@ -8036,7 +8040,7 @@ def _auto_engine_signal_callback(event: dict[str, Any]) -> None:
         symbol = str(event.get("symbol", "") or "")
         if not route or not msg or not symbol:
             return
-        cadence_ok, cadence_msg, cadence_reason = _telegram_cadence_decision(route, msg, symbol)
+        cadence_ok, cadence_msg, cadence_reason = _telegram_cadence_decision(route, msg, symbol, source_scope="AUTO")
         if not cadence_ok:
             return
         symbol_u = symbol.upper()

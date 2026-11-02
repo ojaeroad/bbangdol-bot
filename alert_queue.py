@@ -1,4 +1,4 @@
-"""Tajum On V149 durable-ish alert queue with optional Redis.
+"""Tajum On V151 bounded in-memory alert queue with optional Redis dedup.
 
 The queue protects the signal->FCM handoff from short CPU/network stalls and performs
 deduplication before calling the existing app.py FCM callback.
@@ -65,6 +65,16 @@ class AlertQueue:
             self._seen[key] = now + self.dedup_ttl
             return True
 
+    def _release_claim(self, key: str) -> None:
+        """Allow a failed enqueue to be attempted again (no queued item exists)."""
+        if self._redis is not None:
+            try:
+                self._redis.delete(f"tajum:alert:{key}")
+            except Exception:
+                pass
+        with self._lock:
+            self._seen.pop(key, None)
+
     def enqueue(self, event: dict[str, Any]) -> bool:
         key = self.event_id(event)
         if not self._claim(key):
@@ -78,6 +88,7 @@ class AlertQueue:
         except queue.Full:
             self._failure += 1
             self._last_error = "queue full"
+            self._release_claim(key)
             return False
 
     def start(self) -> None:
@@ -104,7 +115,10 @@ class AlertQueue:
             except queue.Empty:
                 continue
             try:
-                self.callback(event)
+                result = self.callback(event)
+                # Explicit False / {ok: False} indicates failure. None is legacy success.
+                if result is False or (isinstance(result, dict) and result.get("ok") is False):
+                    raise RuntimeError("alert callback reported failure")
                 self._success += 1
             except Exception as exc:
                 self._last_error = f"{type(exc).__name__}: {exc}"
@@ -115,6 +129,7 @@ class AlertQueue:
                         self.q.put_nowait((event, retry + 1))
                     except queue.Full:
                         self._failure += 1
+                        self._last_error = "retry queue full"
                 else:
                     self._failure += 1
             finally:
