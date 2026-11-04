@@ -1994,6 +1994,14 @@ def save_candle(payload: dict[str, Any]) -> bool:
             interval,
         )
 
+    # V152 November prospective OOS: isolated research-only feed, fail-open.
+    try:
+        from performance_oos_nov_collector import record_oos_feed_event_safely as _record_nov_feed
+        _record_nov_feed(payload=payload, symbol=symbol, interval_minutes=interval,
+                         bar_time=bar_time, bar_close_time=bar_close_time)
+    except Exception:
+        log.exception("November OOS feed hook failed symbol=%s", symbol)
+
     values = {name: Decimal(str(payload.get(name))) for name in ("open", "high", "low", "close")}
     volume = Decimal(str(payload.get("volume", 0)))
     ensure_schema()

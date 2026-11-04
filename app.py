@@ -28,6 +28,12 @@ from performance_oos_shadow import (
     status_summary as oos_shadow_status_summary,
 )
 
+from performance_oos_nov_collector import NOV_ENABLED as _NOV_OOS_ENABLED
+from performance_oos_nov_shadow import (
+    register_prediction_snapshot_safely as _register_nov_oos_snapshot,
+    scan_shadow_safely as _scan_nov_oos_shadow,
+)
+
 try:
     import tajumon_member_client as _tajum_member_client
 except Exception:
@@ -7937,6 +7943,10 @@ def _send_oos_shadow_payload(payload: dict[str, Any], only_device_id: str = "") 
 def _oos_shadow_worker_loop() -> None:
     while True:
         try:
+            if _NOV_OOS_ENABLED:
+                nov_result = _scan_nov_oos_shadow()
+                if any(int(v or 0) for v in nov_result.values()):
+                    log.info("November OOS Shadow worker scan=%s", nov_result)
             scan_result = scan_oos_shadow_safely()
             claimed = claim_oos_shadow_events(20)
             for event in claimed:
@@ -8231,6 +8241,9 @@ def tv_webhook_legacy():
             name="tajum-shadow-source",
             daemon=True,
         ).start()
+        if _NOV_OOS_ENABLED:
+            threading.Thread(target=_register_nov_oos_snapshot, args=(dict(data),),
+                             name="tajum-nov-oos-source", daemon=True).start()
         return jsonify({"ok": True, "queued": "prediction_snapshot_1q", "shadow": "queued"}), 200
     # 통계 저장은 별도 스레드에서 실행. 실패해도 기존 텔레그램 전송에는 영향 없음.
     queue_signal_save(data)
@@ -8259,6 +8272,9 @@ def tv_webhook_new():
             name="tajum-shadow-source",
             daemon=True,
         ).start()
+        if _NOV_OOS_ENABLED:
+            threading.Thread(target=_register_nov_oos_snapshot, args=(dict(data),),
+                             name="tajum-nov-oos-source", daemon=True).start()
         return jsonify({"ok": True, "queued": "prediction_snapshot_1q", "shadow": "queued"}), 200
     # /webhook 경로도 동일하게 원본 신호를 저장한다.
     queue_signal_save(data)
